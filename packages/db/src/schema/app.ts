@@ -1556,6 +1556,14 @@ export const issue = pgTable(
     // allocator, and the bead id keeps the rig's. Once non-NULL it never changes and
     // is never erased; the migration adds that guard.
     beadId: text('bead_id'),
+    // Who holds the work right now, the epoch of that hold, and when it lapses. A claim
+    // is one row state: owner and deadline are both set while held and both NULL when
+    // free, and claim_epoch only ever grows by one per change of owner. The claim
+    // itself runs in the transaction that also moves the native status; C3 owns that
+    // statement, so no extra timestamp is stored here.
+    claimOwner: text('claim_owner'),
+    claimEpoch: integer('claim_epoch').notNull().default(0),
+    claimExpiresAt: timestamp('claim_expires_at', { withTimezone: true }),
     typeId: integer('type_id').references(() => issueType.id, {
       onDelete: 'set null',
     }),
@@ -1623,6 +1631,34 @@ export const issue = pgTable(
     uniqueIndex('issue_bead_id_uq')
       .on(t.beadId)
       .where(sql`${t.beadId} IS NOT NULL`),
+    // A claim is held or free: one half of it cannot exist without the other, so a
+    // release cannot leave a deadline behind and an acquire cannot set an owner with no
+    // lapse time.
+    check(
+      'issue_claim_pair_check',
+      sql`(${t.claimOwner} IS NULL AND ${t.claimExpiresAt} IS NULL)
+        OR (${t.claimOwner} IS NOT NULL AND ${t.claimExpiresAt} IS NOT NULL)`,
+    ),
+    // The owner is stored exactly as the authenticated actor is named: no surrounding
+    // POSIX whitespace of any kind, and no empty string. btrim's default charset is the
+    // space alone, so the tab, newline, carriage return, form feed and vertical tab are
+    // named here.
+    check(
+      'issue_claim_owner_shape_check',
+      sql`${t.claimOwner} IS NULL
+        OR (${t.claimOwner} = btrim(${t.claimOwner}, E' \t\r\n\f\v')
+          AND length(${t.claimOwner}) > 0)`,
+    ),
+    // Epoch 0 means never claimed; a holder always has at least the first epoch.
+    check('issue_claim_epoch_check', sql`${t.claimEpoch} >= 0`),
+    check('issue_claim_active_epoch_check', sql`${t.claimOwner} IS NULL OR ${t.claimEpoch} >= 1`),
+    // Backs the expired-claim sweep and a holder's own list.
+    index('issue_claim_expiry_idx')
+      .on(t.claimExpiresAt)
+      .where(sql`${t.claimExpiresAt} IS NOT NULL`),
+    index('issue_claim_owner_idx')
+      .on(t.claimOwner)
+      .where(sql`${t.claimOwner} IS NOT NULL`),
     check('issue_estimate_points_check', sql`${t.estimatePoints} >= 0`),
     check('issue_estimate_minutes_check', sql`${t.estimateMinutes} >= 0`),
     // Backs the board/list read (active issues of a project) and the worker's
