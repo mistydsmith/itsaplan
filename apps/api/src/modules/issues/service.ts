@@ -1464,10 +1464,10 @@ export async function createIssue(
 
 // The identifiers ("MKT-42") of the given issues, for the activity entries a parent
 // change writes. An id with no issue is absent from the map.
-async function identifiers(ids: number[]): Promise<Map<number, string>> {
+async function identifiers(ids: number[], executor: DbExecutor = db): Promise<Map<number, string>> {
   const out = new Map<number, string>();
   if (ids.length === 0) return out;
-  const rows = await db
+  const rows = await executor
     .select({ id: issue.id, key: projectTable.key, seq: issue.sequenceNumber })
     .from(issue)
     .innerJoin(projectTable, eq(projectTable.id, issue.projectId))
@@ -1483,9 +1483,11 @@ export async function recordParentChange(
   before: number | null,
   after: number | null,
   actor?: ActivityActor,
+  executor: DbExecutor = db,
 ): Promise<void> {
   const names = await identifiers(
     [childId, before, after].filter((id): id is number => id !== null),
+    executor,
   );
   const child = rowSide(names.get(childId), childId);
   const parentSide = (id: number | null) => rowSide(id === null ? null : names.get(id), id);
@@ -1505,7 +1507,7 @@ export async function recordParentChange(
       issueId: after,
       event: { action: 'subtask_add', to: child },
     });
-  await recordActivityEntries(entries, actor);
+  await recordActivityEntries(entries, actor, executor);
 }
 
 export interface IssuePatch {
