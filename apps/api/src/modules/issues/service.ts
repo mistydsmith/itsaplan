@@ -209,9 +209,13 @@ function mapIssue(row: typeof issue.$inferSelect, projectKey: string): IssueRow 
 // Sets each issue's statusSince to when it entered the column it is in now, leaving
 // the createdAt default (set by mapIssue) for an issue with no open stretch. One
 // query for the whole set. Mutates the passed issues in place.
-async function attachStatusSince(issues: IssueRow[], ids: number[] | SQLWrapper): Promise<void> {
+async function attachStatusSince(
+  issues: IssueRow[],
+  ids: number[] | SQLWrapper,
+  executor: DbExecutor = db,
+): Promise<void> {
   if (issues.length === 0) return;
-  const rows = await db
+  const rows = await executor
     .select({ issueId: issueStatus.issueId, enteredAt: issueStatus.enteredAt })
     .from(issueStatus)
     .where(and(inArray(issueStatus.issueId, ids), isNull(issueStatus.leftAt)));
@@ -747,9 +751,13 @@ export async function restoreIssue(
 // { id, title, status } / { id, name, status } in place. Both hang off the same issue rows, so one
 // query carries them; an issue linked to neither keeps the nulls mapIssue set.
 // Rendering those names on a board card needs no separate scaffold lookup this way.
-async function attachGroupings(issues: IssueRow[], ids: number[] | SQLWrapper): Promise<void> {
+async function attachGroupings(
+  issues: IssueRow[],
+  ids: number[] | SQLWrapper,
+  executor: DbExecutor = db,
+): Promise<void> {
   if (issues.length === 0) return;
-  const rows = await db
+  const rows = await executor
     .select({
       issueId: issue.id,
       initiativeId: initiative.id,
@@ -806,14 +814,15 @@ function projectIssueIds(projectId: number, archived: boolean): SQLWrapper {
 async function attachDetails(
   issues: IssueRow[],
   opts: { fieldValues?: boolean; ids?: SQLWrapper } = {},
+  executor: DbExecutor = db,
 ) {
   const ids = opts.ids ?? issues.map((i) => i.id);
   await Promise.all([
-    attachLabels(issues, ids),
-    opts.fieldValues ? attachFieldValues(issues, ids) : undefined,
-    attachStatusSince(issues, ids),
-    attachGroupings(issues, ids),
-    attachLoggedMinutes(issues, ids),
+    attachLabels(issues, ids, executor),
+    opts.fieldValues ? attachFieldValues(issues, ids, executor) : undefined,
+    attachStatusSince(issues, ids, executor),
+    attachGroupings(issues, ids, executor),
+    attachLoggedMinutes(issues, ids, executor),
   ]);
 }
 
@@ -822,9 +831,10 @@ async function attachDetails(
 async function attachLabels<T extends { id: number; labelIds: number[] }>(
   issues: T[],
   ids: number[] | SQLWrapper = issues.map((i) => i.id),
+  executor: DbExecutor = db,
 ): Promise<void> {
   if (issues.length === 0) return;
-  const rows = await db
+  const rows = await executor
     .select({ issueId: issueLabel.issueId, labelId: issueLabel.labelId })
     .from(issueLabel)
     .where(inArray(issueLabel.issueId, ids));
@@ -844,10 +854,11 @@ async function attachLabels<T extends { id: number; labelIds: number[] }>(
 async function attachFieldValues(
   issues: IssueRow[],
   issueIds: number[] | SQLWrapper,
+  executor: DbExecutor = db,
 ): Promise<void> {
   if (issues.length === 0) return;
   const [scalarRows, optionRows] = await Promise.all([
-    db
+    executor
       .select({
         issueId: issueFieldValue.issueId,
         fieldId: issueFieldValue.fieldId,
@@ -861,7 +872,7 @@ async function attachFieldValues(
       })
       .from(issueFieldValue)
       .where(inArray(issueFieldValue.issueId, issueIds)),
-    db
+    executor
       .select({
         issueId: issueFieldOption.issueId,
         fieldId: issueFieldOption.fieldId,
@@ -928,22 +939,26 @@ async function loadSnapshot(
   return row ? { ...row, estimatePoints: numOrNull(row.estimatePoints) } : null;
 }
 
-export async function getIssue(id: number): Promise<IssueRow | null> {
-  return (await getIssues([id]))[0] ?? null;
+export async function getIssue(id: number, executor: DbExecutor = db): Promise<IssueRow | null> {
+  return (await getIssues([id], executor))[0] ?? null;
 }
 
 // Several issues at once, in no particular order. The per-issue enrichment is
 // batched, so this costs what a single getIssue does however many ids it is given
 // — which is what makes it worth using for the writes that touch two issues.
-export async function getIssues(ids: number[]): Promise<IssueRow[]> {
+export async function getIssues(ids: number[], executor: DbExecutor = db): Promise<IssueRow[]> {
   if (ids.length === 0) return [];
-  const rows = await db
+  // WHY the executor reaches the enrichment too: a writer that reads back its own uncommitted
+  // issue needs the labels, state stretch, groupings and logged minutes it just wrote, and those
+  // are separate queries. On the default client they are invisible until commit, so the DTO would
+  // come back looking like an issue with no labels, no status and no time.
+  const rows = await executor
     .select({ issue, projectKey: projectTable.key })
     .from(issue)
     .innerJoin(projectTable, eq(projectTable.id, issue.projectId))
     .where(inArray(issue.id, ids));
   const issues = rows.map((row) => mapIssue(row.issue, row.projectKey));
-  await attachDetails(issues);
+  await attachDetails(issues, {}, executor);
   return issues;
 }
 
