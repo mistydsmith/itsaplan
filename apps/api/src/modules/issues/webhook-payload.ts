@@ -1,4 +1,5 @@
 import { db, issue, issueType, label, project, projectColumn, team, user } from '@repo/db';
+import type { DbExecutor } from '@repo/db';
 import { eq, inArray } from 'drizzle-orm';
 import { emitWebhookEvents } from '#modules/webhooks/emit';
 import type { WebhookEventType } from '#modules/webhooks/service';
@@ -19,9 +20,10 @@ function byIds<K, R>(ids: K[], query: (ids: K[]) => Promise<R[]>): Promise<R[]> 
 // The issue's page URL per project, keyed by project id.
 async function projectUrls(
   projectIds: number[],
+  executor: DbExecutor = db,
 ): Promise<Map<number, (seq: number) => string | null>> {
   const rows = await byIds(projectIds, (ids) =>
-    db
+    executor
       .select({ id: project.id, key: project.key, teamId: team.id, teamSlug: team.slug })
       .from(project)
       .innerJoin(team, eq(team.id, project.teamId))
@@ -35,24 +37,25 @@ async function projectUrls(
   );
 }
 
-export async function issuePayloads(issues: IssueRow[]) {
+export async function issuePayloads(issues: IssueRow[], executor: DbExecutor = db) {
   const [columns, users, types, labels, urls] = await Promise.all([
     byIds(
       issues.map((i) => i.columnId),
       (ids) =>
-        db
+        executor
           .select({ id: projectColumn.id, name: projectColumn.name, type: projectColumn.stateType })
           .from(projectColumn)
           .where(inArray(projectColumn.id, ids)),
     ),
     byIds(
       issues.flatMap((i) => [i.assigneeUserId, i.delegateUserId]).filter((id) => id !== null),
-      (ids) => db.select({ id: user.id, name: user.name }).from(user).where(inArray(user.id, ids)),
+      (ids) =>
+        executor.select({ id: user.id, name: user.name }).from(user).where(inArray(user.id, ids)),
     ),
     byIds(
       issues.map((i) => i.typeId).filter((id) => id !== null),
       (ids) =>
-        db
+        executor
           .select({ id: issueType.id, name: issueType.name })
           .from(issueType)
           .where(inArray(issueType.id, ids)),
@@ -60,12 +63,15 @@ export async function issuePayloads(issues: IssueRow[]) {
     byIds(
       issues.flatMap((i) => i.labelIds),
       (ids) =>
-        db
+        executor
           .select({ id: label.id, name: label.name, color: label.color })
           .from(label)
           .where(inArray(label.id, ids)),
     ),
-    projectUrls(issues.map((i) => i.projectId)),
+    projectUrls(
+      issues.map((i) => i.projectId),
+      executor,
+    ),
   ]);
   const columnById = new Map(columns.map((c) => [c.id, c]));
   const userById = new Map(users.map((u) => [u.id, u]));
@@ -86,13 +92,22 @@ export async function issuePayloads(issues: IssueRow[]) {
 
 // Emits one issue event per issue. The payloads are built only when a webhook of the
 // project subscribes to eventType.
+// The load callback stays caller-owned: a writer that passes its transaction must build the rows
+// on that transaction too, so the payload this connector composes sees the same uncommitted facts.
 export async function emitIssueEvents(
   projectId: number,
   eventType: WebhookEventType,
   load: () => Promise<IssueRow[]>,
   actor: ActivityActor,
+  executor: DbExecutor = db,
 ): Promise<void> {
-  await emitWebhookEvents(projectId, eventType, async () => issuePayloads(await load()), actor);
+  await emitWebhookEvents(
+    projectId,
+    eventType,
+    async () => issuePayloads(await load(), executor),
+    actor,
+    executor,
+  );
 }
 
 export async function emitIssueEvent(
@@ -100,12 +115,14 @@ export async function emitIssueEvent(
   row: IssueRow,
   actor: ActivityActor,
   extra: Record<string, unknown> = {},
+  executor: DbExecutor = db,
 ): Promise<void> {
   await emitWebhookEvents(
     row.projectId,
     eventType,
-    async () => (await issuePayloads([row])).map((payload) => ({ ...payload, ...extra })),
+    async () => (await issuePayloads([row], executor)).map((payload) => ({ ...payload, ...extra })),
     actor,
+    executor,
   );
 }
 
@@ -116,12 +133,13 @@ export async function emitCommentEvent(
   eventType: WebhookEventType,
   comment: FeedItemRow,
   actor: ActivityActor,
+  executor: DbExecutor = db,
 ): Promise<void> {
   await emitWebhookEvents(
     projectId,
     eventType,
     async () => {
-      const [row] = await db
+      const [row] = await executor
         .select({
           seq: issue.sequenceNumber,
           title: issue.title,
@@ -149,5 +167,6 @@ export async function emitCommentEvent(
       ];
     },
     actor,
+    executor,
   );
 }
