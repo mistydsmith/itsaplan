@@ -97,11 +97,16 @@ export async function notifyComment(
   projectId: number,
   comment: { issueId: number; id: number; actorUserId: string | null; body: string | null },
   mentionedUsers: MentionedUsers,
+  executor: DbExecutor = db,
 ): Promise<void> {
   const actor = comment.actorUserId;
   const mentioned = new Set([...mentionedUsers.memberIds, ...mentionedUsers.agentUserIds]);
-  await autoWatchIssue(projectId, comment.issueId, [actor, ...mentioned]);
-  const watchers = await watcherUserIds(projectId, comment.issueId);
+  // WHY every one of these takes the executor: a writer that supplied a transaction needs the
+  // watcher row it is about to insert, and the inbox rows it just wrote, to be the ones this
+  // reads. On the default client those uncommitted rows are invisible, so the fan-out would
+  // subscribe nobody and notify nobody.
+  await autoWatchIssue(projectId, comment.issueId, [actor, ...mentioned], executor);
+  const watchers = await watcherUserIds(projectId, comment.issueId, executor);
 
   const rows: NewNotificationRow[] = [];
   for (const userId of mentioned) {
@@ -126,7 +131,7 @@ export async function notifyComment(
       actorUserId: actor,
     });
   }
-  await insertNotifications(rows, comment.id);
+  await insertNotifications(rows, comment.id, executor);
 }
 
 // Fan out the mentions an edit newly added to a comment. The handles the comment
@@ -137,12 +142,13 @@ export async function notifyEditedCommentMentions(
   projectId: number,
   comment: { issueId: number; id: number; actorUserId: string | null },
   mentionedUsers: MentionedUsers,
+  executor: DbExecutor = db,
 ): Promise<void> {
   const mentioned = [...mentionedUsers.memberIds, ...mentionedUsers.agentUserIds].filter(
     (userId) => userId !== comment.actorUserId,
   );
   if (mentioned.length === 0) return;
-  await autoWatchIssue(projectId, comment.issueId, mentioned);
+  await autoWatchIssue(projectId, comment.issueId, mentioned, executor);
   await insertNotifications(
     mentioned.map((userId) => ({
       userId,
@@ -153,6 +159,7 @@ export async function notifyEditedCommentMentions(
       actorUserId: comment.actorUserId,
     })),
     comment.id,
+    executor,
   );
 }
 
