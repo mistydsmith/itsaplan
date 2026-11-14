@@ -134,8 +134,14 @@ const projectWithTeam = {
 // A blocked section reads as off whatever the project has stored, so masking here is
 // what turns a feature off everywhere: the web app reads the flags off this DTO, and
 // the route guards read them off the project the guard resolved.
-export async function mapProject(row: ProjectWithTeam): Promise<ProjectRow> {
-  const { blockedFeatures } = await getLimits(row.workspaceId);
+export async function mapProject(
+  row: ProjectWithTeam,
+  executor: DbExecutor = db,
+): Promise<ProjectRow> {
+  // The limits answer decides which sections read as off, so it has to come from the same
+  // transaction as the project: a caller that just blocked a feature would otherwise read the
+  // pool's older answer and see the section still on.
+  const { blockedFeatures } = await getLimits(row.workspaceId, executor);
   const on = (feature: ProjectFeature, stored: boolean) =>
     stored && !blockedFeatures.includes(feature);
   return {
@@ -379,13 +385,16 @@ export async function getProjectByRef(ref: string, userId: string): Promise<Proj
   return mapProject(mine[0]);
 }
 
-export async function getProjectById(id: number): Promise<ProjectRow | null> {
-  const rows = await db
+export async function getProjectById(
+  id: number,
+  executor: DbExecutor = db,
+): Promise<ProjectRow | null> {
+  const rows = await executor
     .select(projectWithTeam)
     .from(project)
     .innerJoin(team, eq(team.id, project.teamId))
     .where(eq(project.id, id));
-  return rows[0] ? mapProject(rows[0]) : null;
+  return rows[0] ? mapProject(rows[0], executor) : null;
 }
 
 // The team that owns a project, for the resources the team holds on behalf of all of

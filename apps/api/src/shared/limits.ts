@@ -39,18 +39,24 @@ export const NO_LIMITS: Limits = {
   blockedFeatures: [],
 };
 
-let provider: (workspaceId: number) => Promise<Limits> = async () => NO_LIMITS;
+// WHY the provider may take the caller's executor: a hosted build answers from the workspace's
+// subscription, and a caller inside a transaction must see the row it just wrote there rather than
+// the pool's older view. The second argument is optional, so the one-argument providers already
+// installed - including the test helper - stay assignable and unchanged.
+type LimitsProvider = (workspaceId: number, executor?: DbExecutor) => Promise<Limits>;
 
-export function setLimitsProvider(next: (workspaceId: number) => Promise<Limits>): void {
+let provider: LimitsProvider = async () => NO_LIMITS;
+
+export function setLimitsProvider(next: LimitsProvider): void {
   provider = next;
 }
 
-export function getLimits(workspaceId: number): Promise<Limits> {
-  return provider(workspaceId);
+export function getLimits(workspaceId: number, executor: DbExecutor = db): Promise<Limits> {
+  return provider(workspaceId, executor);
 }
 
 export async function getTeamLimits(teamId: number, executor: DbExecutor = db): Promise<Limits> {
-  return provider(await teamWorkspaceId(teamId, executor));
+  return provider(await teamWorkspaceId(teamId, executor), executor);
 }
 
 // The lowest of the limits, leaving out the 0s, which set none; 0 when all of them are.
@@ -61,8 +67,12 @@ export function tightestLimit(...limits: number[]): number {
 
 // Runs of the workspace's internal agents in flight at once: the limit its owner set, or
 // the provider's where that is lower.
-export async function getRunLimit(workspaceId: number, limits: Limits): Promise<number> {
-  const [row] = await db
+export async function getRunLimit(
+  workspaceId: number,
+  limits: Limits,
+  executor: DbExecutor = db,
+): Promise<number> {
+  const [row] = await executor
     .select({ own: workspace.maxConcurrentRuns })
     .from(workspace)
     .where(eq(workspace.id, workspaceId));
