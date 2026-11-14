@@ -30,6 +30,8 @@ import {
   type BeadAllocation,
   type IdentityTransaction,
 } from '@repo/db/issue-identity';
+import { gateIssueWrite, isTrackerGateRefusal } from '@repo/db/tracker-gate';
+import { isIdFactsRefusal, snapshotIdFacts } from '@repo/db/tracker-issue-facts';
 import { alias } from 'drizzle-orm/pg-core';
 import {
   and,
@@ -1224,84 +1226,184 @@ export async function createIssue(
   // An issue created in a column enters it the same way a moved one does, so the
   // column's auto-assignee applies. An assignee sent with the create wins over it.
   const assigneeUserId = input.assigneeUserId ?? (await columnAutoAssignee(input.columnId));
-  const { id: issueId, createdAt } = await db.transaction(async (tx) => {
-    // The rig is read here as a lock-order hint only. When the project is gated the allocation
-    // takes the rig lock, which keeps it ahead of the board lock; the hint itself is never
-    // trusted for the write.
-    const rigHint = await projectRigHint(tx, project.id);
-    const allocation =
-      rigHint === null
-        ? null
-        : await allocateIssueIdentity(
-            tx,
-            rigHint,
-            project.id,
-            input.parentId,
-            input.beadAllocationMode,
+  const { id: issueId, createdAt } = await db
+    .transaction(async (tx) => {
+      // The rig is read here as a lock-order hint only. When the project is gated the allocation
+      // takes the rig lock, which keeps it ahead of the board lock; the hint itself is never
+      // trusted for the write.
+      const rigHint = await projectRigHint(tx, project.id);
+      // A gated create holds the rig row first. The identity snapshot below reads the rig's
+      // counters, and the allocator's own lock re-enters this one, so both see the same held row.
+      if (rigHint !== null) {
+        await tx.execute(sql`SELECT id FROM rig WHERE id = ${rigHint} FOR UPDATE`);
+      }
+      // Every gated create takes the board lock, root creates included, because a project can
+      // become gated or change rig while this transaction waits. An ordinary parent write keeps
+      // taking it for the same reason it always did.
+      if (rigHint !== null || input.parentId != null) {
+        await lockIssueTree(tx, project.id);
+      }
+      if (input.parentId != null) {
+        await assertTreeLink(null, input.parentId, tx, { expectedProjectId: project.id });
+      }
+      // The authoritative check, under the project row's write lock and held until commit: a
+      // project that changed rig while this transaction waited must not receive an issue with a
+      // token from the rig it has left, and an ordinary create that raced into a gated project
+      // must refuse rather than write a null identity.
+      const rigId = await lockProjectRig(tx, project.id);
+      if (rigId !== rigHint) {
+        throw new HttpError(
+          409,
+          'This project changed its rig while the issue was being created; try again',
+        );
+      }
+      // The identity facts the owner is judged on are read under all three locks and BEFORE any
+      // reservation, so the rig's high-water is the one the board already had, not the one this
+      // create is about to make. An ordinary project reads none of it and spawns nothing.
+      const facts =
+        rigId === null
+          ? null
+          : await snapshotIdFacts(tx, {
+              rigId,
+              projectId: project.id,
+              parentIssueId: input.parentId ?? null,
+            });
+      const allocation =
+        rigId === null
+          ? null
+          : await allocateIssueIdentity(
+              tx,
+              rigId,
+              project.id,
+              input.parentId,
+              input.beadAllocationMode,
+            );
+      // The title and description the owner sees are the exact bytes the INSERT writes, prefix
+      // included. An ordinary project keeps its title and its default description untouched.
+      const title = allocation === null ? input.title : `${allocation.localToken}: ${input.title}`;
+      const description = input.description ?? '';
+      if (rigId !== null && allocation !== null && facts !== null) {
+        // Label names are read through this same transaction. The ids a client sent are a lookup
+        // key, never the fact the policy is given.
+        const labelIds = [...new Set(input.labelIds ?? [])];
+        const labelNames =
+          labelIds.length === 0
+            ? []
+            : (
+                (await tx.execute(
+                  sql`SELECT name FROM label WHERE project_id = ${project.id} AND id IN (${sql.join(
+                    labelIds.map((id) => sql`${id}`),
+                    sql`, `,
+                  )})`,
+                )) as unknown as { name: string }[]
+              ).map((row) => row.name);
+        // existing_titles is a duplicate guard, not a dump of the rig: it carries the candidate id
+        // alone, and only when the snapshot already holds that id.
+        const existingTitles: Record<string, string> = {};
+        if (facts.existing_ids.includes(allocation.beadId)) {
+          const clash = (await tx.execute(
+            sql`SELECT i.title FROM bead_identity b JOIN issue i ON i.id = b.issue_id WHERE b.rig_id = ${rigId} AND b.local_token = ${allocation.localToken}`,
+          )) as unknown as { title: string }[];
+          if (clash[0]) existingTitles[allocation.beadId] = clash[0].title;
+        }
+        // 'auto' is left out entirely: the owner chooses root or daughter from the parent it reads.
+        // root and daughter go literally, and no id or mode fact is taken from the request body.
+        const mode = input.beadAllocationMode ?? 'auto';
+        await gateIssueWrite({
+          rigId,
+          op: {
+            op: 'create',
+            id: allocation.beadId,
+            rig_prefix: facts.rig_prefix,
+            existing_ids: facts.existing_ids,
+            root_high_water: facts.root_high_water,
+            parent_id: facts.parent_id,
+            ...(mode === 'auto' ? {} : { id_mode: mode }),
+            title,
+            description,
+            labels: labelNames,
+            existing_titles: existingTitles,
+            proposed_state: {
+              labels: labelNames,
+              title,
+              description,
+              bead_id: allocation.beadId,
+              parent_id: facts.parent_id,
+            },
+          },
+        });
+      }
+      const [seqRow] = await tx
+        .update(projectTable)
+        .set({ nextSequence: sql`next_sequence + 1` })
+        .where(eq(projectTable.id, project.id))
+        .returning({ seq: sql<number>`next_sequence - 1` });
+      const sequenceNumber = Number(seqRow.seq);
+      const [posRow] = await tx
+        .select({ pos: sql<number>`COALESCE(MAX(${issue.position}), 0) + 1000` })
+        .from(issue)
+        .where(eq(issue.columnId, input.columnId));
+      const [row] = await tx
+        .insert(issue)
+        .values({
+          projectId: project.id,
+          sequenceNumber,
+          typeId: input.typeId ?? null,
+          initiativeId: input.initiativeId ?? null,
+          cycleId: input.cycleId ?? null,
+          assigneeUserId,
+          delegateUserId: input.delegateUserId ?? null,
+          columnId: input.columnId,
+          parentId: input.parentId ?? null,
+          // A gated create prefixes the title with its own token, so a card's title names the
+          // identity it holds. Every byte the caller sent after that prefix is preserved, and an
+          // ordinary project keeps its title exactly as given.
+          title,
+          beadId: allocation === null ? null : allocation.beadId,
+          description,
+          priority: input.priority ?? null,
+          estimatePoints: input.estimatePoints == null ? null : String(input.estimatePoints),
+          estimateMinutes: input.estimateMinutes ?? null,
+          startDate: input.startDate ?? null,
+          dueDate: input.dueDate ?? null,
+          position: Number(posRow.pos),
+        })
+        .returning({ id: issue.id, createdAt: issue.createdAt });
+      if (allocation !== null) {
+        // Inserted already attached: the C1 guard refuses a null link becoming non-null, so a
+        // reserved row is not an option.
+        const attached = await attachBeadIdentity(tx, { allocation, issueId: row.id });
+        if (!attached.ok) throw new HttpError(409, attached.message);
+      }
+      return row;
+    })
+    .catch((error) => {
+      // Two shared @repo/db refusals can arrive here, and neither package can import an API
+      // HttpError, so both are mapped next to the write they stopped. The owner's refusal is a
+      // refusal of this write, not a server fault. The snapshot's refusal is a data-integrity one
+      // and keeps the status and wording the allocator's own refusals already give a caller, so a
+      // cross-project parent and a parent with no ledger row answer exactly as they did before the
+      // snapshot was added. Both are thrown inside the transaction, so the reservation, the
+      // sequence and the insert all roll back with them.
+      if (isTrackerGateRefusal(error)) {
+        const safe = error.safe_form ? ` Compliant form: ${error.safe_form}.` : '';
+        throw new HttpError(409, `${error.rule}: ${error.message}.${safe}`, error.code);
+      }
+      if (isIdFactsRefusal(error)) {
+        if (error.code === 'parent-other-project' || error.code === 'parent-other-rig') {
+          throw new HttpError(400, 'Parent must belong to this project', error.code);
+        }
+        if (error.code === 'missing-rig') {
+          throw new HttpError(
+            409,
+            'This project needs a valid rig before you can create an issue',
+            error.code,
           );
-    // Every gated create takes the board lock, root creates included, because a project can
-    // become gated or change rig while this transaction waits. An ordinary parent write keeps
-    // taking it for the same reason it always did.
-    if (rigHint !== null || input.parentId != null) {
-      await lockIssueTree(tx, project.id);
-    }
-    if (input.parentId != null) {
-      await assertTreeLink(null, input.parentId, tx, { expectedProjectId: project.id });
-    }
-    // The authoritative check, under the project row's write lock and held until commit: a
-    // project that changed rig while this transaction waited must not receive an issue with a
-    // token from the rig it has left, and an ordinary create that raced into a gated project
-    // must refuse rather than write a null identity.
-    if ((await lockProjectRig(tx, project.id)) !== rigHint) {
-      throw new HttpError(
-        409,
-        'This project changed its rig while the issue was being created; try again',
-      );
-    }
-    const [seqRow] = await tx
-      .update(projectTable)
-      .set({ nextSequence: sql`next_sequence + 1` })
-      .where(eq(projectTable.id, project.id))
-      .returning({ seq: sql<number>`next_sequence - 1` });
-    const sequenceNumber = Number(seqRow.seq);
-    const [posRow] = await tx
-      .select({ pos: sql<number>`COALESCE(MAX(${issue.position}), 0) + 1000` })
-      .from(issue)
-      .where(eq(issue.columnId, input.columnId));
-    const [row] = await tx
-      .insert(issue)
-      .values({
-        projectId: project.id,
-        sequenceNumber,
-        typeId: input.typeId ?? null,
-        initiativeId: input.initiativeId ?? null,
-        cycleId: input.cycleId ?? null,
-        assigneeUserId,
-        delegateUserId: input.delegateUserId ?? null,
-        columnId: input.columnId,
-        parentId: input.parentId ?? null,
-        // A gated create prefixes the title with its own token, so a card's title names the
-        // identity it holds. Every byte the caller sent after that prefix is preserved, and an
-        // ordinary project keeps its title exactly as given.
-        title: allocation === null ? input.title : `${allocation.localToken}: ${input.title}`,
-        beadId: allocation === null ? null : allocation.beadId,
-        description: input.description ?? '',
-        priority: input.priority ?? null,
-        estimatePoints: input.estimatePoints == null ? null : String(input.estimatePoints),
-        estimateMinutes: input.estimateMinutes ?? null,
-        startDate: input.startDate ?? null,
-        dueDate: input.dueDate ?? null,
-        position: Number(posRow.pos),
-      })
-      .returning({ id: issue.id, createdAt: issue.createdAt });
-    if (allocation !== null) {
-      // Inserted already attached: the C1 guard refuses a null link becoming non-null, so a
-      // reserved row is not an option.
-      const attached = await attachBeadIdentity(tx, { allocation, issueId: row.id });
-      if (!attached.ok) throw new HttpError(409, attached.message);
-    }
-    return row;
-  });
+        }
+        throw new HttpError(409, error.message, error.code);
+      }
+      throw error;
+    });
 
   // The first stretch of the status history starts when the issue does, so the
   // entries of its creation fall inside it.
