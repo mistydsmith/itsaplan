@@ -9,6 +9,7 @@ import {
   user,
   emailSource,
   getProjectEmailConfig,
+  type DbExecutor,
   type DeliveryPayload,
 } from '@repo/db';
 import { eq, inArray } from 'drizzle-orm';
@@ -52,8 +53,11 @@ interface StateChange {
   to: string;
 }
 
-async function readStateChange(activityId: number): Promise<StateChange | null> {
-  const [row] = await db
+async function readStateChange(
+  activityId: number,
+  executor: DbExecutor = db,
+): Promise<StateChange | null> {
+  const [row] = await executor
     .select({ payload: issueActivity.payload })
     .from(issueActivity)
     .where(eq(issueActivity.id, activityId));
@@ -135,13 +139,14 @@ async function composeMessages(
   projectRow: { key: string; teamId: number; teamSlug: string | null },
   actorName: string | null,
   commentId: number | null,
+  executor: DbExecutor = db,
 ): Promise<Messages | null> {
   const actor = actorName ?? 'Someone';
   const first = notifications[0];
   const ref = teamRef({ id: projectRow.teamId, slug: projectRow.teamSlug });
   if (first.documentId != null) {
     const documentId = first.documentId;
-    const [documentRow] = await db
+    const [documentRow] = await executor
       .select({ title: projectDocument.title })
       .from(projectDocument)
       .where(eq(projectDocument.id, documentId));
@@ -154,13 +159,13 @@ async function composeMessages(
       email: async (_type, locale) => {
         const words = emailWords(locale);
         const vars = { actor: actorName ?? words.someone, document: title || words.untitled };
-        return { ...(await composeEmail(template, locale, vars, url)), url };
+        return { ...(await composeEmail(template, locale, vars, url, executor)), url };
       },
       telegram: () => documentTelegramPayload(title || 'Untitled', actor, url),
     };
   }
   if (first.issueId == null) return null;
-  const [issueRow] = await db
+  const [issueRow] = await executor
     .select({ seq: issue.sequenceNumber, title: issue.title })
     .from(issue)
     .where(eq(issue.id, first.issueId));
@@ -173,7 +178,8 @@ async function composeMessages(
   // One issue event, so every 'state_changed' row points at the same activity row.
   const statusActivityId =
     notifications.find((n) => n.type === 'state_changed')?.sourceActivityId ?? null;
-  const stateChange = statusActivityId != null ? await readStateChange(statusActivityId) : null;
+  const stateChange =
+    statusActivityId != null ? await readStateChange(statusActivityId, executor) : null;
   return {
     email: async (type, locale) => {
       const vars = {
@@ -183,7 +189,7 @@ async function composeMessages(
         from: stateChange?.from ?? '—',
         to: stateChange?.to ?? '—',
       };
-      return { ...(await composeEmail(EMAIL_TEMPLATE[type], locale, vars, url)), url };
+      return { ...(await composeEmail(EMAIL_TEMPLATE[type], locale, vars, url, executor)), url };
     },
     telegram: (type) => telegramPayload(type, issueKey, issueRow.title, actor, url, stateChange),
   };
@@ -197,18 +203,19 @@ export async function enqueueOutbound(
   notifications: NewNotificationRow[],
   actorName: string | null,
   commentId: number | null,
+  executor: DbExecutor = db,
 ): Promise<void> {
   if (notifications.length === 0) return;
   const projectId = notifications[0].projectId;
 
-  const [projectRow] = await db
+  const [projectRow] = await executor
     .select({ key: project.key, name: project.name, teamId: project.teamId, teamSlug: team.slug })
     .from(project)
     .innerJoin(team, eq(team.id, project.teamId))
     .where(eq(project.id, projectId));
   if (!projectRow) return;
 
-  const settings = await readRedactedSettings(projectRow.teamId);
+  const settings = await readRedactedSettings(projectRow.teamId, executor);
 
   // The team's own provider when it configured one, otherwise the instance
   // provider when the team asked for it and the instance shares it.
@@ -219,26 +226,32 @@ export async function enqueueOutbound(
       : source === 'resend'
         ? settings.resend.hasApiKey
         : source === 'system'
-          ? (await getProjectEmailConfig()) !== null
+          ? (await getProjectEmailConfig(executor)) !== null
           : false;
   // The team turns Telegram on; the bot that sends is either its own or, when it
   // set no token, the instance bot.
   const telegramEnabled =
-    settings.telegram.enabled && (settings.telegram.hasBotToken || (await hasUsableInstanceBot()));
+    settings.telegram.enabled &&
+    (settings.telegram.hasBotToken || (await hasUsableInstanceBot(executor)));
   if (!emailEnabled && !telegramEnabled) return;
 
-  const messages = await composeMessages(notifications, projectRow, actorName, commentId);
+  const messages = await composeMessages(notifications, projectRow, actorName, commentId, executor);
   if (!messages) return;
 
   const userIds = [...new Set(notifications.map((n) => n.userId))];
   const [users, prefsByUser, chatIdByUser, localeByUser] = await Promise.all([
-    db
+    // WHY the executor and not db: this is this function's own recipient SELECT, so a caller that
+    // supplied a transaction needs the users it created there to be visible. On the default client
+    // they are invisible until commit, and every row would drop at the continue below.
+    executor
       .select({ id: user.id, email: user.email, active: user.active })
       .from(user)
       .where(inArray(user.id, userIds)),
-    getPreferencesForUsers(projectId, userIds),
-    telegramEnabled ? getTelegramChatIds(userIds) : Promise.resolve(new Map<string, string>()),
-    savedLocales(userIds),
+    getPreferencesForUsers(projectId, userIds, executor),
+    telegramEnabled
+      ? getTelegramChatIds(userIds, executor)
+      : Promise.resolve(new Map<string, string>()),
+    savedLocales(userIds, executor),
   ]);
   // A deactivated account keeps its projects, but nothing from them reaches it.
   const emailById = new Map(
@@ -284,5 +297,5 @@ export async function enqueueOutbound(
   }
 
   if (out.length === 0) return;
-  await db.insert(notificationDelivery).values(out);
+  await executor.insert(notificationDelivery).values(out);
 }

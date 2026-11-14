@@ -74,20 +74,19 @@ async function insertNotifications(
   if (rows.length === 0) return;
   const name = await actorName(rows[0].actorUserId, executor);
   await executor.insert(notification).values(rows.map((r) => ({ ...r, actorName: name })));
-  // Fan out to the project's enabled delivery channels (email, Telegram) on the
-  // default client only. A caller holding an executor is inside a transaction the
-  // rows may still roll back out of, and enqueueOutbound writes on its own
-  // connection: a failed write must not leak past the rollback, and the fan-out
-  // joins the owning write's transaction from that write's own plumbing.
-  // Best-effort on the default path: a delivery failure must not break the inbox
-  // insert or the domain mutation.
+  // Fan out to the project's enabled delivery channels (email, Telegram). On the default client
+  // this stays best-effort: a delivery failure must not break the inbox insert or the domain
+  // mutation. A caller that supplies an executor gets the real fan-out on its own transaction, and
+  // a failure there is raised to that caller so its rollback takes the queue rows with it.
   if (executor === db) {
     try {
       await enqueueOutbound(rows, name, commentId);
     } catch (err) {
       console.error('[notifications] outbound enqueue failed:', err);
     }
+    return;
   }
+  await enqueueOutbound(rows, name, commentId, executor);
 }
 
 // Fan out a new comment. Mentioned members get a 'mentioned' notification; the
@@ -181,7 +180,8 @@ export async function notifyTextMentions(
     projectId,
     actor,
     { on: 'issue', place: 'text' },
-    await resolveMentionHandles(projectId, handles),
+    await resolveMentionHandles(projectId, handles, executor),
+    executor,
   );
   if (memberIds.length === 0) return;
   await autoWatchIssue(projectId, issueId, memberIds, executor);
