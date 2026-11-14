@@ -159,6 +159,28 @@ export const teamMember = pgTable(
   ],
 );
 
+// A rig is one canonical bead-id prefix and the counter behind the root numbers
+// the cards of that prefix take. Two projects that configure the same prefix share
+// the counter, which is what stops one prefix issuing a token twice across projects.
+// prefix is immutable and next_root never decreases once the row exists; the
+// migration that creates this table adds the guards, so a schema read alone does not
+// enforce either.
+export const rig = pgTable(
+  'rig',
+  {
+    id: serial('id').primaryKey(),
+    prefix: text('prefix').notNull().unique(),
+    // The root high-water mark. A create takes this row's lock, reads it, and writes
+    // the next value in the same transaction, the way project.next_sequence works.
+    nextRoot: integer('next_root').notNull().default(1),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    check('rig_prefix_check', sql`${t.prefix} ~ '^[^[:space:]]+$'`),
+    check('rig_next_root_check', sql`${t.nextRoot} >= 1`),
+  ],
+);
+
 // A project groups its own columns, issue types, labels, custom fields, and
 // issues. next_sequence is the atomic counter behind each issue's human
 // identifier (e.g. "MKT-42"): incrementing it under a row lock keeps concurrent
@@ -201,9 +223,18 @@ export const project = pgTable(
     // When set, the project is archived: read-only, left out of the members' project
     // lists, and its agent schedules do not run. Its rows are kept and it can be restored.
     archivedAt: timestamp('archived_at', { withTimezone: true }),
+    // The rig this project takes its bead ids from. NULL means the project issues no
+    // bead ids and keeps only its native sequence numbers. A rig that still has a
+    // project cannot be deleted: its ledger holds the tombstones those ids rely on.
+    rigId: integer('rig_id').references(() => rig.id, { onDelete: 'restrict' }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
-  (t) => [unique('project_team_key_uq').on(t.teamId, t.key)],
+  (t) => [
+    unique('project_team_key_uq').on(t.teamId, t.key),
+    index('project_rig_idx')
+      .on(t.rigId)
+      .where(sql`${t.rigId} IS NOT NULL`),
+  ],
 );
 
 // A project template of a workspace: a snapshot of a project's configuration, without
@@ -1519,6 +1550,12 @@ export const issue = pgTable(
       .notNull()
       .references(() => project.id, { onDelete: 'cascade' }),
     sequenceNumber: integer('sequence_number').notNull(),
+    // The canonical bead id this issue holds, for example 'sentinel-prod-8425', set
+    // when the issue is created on a gated project and NULL elsewhere. It is a
+    // separate field from sequence_number on purpose: the native number keeps its
+    // allocator, and the bead id keeps the rig's. Once non-NULL it never changes and
+    // is never erased; the migration adds that guard.
+    beadId: text('bead_id'),
     typeId: integer('type_id').references(() => issueType.id, {
       onDelete: 'set null',
     }),
@@ -1581,6 +1618,11 @@ export const issue = pgTable(
   },
   (t) => [
     unique().on(t.projectId, t.sequenceNumber),
+    // The canonical id is unique across the instance because the rig prefix is part
+    // of the string: two rows can only share one by sharing a rig.
+    uniqueIndex('issue_bead_id_uq')
+      .on(t.beadId)
+      .where(sql`${t.beadId} IS NOT NULL`),
     check('issue_estimate_points_check', sql`${t.estimatePoints} >= 0`),
     check('issue_estimate_minutes_check', sql`${t.estimateMinutes} >= 0`),
     // Backs the board/list read (active issues of a project) and the worker's
@@ -1626,6 +1668,57 @@ export const issueKeyAlias = pgTable(
   (t) => [
     primaryKey({ columns: [t.projectId, t.sequenceNumber] }),
     index('issue_key_alias_issue_idx').on(t.issueId),
+  ],
+);
+
+// One identity a rig issued or imported, kept for good. The row, not the issue, is the
+// record: issue_id goes NULL when the issue is deleted, and the row stays so the token
+// is never handed out again. local_token is the identity and is stored verbatim, which
+// is how an imported historical id ('7vaoz-wmzyw', 'abc.def.ghi') keeps its exact text.
+// root and child are numeric coordinates only the minting path fills; an import may
+// carry neither. On a root, child is 0, not NULL.
+export const beadIdentity = pgTable(
+  'bead_identity',
+  {
+    id: serial('id').primaryKey(),
+    rigId: integer('rig_id')
+      .notNull()
+      .references(() => rig.id, { onDelete: 'restrict' }),
+    localToken: text('local_token').notNull(),
+    root: integer('root'),
+    // 0 for the root itself, n for its n-th daughter. NULL only on an import.
+    child: integer('child'),
+    // 'minted' is a token this rig issued; 'imported' is one preserved from an older
+    // board. Nothing rewrites an import into a minted shape.
+    origin: text('origin').notNull(),
+    issueId: integer('issue_id').references(() => issue.id, { onDelete: 'set null' }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    unique('bead_identity_rig_token_uq').on(t.rigId, t.localToken),
+    // One row per numeric coordinate, so two minted cards cannot claim one slot.
+    uniqueIndex('bead_identity_rig_numeric_uq')
+      .on(t.rigId, t.root, t.child)
+      .where(sql`${t.root} IS NOT NULL AND ${t.child} IS NOT NULL`),
+    // A live issue holds one identity; many tombstones hold none.
+    uniqueIndex('bead_identity_issue_uq')
+      .on(t.issueId)
+      .where(sql`${t.issueId} IS NOT NULL`),
+    check('bead_identity_origin_check', sql`${t.origin} IN ('minted', 'imported')`),
+    check('bead_identity_local_token_check', sql`${t.localToken} ~ '^[^[:space:]]+$'`),
+    // A minted token is exactly what its coordinates spell, which is what stops a
+    // minted row from carrying an arbitrary text token. An import is exempt: it keeps
+    // the text it arrived with.
+    check(
+      'bead_identity_minted_token_check',
+      sql`${t.origin} = 'imported' OR (
+        ${t.origin} = 'minted'
+        AND ${t.root} IS NOT NULL AND ${t.root} >= 1
+        AND ${t.child} IS NOT NULL AND ${t.child} >= 0
+        AND ${t.localToken} = ${t.root}::text
+          || CASE WHEN ${t.child} = 0 THEN '' ELSE '.' || ${t.child}::text END
+      )`,
+    ),
   ],
 );
 
