@@ -30,7 +30,11 @@ import {
   type BeadAllocation,
   type IdentityTransaction,
 } from '@repo/db/issue-identity';
-import { gateIssueWrite, isTrackerGateRefusal } from '@repo/db/tracker-gate';
+import {
+  gateIssueWrite,
+  isTrackerGateRefusal,
+  type TrackerGateRefusal,
+} from '@repo/db/tracker-gate';
 import { isIdFactsRefusal, snapshotIdFacts } from '@repo/db/tracker-issue-facts';
 import { alias } from 'drizzle-orm/pg-core';
 import {
@@ -1760,7 +1764,7 @@ async function finishCreate(
   // Suppress the label_changed event on creation - the initial labels are part of the issue.created
   // payload, so a separate change event would be redundant.
   if (input.labelIds?.length)
-    await setIssueLabels(projectId, issueId, input.labelIds, actorUserId, false, executor);
+    await writeIssueLabels(executor, projectId, issueId, input.labelIds, actorUserId, false);
   // Read after the labels, so the payload the webhook and the inbox carry already names them.
   const created = (await getIssue(issueId, executor))!;
   // The author follows what they filed; the assignee is subscribed by the assignment notification
@@ -2132,6 +2136,209 @@ export async function deleteIssue(
 // the middle would leave links, activity and a webhook row committed while the caller's own
 // work rolls back. `executor` stays LAST so `emitEvent` keeps its fourth/fifth positions and
 // every existing caller keeps the default pool.
+// 8364 U4: one exported door and one module-private seam. Every call that reaches setIssueLabels from
+// outside this module is judged by the owner first - on the default pool and on a caller's supplied
+// transaction alike, because a supplied executor is not a bypass. The private writeIssueLabels below is
+// called by exactly one place, finishCreate, whose create gate already judged these exact label names
+// under the locks create holds; judging the same labels again as an independent label op would re-lock
+// in the wrong position and could refuse a create whose issue row is already reserved. No flag,
+// capability or option on the exported signature skips the gate.
+//
+// Where the facts come from matters as much as the order. The stored labels, the card's title, its
+// description, who holds it and its bead id are read on the locked transaction after the locks are held;
+// nothing in the op is taken from the request. The rig hint only chooses the branch and the lock order,
+// exactly as createIssue uses it; the locked read of project.rig_id is the authority.
+//
+// Why the ordinary branch is fenced rather than trusted: at this base no apps/api code writes
+// project.rig_id, so activating a rig is an ordinary UPDATE of the project row wherever it runs.
+// Postgres makes that UPDATE wait for any transaction holding the row FOR SHARE, makes FOR SHARE wait
+// for an uncommitted UPDATE, and makes a FOR SHARE that waited re-read the newest committed row version.
+// So either this save commits first - the project was ordinary when the labels landed - or the
+// activation commits first, this read returns a rig, and the save refuses with 409 and zero writes.
+// Reading the unlocked hint a second time would not close that window; holding the row does.
+//
+// The ordinary branch now runs inside one transaction, which CT and Root accepted explicitly: the label
+// rows, the updatedAt, the activity rows and the queued webhook_delivery row commit together, so a
+// failure in the middle leaves no partial rows. The observable output of a successful ordinary call -
+// the default-argument path and emitEvent=false included - is unchanged, and the ordinary branch still
+// reads no owner config and spawns nothing.
+//
+// On a gated project a label change can move a card in or out of a routed domain for whoever already
+// holds it, and no authenticated lane fact exists at this base. So a real change on a card someone holds
+// carries routing_facts: null and the owner refuses in its own words until the routing seam exists;
+// when nobody holds the card the key is omitted and the owner's legacy answer stands. The cost is stated
+// plainly: a label change on an assigned or delegated gated card refuses for now.
+//
+// A shared @repo/db refusal mapped to the caller-facing shape the create path already gives: 409,
+// `rule: message`, and the compliant form. Local to this writer, so the create and update mappers stay
+// untouched.
+function labelGateRefusal(error: TrackerGateRefusal): HttpError {
+  const safe = error.safe_form ? ` Compliant form: ${error.safe_form}.` : '';
+  return new HttpError(409, `${error.rule}: ${error.message}.${safe}`, error.code);
+}
+
+// The label names the card actually carries, read on the locked transaction: this is the previous state,
+// not something the caller declared.
+async function storedLabelNames(executor: DbExecutor, issueId: number): Promise<string[]> {
+  const rows = await executor
+    .select({ name: label.name })
+    .from(issueLabel)
+    .innerJoin(label, eq(label.id, issueLabel.labelId))
+    .where(eq(issueLabel.issueId, issueId))
+    .orderBy(label.name);
+  return rows.map((row) => row.name);
+}
+
+// The names the write would put on the card, resolved from the ids through this project's own label
+// table in the requested order, so the post state is complete, deduplicated and project-scoped.
+async function proposedLabelNames(
+  executor: DbExecutor,
+  projectId: number,
+  labelIds: number[],
+): Promise<string[]> {
+  const ids = [...new Set(labelIds)];
+  if (ids.length === 0) return [];
+  const rows = await executor
+    .select({ id: label.id, name: label.name })
+    .from(label)
+    .where(and(eq(label.projectId, projectId), inArray(label.id, ids)));
+  const names = new Map(rows.map((row) => [row.id, row.name]));
+  return ids.map((id) => names.get(id)).filter((name): name is string => name !== undefined);
+}
+
+// The one locked read that makes the ordinary branch safe: the project row held FOR SHARE as the first
+// statement of the transaction. A non-null rig means the project became gated while this save waited, so
+// nothing is written and the caller is told to try again.
+async function ordinaryLabelSave(
+  executor: DbExecutor,
+  projectId: number,
+  issueId: number,
+  labelIds: number[],
+  actorUserId: string | null | undefined,
+  emitEvent: boolean,
+): Promise<void> {
+  const rows = (await executor.execute(
+    sql`SELECT rig_id FROM project WHERE id = ${projectId} FOR SHARE`,
+  )) as unknown as { rig_id: number | string | null }[];
+  const row = rows[0];
+  if (!row) throw new HttpError(404, 'Project not found');
+  if (row.rig_id !== null)
+    throw new HttpError(
+      409,
+      'This project changed its rig while the labels were being saved; try again',
+    );
+  await writeIssueLabels(executor, projectId, issueId, labelIds, actorUserId, emitEvent);
+}
+
+// The label names a write would put on the card, held as a set. The stored names come back ordered by
+// name and the proposed names keep the order the caller sent, so a plain list comparison would call a
+// resubmission of the same labels a change and route-judge a card nobody moved.
+function sameLabelSet(left: string[], right: string[]): boolean {
+  const a = new Set(left);
+  const b = new Set(right);
+  return a.size === b.size && [...a].every((name) => b.has(name));
+}
+
+// The gated save, in the lock order every other gated writer already uses: rig, board, project row, then
+// the issue row. Nothing here takes the rig or the board after holding the project, because a changed rig
+// throws instead of escalating a share lock into an update lock.
+async function gatedLabelSave(
+  executor: DbExecutor,
+  rigHint: number,
+  projectId: number,
+  issueId: number,
+  labelIds: number[],
+  actorUserId: string | null | undefined,
+  emitEvent: boolean,
+): Promise<void> {
+  const rigs = (await executor.execute(
+    sql`SELECT id, prefix FROM rig WHERE id = ${rigHint} FOR UPDATE`,
+  )) as unknown as { id: number; prefix: string }[];
+  const rig = rigs[0];
+  if (!rig)
+    throw new HttpError(
+      409,
+      'This project changed its rig while the labels were being saved; try again',
+    );
+  await lockIssueTree(executor, projectId);
+  const rigId = await lockProjectRig(executor, projectId);
+  if (rigId !== rigHint)
+    throw new HttpError(
+      409,
+      'This project changed its rig while the labels were being saved; try again',
+    );
+  const cards = (await executor.execute(
+    sql`SELECT id, project_id, title, description, assignee_user_id, delegate_user_id
+        FROM issue WHERE id = ${issueId} FOR UPDATE`,
+  )) as unknown as {
+    id: number;
+    project_id: number;
+    title: string;
+    description: string | null;
+    assignee_user_id: string | null;
+    delegate_user_id: string | null;
+  }[];
+  const card = cards[0];
+  if (!card || Number(card.project_id) !== projectId) throw new HttpError(404, 'Issue not found');
+  // The identity the owner judges is the ledger row for this issue under the rig this transaction locked,
+  // built exactly the way create builds it. The mirror column on the issue row cannot stand in for it: it
+  // is null on a card created while the project was ordinary, and it keeps the previous rig's token when
+  // the project's rig changes, so either one would hand the owner an id that does not belong to the rig
+  // whose lock is held here.
+  const ledgers = (await executor.execute(
+    sql`SELECT local_token FROM bead_identity WHERE issue_id = ${issueId} AND rig_id = ${rigId}`,
+  )) as unknown as { local_token: string }[];
+  if (ledgers.length !== 1)
+    throw new HttpError(
+      409,
+      `Issue ${issueId} carries no ledger identity for this rig, so its labels cannot be judged`,
+      'issue-without-identity',
+    );
+  const beadId = `${rig.prefix}-${ledgers[0].local_token}`;
+  await assertIssueLabels(projectId, labelIds, executor);
+  const previousLabels = await storedLabelNames(executor, issueId);
+  const proposedLabels = await proposedLabelNames(executor, projectId, labelIds);
+  // The description the owner is judged on is the stored one, carried forward as text: a mutable
+  // full-state write must hold the description key as a string, and this writer changes no prose.
+  const description = typeof card.description === 'string' ? card.description : '';
+  const op: Record<string, unknown> = {
+    op: 'label',
+    id: beadId,
+    rig_prefix: rig.prefix,
+    title: card.title,
+    description,
+    labels: proposedLabels,
+    previous_state: {
+      title: card.title,
+      description,
+      labels: previousLabels,
+      bead_id: beadId,
+    },
+    proposed_state: {
+      title: card.title,
+      description,
+      labels: proposedLabels,
+      bead_id: beadId,
+    },
+  };
+  // Only a real change can move a card between routed domains, and only a card somebody holds needs a
+  // routing judgement. With no authenticated seam to build the facts from, the op says so plainly.
+  if (
+    !sameLabelSet(previousLabels, proposedLabels) &&
+    (card.assignee_user_id || card.delegate_user_id)
+  )
+    op.routing_facts = null;
+  try {
+    await gateIssueWrite({ rigId, op });
+  } catch (error) {
+    if (isTrackerGateRefusal(error)) throw labelGateRefusal(error);
+    throw error;
+  }
+  await writeIssueLabels(executor, projectId, issueId, labelIds, actorUserId, emitEvent);
+}
+
+// The gated door. Its signature is unchanged, so every existing caller keeps the same call and the same
+// default pool. The hint decides only the branch and the lock order.
 export async function setIssueLabels(
   projectId: number,
   issueId: number,
@@ -2139,6 +2346,46 @@ export async function setIssueLabels(
   actorUserId?: string | null,
   emitEvent = true,
   executor: DbExecutor = db,
+): Promise<void> {
+  const rigHint = await projectRigHint(executor, projectId);
+  if (rigHint === null) {
+    if (executor === db) {
+      await db.transaction(
+        async (tx) =>
+          await ordinaryLabelSave(tx, projectId, issueId, labelIds, actorUserId, emitEvent),
+      );
+      return;
+    }
+    await ordinaryLabelSave(executor, projectId, issueId, labelIds, actorUserId, emitEvent);
+    return;
+  }
+  if (executor === db) {
+    await db.transaction(
+      async (tx) =>
+        await gatedLabelSave(tx, rigHint, projectId, issueId, labelIds, actorUserId, emitEvent),
+    );
+    return;
+  }
+  await gatedLabelSave(executor, rigHint, projectId, issueId, labelIds, actorUserId, emitEvent);
+}
+
+// The writer itself: the body setIssueLabels had at this base, byte for byte apart from the signature,
+// which now takes the executor first because it is the module's private seam and not a public call.
+// Replaces the issue's full label set (not an add/remove diff) and logs the added/removed labels to the
+// activity feed. projectId is the issue's project: a label outside it is rejected before anything is
+// written. WHY every query here takes the executor: a label change is four writes and three reads (the
+// before-state, the link delete/insert, the issue's updatedAt, then the name snapshot, the activity rows
+// and the webhook row). Split across the default client and the caller's transaction, the reads cannot
+// see the writes - the name snapshot would miss a label the same transaction just added, the read-back
+// DTO would show the old links, and a failure in the middle would leave links, activity and a webhook
+// row committed while the caller's own work rolls back.
+async function writeIssueLabels(
+  executor: DbExecutor,
+  projectId: number,
+  issueId: number,
+  labelIds: number[],
+  actorUserId?: string | null,
+  emitEvent = true,
 ): Promise<void> {
   await assertIssueLabels(projectId, labelIds, executor);
   const beforeRows = await executor
@@ -2283,6 +2530,12 @@ export async function bulkAddLabels(
   labelIds: number[],
   actorUserId?: string | null,
 ): Promise<number> {
+  // 8364 U4: a gated bulk label change is disabled here rather than judged member by member. A bulk
+  // write must validate every member before committing any, and gating each issue on its own would let
+  // some cards change while others refuse. Refusing the whole operation disables it instead of bypassing
+  // the gate; real gated bulk belongs to the bulk unit. Ordinary projects are unchanged.
+  if ((await projectRigHint(db, projectId)) !== null)
+    throw new HttpError(409, 'Bulk label changes are not available on a gated project yet');
   const add = [...new Set(labelIds)];
   await assertIssueLabels(projectId, add);
   const valid = await issuesInProject(projectId, ids);
