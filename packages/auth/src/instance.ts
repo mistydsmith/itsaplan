@@ -10,6 +10,7 @@ import {
   defaultInstanceEmailConfig,
   getInstanceEmailConfig,
   INSTANCE_EMAIL_SECRET_KEY,
+  type DbExecutor,
   type InstanceEmailConfig,
 } from '@repo/db';
 import { and, eq, gte, like, lt, sql } from 'drizzle-orm';
@@ -306,9 +307,14 @@ export interface EmailTemplateSettings {
   layout: EmailLayout | null;
 }
 
-export async function getEmailTemplateSettings(): Promise<EmailTemplateSettings> {
+// The optional executor lets a caller read the stored templates inside its own transaction, so a
+// compose that must see an uncommitted setting can. The default keeps every existing caller on the
+// shared client.
+export async function getEmailTemplateSettings(
+  executor: DbExecutor = db,
+): Promise<EmailTemplateSettings> {
   return (
-    (await getSetting<EmailTemplateSettings>(EMAIL_TEMPLATES_SETTING_KEY)) ?? {
+    (await getSetting<EmailTemplateSettings>(EMAIL_TEMPLATES_SETTING_KEY, executor)) ?? {
       texts: {},
       layout: null,
     }

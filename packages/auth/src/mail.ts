@@ -14,7 +14,7 @@ import {
   type Locale,
   type RenderedEmail,
 } from '@repo/mailer';
-import { db, getInstanceEmailConfig, user, userPreference } from '@repo/db';
+import { db, getInstanceEmailConfig, user, userPreference, type DbExecutor } from '@repo/db';
 import { eq, inArray } from 'drizzle-orm';
 import { getEmailTemplateSettings } from './instance';
 import { trustedOrigins } from './origins';
@@ -24,15 +24,18 @@ function emailSite(): EmailSite {
   return { name: "It's a Plan", url, logoUrl: `${url}/icon-192.png` };
 }
 
+// composeEmail only renders: the executor lets a caller read the stored template inside its own
+// transaction, and nothing here sends. The trailing parameter keeps every existing call unchanged.
 export async function composeEmail(
   key: string,
   locale: Locale,
   vars: Record<string, string> = {},
   url?: string,
+  executor: DbExecutor = db,
 ): Promise<RenderedEmail> {
   const template = emailTemplate(key);
   if (!template) throw new Error(`Unknown email template "${key}".`);
-  const settings = await getEmailTemplateSettings();
+  const settings = await getEmailTemplateSettings(executor);
   return renderEmail({
     text: settings.texts[key]?.[locale] ?? defaultEmailText(template, locale),
     layout: settings.layout ?? DEFAULT_EMAIL_LAYOUT,
@@ -57,9 +60,12 @@ export function composeEmailDraft(
 }
 
 // The language each account saved. An account that has not opened the app yet has no row.
-export async function savedLocales(userIds: string[]): Promise<Map<string, Locale>> {
+export async function savedLocales(
+  userIds: string[],
+  executor: DbExecutor = db,
+): Promise<Map<string, Locale>> {
   if (userIds.length === 0) return new Map();
-  const rows = await db
+  const rows = await executor
     .select({ userId: userPreference.userId, locale: userPreference.locale })
     .from(userPreference)
     .where(inArray(userPreference.userId, userIds));
