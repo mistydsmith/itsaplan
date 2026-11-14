@@ -1,5 +1,5 @@
 import { eq, sql } from 'drizzle-orm';
-import { db } from './client';
+import { db, type DbExecutor } from './client';
 import { appSetting } from './schema/app';
 
 // Data access for global instance settings (app_setting): a key-value store, not
@@ -7,8 +7,11 @@ import { appSetting } from './schema/app';
 // one table backs many settings. It lives here rather than in the api because both
 // the api (god mode routes) and @repo/auth (the registration gate) read it.
 
-export async function getSetting<T>(key: string): Promise<T | null> {
-  const rows = await db
+// `executor` defaults to the process pool, so an ordinary call is unchanged. A caller
+// that is already inside a transaction passes it, and the read then sees that
+// transaction's own uncommitted rows and takes no second connection.
+export async function getSetting<T>(key: string, executor: DbExecutor = db): Promise<T | null> {
+  const rows = await executor
     .select({ value: appSetting.value })
     .from(appSetting)
     .where(eq(appSetting.key, key));
