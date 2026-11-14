@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { aiAgent, db, user, webhook, webhookDelivery } from '@repo/db';
+import { aiAgent, db, user, webhook, webhookDelivery, type DbExecutor } from '@repo/db';
 import { and, eq, sql } from 'drizzle-orm';
 import type { ActivityActor } from '#modules/issues/activity';
 import {
@@ -38,10 +38,13 @@ interface WebhookActor {
   name: string | null;
 }
 
-async function resolveActor(actor: ActivityActor): Promise<WebhookActor> {
+async function resolveActor(
+  actor: ActivityActor,
+  executor: DbExecutor = db,
+): Promise<WebhookActor> {
   if (!actor) return { type: 'system', id: null, name: null };
   if (typeof actor === 'object') return { type: 'system', id: null, name: actor.system };
-  const [row] = await db
+  const [row] = await executor
     .select({ name: user.name, agentId: aiAgent.id })
     .from(user)
     .leftJoin(aiAgent, eq(aiAgent.userId, user.id))
@@ -84,8 +87,8 @@ export async function projectEventWanted(
 }
 
 // The active webhooks of the project that subscribe to eventType.
-function subscribedWebhooks(projectId: number, eventType: string) {
-  return db
+function subscribedWebhooks(projectId: number, eventType: string, executor: DbExecutor = db) {
+  return executor
     .select({ id: webhook.id })
     .from(webhook)
     .where(
@@ -116,6 +119,7 @@ export async function emitWebhookEvents(
   eventType: WebhookEventType,
   load: () => Promise<unknown[]>,
   actor: ActivityActor,
+  executor: DbExecutor = db,
 ): Promise<void> {
   let loaded: Promise<unknown[]> | undefined;
   const loadOnce = () => (loaded ??= load());
@@ -127,7 +131,7 @@ export async function emitWebhookEvents(
     }
   }
 
-  await deliver(projectId, eventType, EVENT_SHAPE[eventType], loadOnce, actor);
+  await deliver(projectId, eventType, EVENT_SHAPE[eventType], loadOnce, actor, executor);
 }
 
 // Sends an event an extension adds (setWebhookEvents) to the webhooks of the project that
@@ -149,19 +153,20 @@ async function deliver(
   { action, type }: EventShape,
   load: () => Promise<unknown[]>,
   actor: ActivityActor,
+  executor: DbExecutor = db,
 ): Promise<void> {
-  const matching = await subscribedWebhooks(projectId, eventType);
+  const matching = await subscribedWebhooks(projectId, eventType, executor);
   if (matching.length === 0) return;
 
   const payloads = await load();
   if (payloads.length === 0) return;
 
-  const resolvedActor = await resolveActor(actor);
+  const resolvedActor = await resolveActor(actor, executor);
   const now = new Date();
   const createdAt = now.toISOString();
   const webhookTimestamp = now.getTime();
 
-  await db.insert(webhookDelivery).values(
+  await executor.insert(webhookDelivery).values(
     payloads.flatMap((data) => {
       const eventId = randomUUID();
       return matching.map((h) => ({

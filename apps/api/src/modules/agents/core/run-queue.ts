@@ -149,24 +149,27 @@ async function countClaimedRuns(executor: DbExecutor): Promise<number> {
   return row?.count ?? 0;
 }
 
-export async function enqueueAgentRun(input: {
-  agentId: number;
-  // The project the run works in, which is the issue's or the document's. An agent works
-  // in several projects, so the run carries its own rather than reading the agent's.
-  projectId: number;
-  issueId: number | null;
-  sourceActivityId: number | null;
-  // A mention in a document comment: the document and the comment, with no issue.
-  documentId?: number;
-  sourceDocumentCommentId?: string;
-  prompt: string;
-  trigger?: 'mention' | 'delegation' | 'field';
-  // Seconds the run stays unclaimable after it is queued, so the issue can still be
-  // edited before the agent reads it.
-  delaySeconds?: number;
-}): Promise<void> {
+export async function enqueueAgentRun(
+  input: {
+    agentId: number;
+    // The project the run works in, which is the issue's or the document's. An agent works
+    // in several projects, so the run carries its own rather than reading the agent's.
+    projectId: number;
+    issueId: number | null;
+    sourceActivityId: number | null;
+    // A mention in a document comment: the document and the comment, with no issue.
+    documentId?: number;
+    sourceDocumentCommentId?: string;
+    prompt: string;
+    trigger?: 'mention' | 'delegation' | 'field';
+    // Seconds the run stays unclaimable after it is queued, so the issue can still be
+    // edited before the agent reads it.
+    delaySeconds?: number;
+  },
+  executor: DbExecutor = db,
+): Promise<void> {
   const delay = Math.max(0, Math.trunc(input.delaySeconds ?? 0));
-  await db.insert(agentRun).values({
+  await executor.insert(agentRun).values({
     agentId: input.agentId,
     projectId: input.projectId,
     issueId: input.issueId,
