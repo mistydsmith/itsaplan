@@ -254,6 +254,8 @@ export function commentOp(input: {
   // every body a delete removes. Never a body the request supplied.
   superseded: string[];
   targetId?: number;
+  // The rows this write removes outright: a delete drops the root and every locked descendant, so the
+  // proposed live list is the remainder and the cascade is never appended back.
   omitIds?: number[];
   editBody?: string;
   agentReached: boolean;
@@ -296,6 +298,55 @@ export function commentOp(input: {
   };
   if (input.agentReached) op.routing_facts = null;
   return op;
+}
+
+// The root and every comment reply under it, locked to a fixed point.
+//
+// WHY the loop rather than one query: a reply insert takes FOR KEY SHARE on its parent through the FK
+// check, which conflicts with FOR UPDATE, so a child committed before we locked its parent is seen by the
+// next round, and a child still in flight makes our lock wait and then appear. Once every row in the set
+// is FOR UPDATE, no new child can attach to any of them before commit, so the FK cascade deletes exactly
+// what was versioned. A cross-issue or non-comment descendant is legacy data this seam cannot version, so
+// the whole delete refuses.
+export async function lockCommentCascade(
+  executor: DbExecutor,
+  root: LockedComment,
+): Promise<LockedComment[]> {
+  const locked: LockedComment[] = [root];
+  let frontier = [root.commentId];
+  while (frontier.length > 0) {
+    const rows = (await executor.execute(sql`
+      SELECT id, issue_id, kind, body, actor_user_id FROM issue_activity
+      WHERE reply_to_id = ANY(${sql.raw(`ARRAY[${frontier.join(',')}]::int[]`)})
+        AND id <> ALL(${sql.raw(`ARRAY[${locked.map((row) => row.commentId).join(',')}]::int[]`)})
+      ORDER BY id FOR UPDATE`)) as unknown as {
+      id: number;
+      issue_id: number | null;
+      kind: string;
+      body: string | null;
+      actor_user_id: string | null;
+    }[];
+    if (rows.length === 0) break;
+    for (const row of rows) {
+      if (row.issue_id !== root.issueId || row.kind !== 'comment') {
+        throw new HttpError(
+          409,
+          'This comment has replies this seam cannot version; delete it from the board instead',
+          'comment-cascade-unsupported',
+        );
+      }
+      locked.push({
+        commentId: row.id,
+        issueId: row.issue_id,
+        projectId: root.projectId,
+        body: row.body ?? '',
+        authorUserId: row.actor_user_id,
+        rigId: root.rigId,
+      });
+    }
+    frontier = rows.map((row) => row.id);
+  }
+  return locked;
 }
 
 // The live comment rows in the record's order (W1's ORDER BY id), with the bodies the op needs.

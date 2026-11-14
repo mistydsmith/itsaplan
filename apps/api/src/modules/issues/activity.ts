@@ -23,6 +23,7 @@ import {
   gateCommentOp,
   insertVersion,
   liveCommentRows,
+  lockCommentCascade,
   lockCommentForWrite,
   ownerCardFacts,
   readCommentTarget,
@@ -788,14 +789,61 @@ export async function deleteComment(
   actorUserId: string | null,
   projectId: number,
 ): Promise<boolean> {
-  const [before] = await db
-    .select()
-    .from(issueActivity)
-    .where(and(eq(issueActivity.id, commentId), eq(issueActivity.kind, 'comment')));
-  if (!before) return false;
-  await db.delete(issueActivity).where(eq(issueActivity.id, commentId));
-  await recordActivity(before.issueId as number, [{ action: 'comment_deleted' }], actorUserId);
-  await emitCommentEvent(projectId, 'comment.deleted', mapFeedItem(before), actorUserId);
+  // The pool read is a hint only; the row is re-read under its lock inside the write. A comment that is
+  // not there is `false`, which is what this public function has always returned.
+  const hint = await readCommentTarget(db, commentId);
+  if (!hint || hint.projectId !== projectId) return false;
+
+  const outcome = await db.transaction(async (tx) => {
+    const root = await lockCommentForWrite(tx, hint, projectId);
+    // The root and every reply under it are locked and versioned together; a cross-issue or non-comment
+    // descendant refuses the whole delete before anything is written.
+    const cascade = await lockCommentCascade(tx, root);
+    if (root.rigId !== null) {
+      const facts = await ownerCardFacts(tx, root.issueId, root.rigId);
+      const op = commentOp({
+        opName: 'comment_delete',
+        facts,
+        versions: await storedVersionBodies(tx, root.issueId),
+        liveBefore: await liveCommentRows(tx, root.issueId),
+        // Every body this delete removes, from the locked rows - never from the request.
+        superseded: cascade.map((row) => row.body),
+        // The whole locked cascade leaves the post-write list, not just the root.
+        omitIds: cascade.map((row) => row.commentId),
+        agentReached: false,
+      });
+      try {
+        await gateCommentOp(root.rigId, op);
+      } catch (error) {
+        if (isTrackerGateRefusal(error)) {
+          const safe = error.safe_form ? ` Compliant form: ${error.safe_form}.` : '';
+          throw new HttpError(409, `${error.rule}: ${error.message}.${safe}`, error.code);
+        }
+        throw error;
+      }
+    }
+    // One final version per locked comment, carrying that row's own original author, before removal.
+    for (const row of cascade) await insertVersion(tx, row, { deletedAfter: true });
+    const [before] = await tx
+      .select()
+      .from(issueActivity)
+      .where(and(eq(issueActivity.id, commentId), eq(issueActivity.kind, 'comment')));
+    if (!before) return { removed: false, written: null, issueId: 0, gated: root.rigId !== null };
+    // The root goes; the replies follow through the existing reply_to_id cascade, exactly as today.
+    await tx.delete(issueActivity).where(eq(issueActivity.id, commentId));
+    const written = mapFeedItem(before);
+    if (root.rigId !== null) {
+      await recordActivity(root.issueId, [{ action: 'comment_deleted' }], actorUserId, tx);
+      await emitCommentEvent(projectId, 'comment.deleted', written, actorUserId, tx);
+    }
+    return { removed: true, written, issueId: root.issueId, gated: root.rigId !== null };
+  });
+
+  if (!outcome.removed || !outcome.written) return false;
+  if (outcome.gated) return true;
+  // Ordinary: today's two effects, after the commit, on the default client.
+  await recordActivity(outcome.issueId, [{ action: 'comment_deleted' }], actorUserId);
+  await emitCommentEvent(projectId, 'comment.deleted', outcome.written, actorUserId);
   return true;
 }
 
