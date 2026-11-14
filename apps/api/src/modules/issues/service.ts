@@ -1248,8 +1248,12 @@ async function gateUpdateWrite(
     patch: IssuePatch;
     set: Partial<typeof issue.$inferInsert>;
     skipIfColumnFull: boolean;
+    onlyIfColumnId?: number;
   },
-): Promise<Partial<typeof issue.$inferInsert> | null> {
+): Promise<{
+  writeSet: Partial<typeof issue.$inferInsert>;
+  lockedBefore: IssueSnapshot & { projectId: number; parentId: number | null };
+} | null> {
   const { id, before, patch, set, skipIfColumnFull } = input;
   const rigRows = (await tx.execute(
     sql`SELECT id FROM rig WHERE id = ${input.rigHint} FOR UPDATE`,
@@ -1282,6 +1286,9 @@ async function gateUpdateWrite(
     // that moved projects under the locks is not the write those checks cover.
     throw new HttpError(409, 'This issue moved projects while it was being updated; try again');
   }
+  // A caller that conditioned the write on a column is judged here, on the locked row, before the
+  // owner is asked: the owner must never judge a write this guard is about to drop.
+  if (input.onlyIfColumnId != null && lockedBefore.columnId !== input.onlyIfColumnId) return null;
   if (patch.parentId != null) await assertTreeLink(id, patch.parentId, tx);
   // The pool's answers were early only: whether the write is a move at all is judged against
   // the locked row, so a card another writer already put in the target column is not counted
@@ -1333,7 +1340,7 @@ async function gateUpdateWrite(
       'close-facts-missing',
     );
   }
-  return writeSet;
+  return { writeSet, lockedBefore };
 }
 
 // The operation the rule owner judges a gated update on, built only from facts this
@@ -1929,22 +1936,68 @@ export async function updateIssue(
       opts?.onlyIfColumnId == null
         ? eq(issue.id, id)
         : and(eq(issue.id, id), eq(issue.columnId, opts.onlyIfColumnId));
-    const updated = await db
+    // A gated write runs the whole side-effect sequence on its own transaction, before the commit, and
+    // hands the written row back; an ordinary project keeps its post-commit geometry and finishes on
+    // the default client. Either way the diff is taken from the state the write actually changed.
+    const outcome = await db
       .transaction(async (tx) => {
         const rigHint = await projectRigHint(tx, before.projectId);
-        const writeSet =
-          rigHint === null
-            ? await ordinaryUpdatePrep(tx, before.projectId, patch.parentId, id, set)
-            : await gateUpdateWrite(tx, {
-                rigHint,
-                id,
-                before,
-                patch,
-                set,
-                skipIfColumnFull: opts?.skipIfColumnFull === true,
-              });
-        if (writeSet === null) return [] as { id: number }[];
-        return tx.update(issue).set(writeSet).where(guard).returning({ id: issue.id });
+        if (rigHint === null) {
+          const writeSet = await ordinaryUpdatePrep(tx, before.projectId, patch.parentId, id, set);
+          if (writeSet === null)
+            return {
+              wrote: false,
+              after: null as IssueRow | null,
+              judgedColumnId: before.columnId,
+            };
+          const rows = await tx
+            .update(issue)
+            .set(writeSet)
+            .where(guard)
+            .returning({ id: issue.id });
+          return {
+            wrote: rows.length > 0,
+            after: null as IssueRow | null,
+            judgedColumnId: before.columnId,
+          };
+        }
+        const gated = await gateUpdateWrite(tx, {
+          rigHint,
+          id,
+          before,
+          patch,
+          set,
+          skipIfColumnFull: opts?.skipIfColumnFull === true,
+          onlyIfColumnId: opts?.onlyIfColumnId,
+        });
+        if (gated === null)
+          return { wrote: false, after: null as IssueRow | null, judgedColumnId: before.columnId };
+        const rows = await tx
+          .update(issue)
+          .set(gated.writeSet)
+          .where(guard)
+          .returning({ id: issue.id });
+        if (rows.length === 0)
+          return { wrote: false, after: null as IssueRow | null, judgedColumnId: before.columnId };
+        const afterTx = await getIssue(id, tx);
+        if (!afterTx) {
+          // The row this transaction just locked and updated must read back on the same transaction. If
+          // it does not, something is wrong with the write itself: refuse here rather than letting a
+          // gated write finish later on the pool.
+          throw new Error('This issue could not be read back inside its own update transaction');
+        }
+        // The diff uses the row the gate locked, never the pool snapshot: the pool copy can be stale,
+        // which would duplicate or drop status stretches, activity and notifications.
+        if (afterTx) {
+          await finishUpdate(tx, {
+            id,
+            before: gated.lockedBefore,
+            after: afterTx,
+            changed: true,
+            actor,
+          });
+        }
+        return { wrote: true, after: afterTx, judgedColumnId: gated.lockedBefore.columnId };
       })
       .catch((error) => {
         // The shared @repo/db refusal cannot import an API HttpError, so the gate's refusal is
@@ -1956,31 +2009,63 @@ export async function updateIssue(
         }
         throw error;
       });
-    if (updated.length === 0) return getIssue(id);
-  }
-  const after = await getIssue(id);
-  if (after) {
-    const afterSnapshot = snapshot(after);
-    if (before.columnId !== afterSnapshot.columnId)
-      await recordStatusChange([id], afterSnapshot.columnId);
-    await logIssueUpdate(before, afterSnapshot, actor);
-    await recordCycleChange(id, before.cycleId, afterSnapshot.cycleId);
-    if (before.parentId !== after.parentId)
-      await recordParentChange(id, before.parentId, after.parentId, actor);
-    if (changed) {
-      await emitIssueEvent('issue.updated', after, actor);
-      // Granular events fire in addition to issue.updated when their field changed.
-      if (before.assigneeUserId !== after.assigneeUserId)
-        await emitIssueEvent('issue.assigned', after, actor);
-      if (before.delegateUserId !== after.delegateUserId) await enqueueDelegateRun(after, actor);
-      if (before.columnId !== after.columnId) {
-        await emitIssueEvent('issue.state_changed', after, actor);
-        await queueStatusRuns([id], after.columnId, actorId(actor));
-        await applySubtaskAutomation(after, actor);
-      }
+    if (!outcome.wrote) return getIssue(id);
+    if (outcome.after) {
+      // Gated: everything already ran on the write's transaction. Only the subtask cascade stays
+      // post-commit, because its nested updateIssue would wait on the rig row this call still holds.
+      if (outcome.judgedColumnId !== outcome.after.columnId)
+        await applySubtaskAutomation(outcome.after, actor);
+      return outcome.after;
     }
+    const afterOrdinary = await getIssue(id);
+    if (afterOrdinary) {
+      await finishUpdate(db, { id, before, after: afterOrdinary, changed: true, actor });
+      if (before.columnId !== afterOrdinary.columnId)
+        await applySubtaskAutomation(afterOrdinary, actor);
+    }
+    return afterOrdinary;
   }
-  return after;
+  // Nothing to write: the sequence still runs on the default client, where its calls are no-ops when
+  // the snapshot did not move, exactly as before.
+  const current = await getIssue(id);
+  if (current) await finishUpdate(db, { id, before, after: current, changed: false, actor });
+  return current;
+}
+
+// The update side effects, in the order they have always run. A gated write passes its transaction so a
+// failure here rolls the write back with them; an ordinary project passes the default client after the
+// commit. The subtask cascade is deliberately not here: it calls updateIssue again, which opens its own
+// transaction and would wait on the rig row the caller still holds, with no deadlock for Postgres to
+// detect.
+async function finishUpdate(
+  executor: DbExecutor,
+  facts: {
+    id: number;
+    before: IssueSnapshot & { parentId: number | null };
+    after: IssueRow;
+    changed: boolean;
+    actor?: ActivityActor;
+  },
+): Promise<void> {
+  const { id, before, after, changed, actor } = facts;
+  const afterSnapshot = snapshot(after);
+  if (before.columnId !== afterSnapshot.columnId)
+    await recordStatusChange([id], afterSnapshot.columnId, undefined, executor);
+  await logIssueUpdate(before, afterSnapshot, actor, executor);
+  await recordCycleChange(id, before.cycleId, afterSnapshot.cycleId, executor);
+  if (before.parentId !== after.parentId)
+    await recordParentChange(id, before.parentId, after.parentId, actor, executor);
+  if (!changed) return;
+  await emitIssueEvent('issue.updated', after, actor, {}, executor);
+  // Granular events fire in addition to issue.updated when their field changed.
+  if (before.assigneeUserId !== afterSnapshot.assigneeUserId)
+    await emitIssueEvent('issue.assigned', after, actor, {}, executor);
+  if (before.delegateUserId !== afterSnapshot.delegateUserId)
+    await enqueueDelegateRun(after, actor, executor);
+  if (before.columnId !== afterSnapshot.columnId) {
+    await emitIssueEvent('issue.state_changed', after, actor, {}, executor);
+    await queueStatusRuns([id], afterSnapshot.columnId, actorId(actor), executor);
+  }
 }
 
 // If an issue's new delegate is an agent that reacts to delegation, queue a run so it
