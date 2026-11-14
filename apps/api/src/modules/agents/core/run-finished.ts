@@ -1,4 +1,4 @@
-import { agentRun, aiAgent, db, issue, project, user } from '@repo/db';
+import { agentRun, aiAgent, db, issue, project, user, type DbExecutor } from '@repo/db';
 import { eq, inArray } from 'drizzle-orm';
 import { alias } from 'drizzle-orm/pg-core';
 import type { ActivityActor } from '#modules/issues/activity';
@@ -16,17 +16,22 @@ export function emitRunsFinished(runIds: number[]): Promise<void> {
 }
 
 // Runs someone ended before their agent did.
-export function emitRunsCanceled(runIds: number[], actor: ActivityActor): Promise<void> {
-  return emitEnded(runIds, () => actor);
+export function emitRunsCanceled(
+  runIds: number[],
+  actor: ActivityActor,
+  executor: DbExecutor = db,
+): Promise<void> {
+  return emitEnded(runIds, () => actor, executor);
 }
 
 async function emitEnded(
   runIds: number[],
   actorOf: (agentUserId: string) => ActivityActor,
+  executor: DbExecutor = db,
 ): Promise<void> {
   if (runIds.length === 0) return;
   const groups = new Map<string, { projectId: number; actor: ActivityActor; runs: EndedRun[] }>();
-  for (const row of await selectRuns(runIds)) {
+  for (const row of await selectRuns(runIds, executor)) {
     const actor = actorOf(row.agentUserId);
     const key = `${row.projectId}:${JSON.stringify(actor ?? null)}`;
     const group = groups.get(key) ?? { projectId: row.projectId, actor, runs: [] };
@@ -39,6 +44,7 @@ async function emitEnded(
       'agent_run.finished',
       async () => runs.map(runPayload),
       actor,
+      executor,
     );
   }
 }
@@ -46,8 +52,8 @@ async function emitEnded(
 // An issue moved to another project keeps its runs in the project they worked in.
 const issueProject = alias(project, 'issue_project');
 
-function selectRuns(runIds: number[]) {
-  return db
+function selectRuns(runIds: number[], executor: DbExecutor = db) {
+  return executor
     .select({
       id: agentRun.id,
       status: agentRun.status,
