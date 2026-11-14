@@ -62,16 +62,98 @@ export async function subtreeIds(issueIds: number[], executor: DbExecutor = db):
   return rows.map((row) => row.id);
 }
 
-// Why issueId cannot go under parentId, or null when it can: 'cycle' when the parent
-// is the issue itself or one of its subtasks at any level, 'depth' when the issue
-// and the subtasks under it would reach past MAX_SUBTASK_DEPTH. issueId is null for
-// an issue being created, which has no subtasks yet.
+// Why issueId cannot go under parentId, or null when it can.
+//
+// 'cycle' means the parent is the issue itself, one of its subtasks at any level, or the
+// parent chain already loops in stored data. 'depth' is the ordinary project limit being
+// passed. 'missing-parent' and 'cross-project' are the association problems, which the
+// caller turns into the 400 it already answers with.
+//
+// A gated project, one whose project row carries a rig_id, has no depth cap at all:
+// SPEC_R2 rejects any arbitrary cap for those projects, so the only limits there are the
+// cycle rules. That decision is read from the database through the supplied executor, never
+// from a caller-supplied flag, because a flag would be authority a request could fake.
+//
+// expectedProjectId is for a fresh create, where issueId is null and the project cannot be
+// read from the issue row. It is the project the caller has already locked, so the
+// association is revalidated against it under the lock instead of being trusted.
+export interface ParentLinkOptions {
+  expectedProjectId?: number;
+}
+
+export type ParentLinkProblem = 'cycle' | 'depth' | 'missing-parent' | 'cross-project' | null;
+
 export async function parentLinkProblem(
   issueId: number | null,
   parentId: number,
   executor: DbExecutor = db,
-): Promise<'cycle' | 'depth' | null> {
+  options: ParentLinkOptions = {},
+): Promise<ParentLinkProblem> {
   if (issueId === parentId) return 'cycle';
+
+  const parentRows = (await executor.execute(
+    sql`SELECT id, project_id FROM issue WHERE id = ${parentId}`,
+  )) as unknown as { id: number; project_id: number }[];
+  const parent = parentRows[0];
+  if (!parent) return 'missing-parent';
+
+  // For an existing issue the row owns the association, so a supplied project is only a claim
+  // about it and a disagreement refuses. The expected project decides the project only for a
+  // fresh create, where there is no issue row yet.
+  let projectId: number | null = null;
+  if (issueId !== null) {
+    const ownRows = (await executor.execute(
+      sql`SELECT project_id FROM issue WHERE id = ${issueId}`,
+    )) as unknown as { project_id: number }[];
+    const actual = ownRows[0]?.project_id ?? null;
+    if (options.expectedProjectId !== undefined && Number(options.expectedProjectId) !== actual) {
+      return 'cross-project';
+    }
+    projectId = actual;
+  } else if (options.expectedProjectId !== undefined) {
+    projectId = options.expectedProjectId;
+  }
+  if (projectId === null) projectId = Number(parent.project_id);
+  if (Number(parent.project_id) !== projectId) return 'cross-project';
+
+  const rigRows = (await executor.execute(
+    sql`SELECT rig_id FROM project WHERE id = ${projectId}`,
+  )) as unknown as { rig_id: number | null }[];
+  const gated = rigRows[0]?.rig_id != null;
+
+  if (gated) {
+    // The walk is a finite UNION, so stored data that already loops ends it instead of
+    // running forever, and the loop is then detected in memory. No level cap is applied:
+    // a gated chain of any length is allowed, archived parents included, because nothing
+    // here filters on archived_at.
+    const rows = (await executor.execute(sql`
+      WITH RECURSIVE up(id, parent_id, project_id) AS (
+        SELECT id, parent_id, project_id FROM issue WHERE id = ${parentId}
+        UNION
+        SELECT i.id, i.parent_id, i.project_id FROM issue i JOIN up ON i.id = up.parent_id
+      )
+      SELECT id, parent_id, project_id FROM up
+    `)) as unknown as { id: number; parent_id: number | null; project_id: number }[];
+    const parentOf = new Map(rows.map((row) => [row.id, row.parent_id]));
+    const projectOf = new Map(rows.map((row) => [row.id, Number(row.project_id)]));
+    const seen = new Set<number>();
+    for (
+      let cursor: number | null = parentId;
+      cursor !== null;
+      cursor = parentOf.get(cursor) ?? null
+    ) {
+      if (seen.has(cursor)) return 'cycle';
+      seen.add(cursor);
+      // A chain that leaves the project is refused wherever it appears, archived imports
+      // included, because a caller authorised for one project must not reach another's.
+      if (projectOf.get(cursor) !== projectId) return 'cross-project';
+      if (issueId !== null && cursor === issueId) return 'cycle';
+    }
+    return null;
+  }
+
+  // An ordinary project keeps the walk and the cap it had, unchanged in both shape and
+  // answer, so its errors and its eight-level limit stay exactly as they are.
   const rows = (await executor.execute(sql`
     WITH RECURSIVE up(id, parent_id) AS (
       SELECT id, parent_id FROM issue WHERE id = ${parentId}

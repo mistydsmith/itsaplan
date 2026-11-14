@@ -1095,17 +1095,28 @@ async function assertParent(
 // Rejects a link that puts the issue under one of its own subtasks, or the issue
 // with its subtasks past MAX_SUBTASK_DEPTH. issueId is null for an issue being
 // created. Throws 400.
+// The one door to the tree rules. The caller must already hold the project's board lock
+// (lockIssueTree) and must never take it after locking the issue: the order is board lock,
+// then issue, never the other way round.
+//
+// expectedProjectId is for a fresh create, where the issue row does not exist yet and the
+// project cannot be read from it. Pass the project the caller has locked, so the parent's
+// association is revalidated under that lock rather than trusted from the request.
 export async function assertTreeLink(
   issueId: number | null,
   parentId: number | null | undefined,
   executor: DbExecutor = db,
+  options: { expectedProjectId?: number } = {},
 ): Promise<void> {
   if (parentId == null) return;
-  const problem = await parentLinkProblem(issueId, parentId, executor);
+  const problem = await parentLinkProblem(issueId, parentId, executor, options);
   if (problem === 'cycle')
     throw new HttpError(400, 'An issue cannot become a subtask of its own subtask');
   if (problem === 'depth')
     throw new HttpError(400, `Subtasks can be nested at most ${MAX_SUBTASK_DEPTH} levels deep`);
+  // The association answers keep the wording callers already receive from assertParent.
+  if (problem === 'missing-parent' || problem === 'cross-project')
+    throw new HttpError(400, 'Parent must belong to this project');
 }
 
 // Enforces that every label belongs to the issue's project — the issue_label
