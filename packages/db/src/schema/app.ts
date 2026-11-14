@@ -2196,6 +2196,45 @@ export const issueActivity = pgTable(
   ],
 );
 
+// The bytes a comment used to say, kept before the live row is overwritten or deleted. The live
+// issue_activity row is the current text only: an edit replaces it and a delete removes it, so without
+// this table a comment's prior wording exists nowhere and the compliance owner cannot judge the
+// retained state it is required to judge (SPEC_R2, comment_edit/comment_delete).
+//
+// WHY no foreign key on comment_id: deleteComment hard-deletes the row it belongs to, and an FK with
+// ON DELETE CASCADE would erase exactly the history this table exists to keep. A plain id keeps the
+// text after the comment is gone; the issue_id FK below is the one cascade accepted, so history ends
+// when the whole card is deleted, the same boundary issue_activity already has.
+//
+// WHY author_user_id carries no FK: rows here are immutable - a BEFORE UPDATE trigger refuses every
+// update - and an FK ON DELETE SET NULL would need an UPDATE to fire, which the trigger forbids. The
+// value is a snapshot of the comment's original author as stored on the live row when the version was
+// written, never the actor of the edit that superseded it.
+export const commentVersion = pgTable(
+  'comment_version',
+  {
+    id: serial('id').primaryKey(),
+    // The comment this version belonged to. No FK on purpose: see the note above.
+    commentId: integer('comment_id').notNull(),
+    issueId: integer('issue_id')
+      .notNull()
+      .references(() => issue.id, { onDelete: 'cascade' }),
+    // 1 for the body the comment was created with, then 2, 3 ... per superseding edit.
+    revision: integer('revision').notNull(),
+    body: text('body').notNull(),
+    // A snapshot, not a reference: set-null cannot fire on an immutable row.
+    authorUserId: text('author_user_id'),
+    supersededAt: timestamp('superseded_at', { withTimezone: true }).notNull().defaultNow(),
+    // True on the row written by a delete, so a deletion is distinguishable from an edit.
+    deletedAfter: boolean('deleted_after').notNull().default(false),
+  },
+  (t) => [
+    check('comment_version_revision_check', sql`${t.revision} >= 1`),
+    unique('comment_version_comment_revision_unique').on(t.commentId, t.revision),
+    index('comment_version_lookup_idx').on(t.issueId, t.commentId, t.revision),
+  ],
+);
+
 // Saved views (the tabs above a project's work items view). filters and display are jsonb
 // blobs owned by the UI; the server stores and returns them without inspecting
 // them. position orders the tabs.
