@@ -1,5 +1,6 @@
 import {
   db,
+  type DbExecutor,
   project,
   projectColumn,
   issue,
@@ -50,8 +51,11 @@ async function assertAutoAssignee(projectId: number, userId?: string | null): Pr
     throw new HttpError(400, 'Auto-assignee must be a project member');
 }
 
-export async function columnAutoAssignee(columnId: number): Promise<string | null> {
-  const [row] = await db
+export async function columnAutoAssignee(
+  columnId: number,
+  executor: DbExecutor = db,
+): Promise<string | null> {
+  const [row] = await executor
     .select({ userId: projectColumn.autoAssignUserId })
     .from(projectColumn)
     .where(eq(projectColumn.id, columnId));
@@ -75,8 +79,12 @@ export const WIP_LIMIT_EXCEEDED = 'wip_limit_exceeded';
 // limit is a state the board already has to render (a limit lowered under the
 // current count does the same), and locking the column on every drag would cost
 // more than the overshoot.
-export async function wipLimitBreach(columnId: number, incoming = 1): Promise<HttpError | null> {
-  const [column] = await db
+export async function wipLimitBreach(
+  columnId: number,
+  incoming = 1,
+  executor: DbExecutor = db,
+): Promise<HttpError | null> {
+  const [column] = await executor
     .select({
       name: projectColumn.name,
       limit: projectColumn.wipLimit,
@@ -87,7 +95,7 @@ export async function wipLimitBreach(columnId: number, incoming = 1): Promise<Ht
   if (!column || column.limit == null || column.mode !== 'hard') return null;
 
   // Archived issues are off the board, so they do not occupy the column.
-  const [{ count }] = await db
+  const [{ count }] = await executor
     .select({ count: sql<number>`count(*)::int` })
     .from(issue)
     .where(and(eq(issue.columnId, columnId), isNull(issue.archivedAt)));
@@ -101,8 +109,12 @@ export async function wipLimitBreach(columnId: number, incoming = 1): Promise<Ht
 }
 
 // The same check for a write that must fail rather than skip.
-export async function assertWipLimit(columnId: number, incoming = 1): Promise<void> {
-  const breach = await wipLimitBreach(columnId, incoming);
+export async function assertWipLimit(
+  columnId: number,
+  incoming = 1,
+  executor: DbExecutor = db,
+): Promise<void> {
+  const breach = await wipLimitBreach(columnId, incoming, executor);
   if (breach) throw breach;
 }
 
