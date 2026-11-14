@@ -1,0 +1,322 @@
+import { issueActivity, lockIssueTree, type DbExecutor } from '@repo/db';
+import { gateIssueWrite } from '@repo/db/tracker-gate';
+import { eq, sql } from 'drizzle-orm';
+import { HttpError } from '#shared/lib';
+
+// The lock, history and owner-op facts the gated comment writers need, in one place.
+//
+// WHY this file exists: updateComment and (later) deleteComment must run their whole gated sequence on
+// one transaction, in the same lock order the issue writers use, and they must hand the tracker owner
+// the retained comment bodies rather than only the live ones. activity.ts cannot import issues/service.ts
+// (service.ts already imports ./activity), so the two project-lock statements are issued here verbatim,
+// copying service.ts projectRigHint/lockProjectRig - two queries, not a second lock layer.
+//
+// WHY nothing here is post-commit: every effect of a gated comment write runs on the caller's
+// transaction, so a refusal or a late failure leaves no version row, no activity entry and no queued
+// delivery behind. The ordinary path keeps its existing shape; the caller decides which executor it
+// passes for the effects.
+
+export interface CommentTarget {
+  commentId: number;
+  issueId: number;
+  projectId: number;
+  body: string;
+  authorUserId: string | null;
+  rigHint: number | null;
+}
+
+// The rig hint, unlocked: a hint is never write authority.
+async function projectRigHint(executor: DbExecutor, projectId: number): Promise<number | null> {
+  const rows = (await executor.execute(
+    sql`SELECT rig_id FROM project WHERE id = ${projectId}`,
+  )) as unknown as { rig_id: number | string | null }[];
+  const row = rows[0];
+  // A project that is not there is the caller's 404, not an absent rig that reads as ordinary.
+  if (!row) throw new HttpError(404, 'Comment not found');
+  return row.rig_id === null ? null : Number(row.rig_id);
+}
+
+// The same statement service.ts:1193 issues, for the same reason: the rig a write judged must still be
+// the rig the project holds until commit.
+async function lockProjectRig(executor: DbExecutor, projectId: number): Promise<number | null> {
+  const rows = (await executor.execute(
+    sql`SELECT rig_id FROM project WHERE id = ${projectId} FOR UPDATE`,
+  )) as unknown as { rig_id: number | string | null }[];
+  const row = rows[0];
+  // A project that is not there is the caller's 404, not an absent rig that reads as ordinary.
+  if (!row) throw new HttpError(404, 'Comment not found');
+  return row.rig_id === null ? null : Number(row.rig_id);
+}
+
+// The comment the route named, as a hint only: the caller re-reads it under its own locks below.
+export async function readCommentTarget(
+  executor: DbExecutor,
+  commentId: number,
+): Promise<CommentTarget | null> {
+  const rows = (await executor.execute(sql`
+    SELECT a.id, a.issue_id, i.project_id, a.body, a.actor_user_id
+    FROM issue_activity a JOIN issue i ON i.id = a.issue_id
+    WHERE a.id = ${commentId} AND a.kind = 'comment'`)) as unknown as {
+    id: number;
+    issue_id: number;
+    project_id: number;
+    body: string | null;
+    actor_user_id: string | null;
+  }[];
+  const row = rows[0];
+  if (!row) return null;
+  return {
+    commentId: row.id,
+    issueId: row.issue_id,
+    projectId: row.project_id,
+    body: row.body ?? '',
+    authorUserId: row.actor_user_id,
+    rigHint: await projectRigHint(executor, row.project_id),
+  };
+}
+
+export interface LockedComment {
+  commentId: number;
+  issueId: number;
+  projectId: number;
+  body: string;
+  authorUserId: string | null;
+  rigId: number | null;
+}
+
+// The gated lock chain, in the order the issue writers use: rig, advisory tree, project (with the rig
+// recheck), issue (with the project-moved recheck), then the target comment. An ordinary project takes
+// the project FOR SHARE and must find no rig, which is the ordinaryUpdatePrep precedent.
+export async function lockCommentForWrite(
+  executor: DbExecutor,
+  target: CommentTarget,
+  expectedProjectId: number,
+): Promise<LockedComment> {
+  if (target.rigHint === null) {
+    // Ordinary geometry, in W1's order: project FOR SHARE, then the issue row FOR SHARE, then the
+    // comment. The issue fence is not decoration - without it a concurrent move into another project,
+    // or into a gated one, would leave this edit judged on the old project while its side effects land
+    // in the new one.
+    const projectRows = (await executor.execute(
+      sql`SELECT rig_id FROM project WHERE id = ${target.projectId} FOR SHARE`,
+    )) as unknown as { rig_id: number | string | null }[];
+    const projectRow = projectRows[0];
+    if (!projectRow) throw new HttpError(404, 'Comment not found');
+    if (projectRow.rig_id !== null && projectRow.rig_id !== undefined) {
+      throw new HttpError(
+        409,
+        'This project changed its rig while the comment was being written; try again',
+      );
+    }
+    const issueRows = (await executor.execute(
+      sql`SELECT project_id FROM issue WHERE id = ${target.issueId} FOR SHARE`,
+    )) as unknown as { project_id: number }[];
+    const issueRow = issueRows[0];
+    if (!issueRow) throw new HttpError(404, 'Comment not found');
+    if (issueRow.project_id !== expectedProjectId) {
+      throw new HttpError(409, 'This issue moved projects while it was being updated; try again');
+    }
+  } else {
+    const rigRows = (await executor.execute(
+      sql`SELECT id FROM rig WHERE id = ${target.rigHint} FOR UPDATE`,
+    )) as unknown as { id: number }[];
+    if (rigRows.length === 0) {
+      throw new HttpError(
+        409,
+        'This project changed its rig while the comment was being written; try again',
+      );
+    }
+    await lockIssueTree(executor, target.projectId);
+    const rigId = await lockProjectRig(executor, target.projectId);
+    if (rigId !== target.rigHint) {
+      throw new HttpError(
+        409,
+        'This project changed its rig while the comment was being written; try again',
+      );
+    }
+    const issueRows = (await executor.execute(
+      sql`SELECT project_id FROM issue WHERE id = ${target.issueId} FOR UPDATE`,
+    )) as unknown as { project_id: number }[];
+    if (issueRows.length === 0) throw new HttpError(404, 'Comment not found');
+    if (issueRows[0].project_id !== expectedProjectId) {
+      throw new HttpError(409, 'This issue moved projects while it was being updated; try again');
+    }
+  }
+  // The target is re-read under its own lock on both paths: the pool copy is only a hint.
+  const rows = (await executor.execute(sql`
+    SELECT id, issue_id, body, actor_user_id FROM issue_activity
+    WHERE id = ${target.commentId} AND kind = 'comment' FOR UPDATE`)) as unknown as {
+    id: number;
+    issue_id: number;
+    body: string | null;
+    actor_user_id: string | null;
+  }[];
+  const row = rows[0];
+  if (!row || row.issue_id !== target.issueId) throw new HttpError(404, 'Comment not found');
+  return {
+    commentId: row.id,
+    issueId: row.issue_id,
+    projectId: expectedProjectId,
+    body: row.body ?? '',
+    authorUserId: row.actor_user_id,
+    rigId: target.rigHint,
+  };
+}
+
+// Every body the issue still has: the versions already stored, then the live comments. The owner judges
+// retained text on both sides of the write, so a request cannot drop it.
+// The stored version bodies only. The live bodies are the caller's `liveBefore`, appended once by the op
+// builder: returning them here as well duplicated every unchanged live body in both states.
+export async function storedVersionBodies(
+  executor: DbExecutor,
+  issueId: number,
+): Promise<string[]> {
+  const versions = (await executor.execute(sql`
+    SELECT body FROM comment_version WHERE issue_id = ${issueId}
+    ORDER BY comment_id, revision`)) as unknown as { body: string }[];
+  return versions.map((row) => row.body);
+}
+
+// One version row per superseded body. The revision is read after the comment's FOR UPDATE, so edits of
+// one comment serialize there and the UNIQUE (comment_id, revision) backstop is never hit by a correct
+// writer. author_user_id is a snapshot of the row's own author, never the actor of this change.
+export async function insertVersion(
+  executor: DbExecutor,
+  locked: LockedComment,
+  options: { deletedAfter: boolean },
+): Promise<{ revision: number }> {
+  const rows = (await executor.execute(sql`
+    SELECT coalesce(max(revision), 0) + 1 AS next FROM comment_version
+    WHERE comment_id = ${locked.commentId}`)) as unknown as { next: number }[];
+  const revision = Number(rows[0].next);
+  await executor.execute(sql`
+    INSERT INTO comment_version (comment_id, issue_id, revision, body, author_user_id, deleted_after)
+    VALUES (${locked.commentId}, ${locked.issueId}, ${revision}, ${locked.body},
+            ${locked.authorUserId}, ${options.deletedAfter})`);
+  return { revision };
+}
+
+// The card facts and identity the owner op is built from, read on the caller's transaction under its
+// locks. The bead id comes from the ledger scoped to the locked rig, never from a title.
+export async function ownerCardFacts(
+  executor: DbExecutor,
+  issueId: number,
+  rigId: number,
+): Promise<{
+  beadId: string;
+  rigPrefix: string;
+  title: string;
+  description: string;
+  labels: string[];
+}> {
+  const identity = (await executor.execute(sql`
+    SELECT b.local_token AS bead_id, r.prefix AS rig_prefix
+    FROM bead_identity b JOIN rig r ON r.id = b.rig_id
+    WHERE b.issue_id = ${issueId} AND b.rig_id = ${rigId}`)) as unknown as {
+    bead_id: string;
+    rig_prefix: string;
+  }[];
+  if (identity.length !== 1) {
+    throw new HttpError(
+      409,
+      'This issue holds no bead identity in its rig, so its comment cannot be judged',
+      'issue-without-identity',
+    );
+  }
+  const card = (await executor.execute(sql`
+    SELECT title, description FROM issue WHERE id = ${issueId}`)) as unknown as {
+    title: string;
+    description: string;
+  }[];
+  const labels = (await executor.execute(sql`
+    SELECT l.name FROM issue_label il JOIN label l ON l.id = il.label_id
+    WHERE il.issue_id = ${issueId} ORDER BY l.name`)) as unknown as { name: string }[];
+  return {
+    // The owner names a card by rig prefix plus ledger token, the same composed id W1 hands it.
+    beadId: `${identity[0].rig_prefix}-${identity[0].bead_id}`,
+    rigPrefix: identity[0].rig_prefix,
+    title: card[0]?.title ?? '',
+    description: card[0]?.description ?? '',
+    labels: labels.map((row) => row.name),
+  };
+}
+
+// The op the owner judges: the retained comments on both sides, the new body on the edit, and the live
+// list after the write. Built only from the facts read on this transaction.
+export function commentOp(input: {
+  opName: 'comment_create' | 'comment_edit' | 'comment_delete';
+  facts: Awaited<ReturnType<typeof ownerCardFacts>>;
+  // Stored version bodies only, oldest first.
+  versions: string[];
+  // The live comments in record order, including the one this write touches.
+  liveBefore: { id: number; body: string }[];
+  // The bodies this write supersedes, taken from the locked rows: the edited comment's old body, or
+  // every body a delete removes. Never a body the request supplied.
+  superseded: string[];
+  targetId?: number;
+  omitIds?: number[];
+  editBody?: string;
+  agentReached: boolean;
+}): Record<string, unknown> {
+  // An edit substitutes its body where it stands; a delete drops the whole omitted set; a create appends.
+  const liveAfter: string[] = [];
+  for (const row of input.liveBefore) {
+    if (input.omitIds?.includes(row.id)) continue;
+    if (input.targetId != null && row.id === input.targetId) {
+      if (input.opName === 'comment_edit') liveAfter.push(input.editBody ?? row.body);
+      continue;
+    }
+    liveAfter.push(row.body);
+  }
+  if (input.opName === 'comment_create') liveAfter.push(input.editBody ?? '');
+  const base = {
+    title: input.facts.title,
+    description: input.facts.description,
+    labels: input.facts.labels,
+    bead_id: input.facts.beadId,
+  };
+  const op: Record<string, unknown> = {
+    op: input.opName,
+    id: input.facts.beadId,
+    rig_prefix: input.facts.rigPrefix,
+    title: input.facts.title,
+    labels: input.facts.labels,
+    ...(input.editBody === undefined ? {} : { comment: input.editBody }),
+    // Retained history is the stored versions plus every live body as it stood before the write.
+    previous_state: {
+      ...base,
+      comments: [...input.versions, ...input.liveBefore.map((r) => r.body)],
+    },
+    // The post-write state keeps those, adds the bodies this write supersedes, and carries the live list
+    // as it will read afterwards - each unchanged body exactly once.
+    proposed_state: {
+      ...base,
+      comments: [...input.versions, ...input.superseded, ...liveAfter],
+    },
+  };
+  if (input.agentReached) op.routing_facts = null;
+  return op;
+}
+
+// The live comment rows in the record's order (W1's ORDER BY id), with the bodies the op needs.
+export async function liveCommentRows(
+  executor: DbExecutor,
+  issueId: number,
+): Promise<{ id: number; body: string }[]> {
+  const rows = (await executor.execute(sql`
+    SELECT id, body FROM issue_activity WHERE issue_id = ${issueId} AND kind = 'comment'
+    ORDER BY id`)) as unknown as { id: number; body: string | null }[];
+  return rows.map((row) => ({ id: row.id, body: row.body ?? '' }));
+}
+
+// The gate, on the caller's transaction. A refusal throws before any version row or body change, exactly
+// the order the decision packet sets: locks, facts, op, gate, history, mutation.
+export async function gateCommentOp(rigId: number, op: Record<string, unknown>): Promise<void> {
+  await gateIssueWrite({ rigId, op });
+}
+
+// A comment row as the feed returns it, mapped the same way the existing writer does.
+export async function readLiveComment(executor: DbExecutor, commentId: number) {
+  const rows = await executor.select().from(issueActivity).where(eq(issueActivity.id, commentId));
+  return rows[0] ?? null;
+}

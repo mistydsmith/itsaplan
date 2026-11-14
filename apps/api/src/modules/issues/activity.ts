@@ -17,8 +17,18 @@ import { gateIssueWrite, isTrackerGateRefusal } from '@repo/db/tracker-gate';
 import { and, asc, desc, eq, gte, inArray, isNull, lt, ne, sql } from 'drizzle-orm';
 import { HttpError, iso } from '#shared/lib';
 import { emitCommentEvent } from './webhook-payload';
-import { addedMentionHandles, parseMentionHandles, resolveMentionHandles } from '#shared/mentions';
 import { isAgentUser } from '#modules/agents/core/service';
+import {
+  commentOp,
+  gateCommentOp,
+  insertVersion,
+  liveCommentRows,
+  lockCommentForWrite,
+  ownerCardFacts,
+  readCommentTarget,
+  storedVersionBodies,
+} from './comment-history';
+import { addedMentionHandles, parseMentionHandles, resolveMentionHandles } from '#shared/mentions';
 import { mentionReach, queueMentionRuns, type MentionReach } from '#modules/mentions/service';
 import {
   notifyComment,
@@ -590,46 +600,19 @@ async function buildCommentOp(
     agentReached: boolean;
   },
 ): Promise<Record<string, unknown>> {
-  const labelRows = (await tx.execute(
-    sql`SELECT l.name FROM issue_label il JOIN label l ON l.id = il.label_id
-        WHERE il.issue_id = ${input.issueId} ORDER BY l.name`,
-  )) as unknown as { name: string }[];
-  const labels = labelRows.map((row) => row.name);
-  const identityRows = (await tx.execute(
-    sql`SELECT r.prefix, b.local_token FROM bead_identity b
-        JOIN rig r ON r.id = b.rig_id
-        WHERE b.issue_id = ${input.issueId} AND b.rig_id = ${input.rigId}`,
-  )) as unknown as { prefix: string; local_token: string }[];
-  // One fact of the locked rig's ledger names the card. An identity that exists only
-  // in another rig, like none at all, is an identity this seam cannot judge, and the
-  // answer is the caller's own 409, not a guess from the title.
-  if (identityRows.length !== 1) {
-    throw new HttpError(
-      409,
-      'This issue holds no bead identity in its rig, so its comment cannot be judged',
-      'issue-without-identity',
-    );
-  }
-  const beadId = `${identityRows[0].prefix}-${identityRows[0].local_token}`;
-  const commentRows = (await tx.execute(
-    sql`SELECT body FROM issue_activity
-        WHERE issue_id = ${input.issueId} AND kind = 'comment' ORDER BY id`,
-  )) as unknown as { body: string | null }[];
-  const retained = commentRows.map((row) => row.body ?? '');
-  const base = { title: input.title, description: input.description, labels, bead_id: beadId };
-  const op: Record<string, unknown> = {
-    op: 'comment_create',
-    id: beadId,
-    rig_prefix: identityRows[0].prefix,
-    labels,
-    title: input.title,
-    description: input.description,
-    comment: input.body,
-    previous_state: { ...base, comments: retained },
-    proposed_state: { ...base, comments: [...retained, input.body] },
-  };
-  if (input.agentReached) op.routing_facts = null;
-  return op;
+  // One builder for all three comment doors: this private shape stays what createComment calls, and the
+  // op itself comes from comment-history, so a create judges the same retained version bodies an edit
+  // does instead of only the live ones.
+  const facts = await ownerCardFacts(tx, input.issueId, input.rigId);
+  return commentOp({
+    opName: 'comment_create',
+    facts,
+    versions: await storedVersionBodies(tx, input.issueId),
+    liveBefore: await liveCommentRows(tx, input.issueId),
+    superseded: [],
+    editBody: input.body,
+    agentReached: input.agentReached,
+  });
 }
 
 // The comment a route guard resolves: the issue it hangs on, the project behind
@@ -665,33 +648,137 @@ export async function updateComment(
   actorUserId: string | null,
   projectId: number,
 ): Promise<FeedItemRow> {
-  const [before] = await db
-    .select()
-    .from(issueActivity)
-    .where(and(eq(issueActivity.id, commentId), eq(issueActivity.kind, 'comment')));
-  if (!before) throw new HttpError(404, 'Comment not found');
-  const [row] = await db
-    .update(issueActivity)
-    .set({ body, editedAt: new Date() })
-    .where(eq(issueActivity.id, commentId))
-    .returning();
-  if (!row) throw new HttpError(404, 'Comment not found');
-  const comment = mapFeedItem(row);
+  // The pool read is only a hint: the row is re-read under its own lock inside the write.
+  const hint = await readCommentTarget(db, commentId);
+  if (!hint) throw new HttpError(404, 'Comment not found');
+  if (hint.projectId !== projectId) throw new HttpError(404, 'Comment not found');
 
-  await recordActivity(comment.issueId, [{ action: 'comment_edited' }], actorUserId);
-  await emitCommentEvent(projectId, 'comment.updated', comment, actorUserId);
+  // The history row and the body change are one transaction on both paths. A gated edit also runs its
+  // whole effect sequence there, so a refusal or a late failure leaves no version, no activity entry and
+  // no queued delivery behind; an ordinary edit keeps today's behaviour and runs the effects after the
+  // commit, on the client the caller gave it.
+  const outcome = await db.transaction(async (tx) => {
+    const locked = await lockCommentForWrite(tx, hint, projectId);
+    // The added reach is resolved ONCE, before the gate, and reused by the fan-out below: two
+    // resolutions could disagree and the owner would judge facts the write never used. replyToId stays
+    // null, so an edit reaches only the agents it newly names.
+    let mentioned: { memberIds: string[]; agentUserIds: string[] } = {
+      memberIds: [],
+      agentUserIds: [],
+    };
+    let reach: Awaited<ReturnType<typeof mentionReach>> = { agents: [], memberIds: [] };
+    if (locked.rigId !== null) {
+      const added = addedMentionHandles(locked.body, body);
+      mentioned =
+        added.length > 0
+          ? await resolveMentionHandles(projectId, added, tx)
+          : { memberIds: [], agentUserIds: [] };
+      // WHY the original author and not the editor: the existing helper filters and queues on the
+      // comment's own author (comment.actorUserId), so a project owner editing somebody else's comment
+      // must not change which agent is reached. The editor stays the activity actor.
+      const reachActor = locked.authorUserId;
+      reach =
+        mentioned.agentUserIds.length > 0
+          ? await mentionReach(
+              projectId,
+              reachActor,
+              { on: 'issue', place: 'comment' },
+              { memberIds: [], agentUserIds: mentioned.agentUserIds },
+              tx,
+            )
+          : { agents: [], memberIds: [] };
+      const facts = await ownerCardFacts(tx, locked.issueId, locked.rigId);
+      const versions = await storedVersionBodies(tx, locked.issueId);
+      const liveBefore = await liveCommentRows(tx, locked.issueId);
+      const op = commentOp({
+        opName: 'comment_edit',
+        facts,
+        versions,
+        liveBefore,
+        // The body this edit supersedes, from the locked row - never the request.
+        superseded: [locked.body],
+        targetId: locked.commentId,
+        editBody: body,
+        // The same condition W1's createComment uses: an agent is really reached, and the fan-out below
+        // will not skip the actor. A raw mentioned list is not that fact.
+        // The same author the reach and the queue use: a comment written by an agent is skipped
+        // however a human edits it, and a human comment is judged as human even when an agent edits.
+        agentReached:
+          reach.agents.length > 0 &&
+          !(locked.authorUserId != null && (await isAgentUser(locked.authorUserId, tx))),
+      });
+      try {
+        await gateCommentOp(locked.rigId, op);
+      } catch (error) {
+        // The shared gate's refusal becomes the API's own 409, exactly as the issue writers map it.
+        if (isTrackerGateRefusal(error)) {
+          const safe = error.safe_form ? ` Compliant form: ${error.safe_form}.` : '';
+          throw new HttpError(409, `${error.rule}: ${error.message}.${safe}`, error.code);
+        }
+        throw error;
+      }
+      await insertVersion(tx, locked, { deletedAfter: false });
+    } else {
+      await insertVersion(tx, locked, { deletedAfter: false });
+    }
+    const [row] = await tx
+      .update(issueActivity)
+      .set({ body, editedAt: new Date() })
+      .where(and(eq(issueActivity.id, commentId), eq(issueActivity.kind, 'comment')))
+      .returning();
+    if (!row) throw new HttpError(404, 'Comment not found');
+    const written = mapFeedItem(row);
+    if (locked.rigId !== null) {
+      // Gated: the effects belong to this transaction.
+      await recordActivity(written.issueId, [{ action: 'comment_edited' }], actorUserId, tx);
+      await emitCommentEvent(projectId, 'comment.updated', written, actorUserId, tx);
+      if (addedMentionHandles(locked.body, body).length > 0) {
+        if (reach.agents.length > 0) {
+          // Queued directly from the reach already resolved on this transaction: the private W1 helper
+          // resolves its own reach on the pool, so it is not usable on a gated path without editing it.
+          await queueMentionRuns(
+            {
+              projectId,
+              actorUserId: locked.authorUserId,
+              agents: reach.agents,
+              prompt: written.body ?? '',
+              source: { issueId: written.issueId, sourceActivityId: written.id },
+            },
+            tx,
+          );
+        }
+        await notifyEditedCommentMentions(
+          projectId,
+          written,
+          { memberIds: mentioned.memberIds, agentUserIds: mentioned.agentUserIds },
+          tx,
+        );
+      }
+    }
+    return { written, gated: locked.rigId !== null, before: locked.body, issueId: locked.issueId };
+  });
 
-  const added = addedMentionHandles(before.body ?? '', body);
+  if (outcome.gated) return outcome.written;
+  // Ordinary: today's effects, after the commit, on the caller's client.
+  await recordActivity(outcome.issueId, [{ action: 'comment_edited' }], actorUserId);
+  await emitCommentEvent(projectId, 'comment.updated', outcome.written, actorUserId);
+  const added = addedMentionHandles(outcome.before, body);
   if (added.length > 0) {
     const mentioned = await resolveMentionHandles(projectId, added);
     if (mentioned.agentUserIds.length > 0)
-      // replyToId is dropped: an edit reaches only the agents it newly names, not
-      // the author of the comment being answered, who a create would reach.
-      await enqueueMentionRuns(projectId, { ...comment, replyToId: null }, mentioned.agentUserIds);
-    await notifyEditedCommentMentions(projectId, comment, mentioned);
+      await enqueueMentionRuns(
+        projectId,
+        { ...outcome.written, replyToId: null },
+        mentioned.agentUserIds,
+      );
+    await notifyEditedCommentMentions(projectId, outcome.written, mentioned);
   }
-  return comment;
+  return outcome.written;
 }
+
+// Deletes a comment; its replies cascade away with it (reply_to_id FK). The change
+// log keeps a comment_deleted entry, and subscribed webhooks receive the comment as
+// it read. Returns false when there is no such comment.
 
 // Deletes a comment; its replies cascade away with it (reply_to_id FK). The change
 // log keeps a comment_deleted entry, and subscribed webhooks receive the comment as
