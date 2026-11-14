@@ -1,4 +1,4 @@
-import { db, userNotificationPreference } from '@repo/db';
+import { db, userNotificationPreference, type DbExecutor } from '@repo/db';
 import { and, eq, inArray, sql } from 'drizzle-orm';
 
 // A member's own notification preferences for one project: for each issue event
@@ -84,9 +84,10 @@ export async function setPreferences(
 export async function getPreferencesForUsers(
   projectId: number,
   userIds: string[],
+  executor: DbExecutor = db,
 ): Promise<Map<string, NotificationPreferenceDto>> {
   if (userIds.length === 0) return new Map();
-  const rows = await db
+  const rows = await executor
     .select({
       userId: userNotificationPreference.userId,
       emailEvents: userNotificationPreference.emailEvents,

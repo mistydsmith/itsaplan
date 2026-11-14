@@ -6,6 +6,7 @@ import {
   isInstanceBotUsable,
   TELEGRAM_BOT_SECRET_KEY,
   type InstanceBotConfig,
+  type DbExecutor,
 } from '@repo/db';
 import { eq, inArray } from 'drizzle-orm';
 import { randomBytes } from 'node:crypto';
@@ -132,9 +133,12 @@ export async function getTelegramLink(userId: string): Promise<TelegramLink | nu
 
 // The chat ids of several users at once, for the notification enqueue path. Users
 // with no completed link are absent from the map.
-export async function getTelegramChatIds(userIds: string[]): Promise<Map<string, string>> {
+export async function getTelegramChatIds(
+  userIds: string[],
+  executor: DbExecutor = db,
+): Promise<Map<string, string>> {
   if (userIds.length === 0) return new Map();
-  const rows = await db
+  const rows = await executor
     .select({ userId: userTelegramAccount.userId, chatId: userTelegramAccount.chatId })
     .from(userTelegramAccount)
     .where(inArray(userTelegramAccount.userId, userIds));

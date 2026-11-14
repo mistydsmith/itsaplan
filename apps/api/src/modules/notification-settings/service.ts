@@ -4,6 +4,7 @@ import {
   defaultNotificationConfig,
   readNotificationConfig,
   type NotificationConfig,
+  type DbExecutor,
 } from '@repo/db';
 import { eq, sql } from 'drizzle-orm';
 import { encryptSecret } from '@repo/crypto';
@@ -189,8 +190,11 @@ export async function setNotificationSettings(
 // decrypting. Used by the outbound enqueue path to decide which channels are enabled.
 // Cheaper than getNotificationSettings, which decrypts the secret blob. A team that
 // saved nothing gets the defaults, so it delivers through the instance provider.
-export async function readRedactedSettings(teamId: number): Promise<NotificationSettingsDto> {
-  const rows = await db
+export async function readRedactedSettings(
+  teamId: number,
+  executor: DbExecutor = db,
+): Promise<NotificationSettingsDto> {
+  const rows = await executor
     .select({ redacted: teamNotificationSetting.redacted })
     .from(teamNotificationSetting)
     .where(eq(teamNotificationSetting.teamId, teamId));
