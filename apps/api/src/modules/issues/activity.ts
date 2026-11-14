@@ -643,10 +643,14 @@ export async function userName(
 // Name snapshots for a set of labels in one query, resolved at change time so a log
 // entry keeps reading correctly after a label is renamed or deleted. An id outside
 // projectId, or with no label at all, is absent from the map.
-export async function labelNames(projectId: number, ids: number[]): Promise<Map<number, string>> {
+export async function labelNames(
+  projectId: number,
+  ids: number[],
+  executor: DbExecutor = db,
+): Promise<Map<number, string>> {
   const out = new Map<number, string>();
   if (ids.length === 0) return out;
-  const rows = await db
+  const rows = await executor
     .select({ id: label.id, name: label.name })
     .from(label)
     .where(and(eq(label.projectId, projectId), inArray(label.id, ids)));

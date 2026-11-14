@@ -1148,10 +1148,18 @@ export async function assertTreeLink(
 
 // Enforces that every label belongs to the issue's project — the issue_label
 // foreign key only requires the label to exist somewhere. Throws 400 otherwise.
-async function assertIssueLabels(projectId: number, labelIds?: number[]): Promise<void> {
+// WHY the executor: this is a read of the label table, and a writer that created a label
+// inside its own transaction has to see that label here. On the default client a label
+// inserted in the same transaction does not exist yet, so the check would refuse the
+// writer's own label as "not in this project".
+async function assertIssueLabels(
+  projectId: number,
+  labelIds?: number[],
+  executor: DbExecutor = db,
+): Promise<void> {
   const ids = [...new Set(labelIds ?? [])];
   if (ids.length === 0) return;
-  const rows = await db
+  const rows = await executor
     .select({ id: label.id })
     .from(label)
     .where(and(eq(label.projectId, projectId), inArray(label.id, ids)));
@@ -1683,24 +1691,33 @@ export async function deleteIssue(
 // Replaces the issue's full label set (not an add/remove diff) and logs the
 // added/removed labels to the activity feed. projectId is the issue's project: a
 // label outside it is rejected before anything is written.
+// WHY every query here takes the executor: a label change is four writes and three reads
+// (the before-state, the link delete/insert, the issue's updatedAt, then the name snapshot,
+// the activity rows and the webhook row). Split across the default client and the caller's
+// transaction, the reads cannot see the writes — the name snapshot would miss a label the
+// same transaction just added, the read-back DTO would show the old links, and a failure in
+// the middle would leave links, activity and a webhook row committed while the caller's own
+// work rolls back. `executor` stays LAST so `emitEvent` keeps its fourth/fifth positions and
+// every existing caller keeps the default pool.
 export async function setIssueLabels(
   projectId: number,
   issueId: number,
   labelIds: number[],
   actorUserId?: string | null,
   emitEvent = true,
+  executor: DbExecutor = db,
 ): Promise<void> {
-  await assertIssueLabels(projectId, labelIds);
-  const beforeRows = await db
+  await assertIssueLabels(projectId, labelIds, executor);
+  const beforeRows = await executor
     .select({ labelId: issueLabel.labelId })
     .from(issueLabel)
     .where(eq(issueLabel.issueId, issueId));
   const before = beforeRows.map((r) => r.labelId);
   const next = [...new Set(labelIds)];
 
-  await db.delete(issueLabel).where(eq(issueLabel.issueId, issueId));
+  await executor.delete(issueLabel).where(eq(issueLabel.issueId, issueId));
   if (next.length) {
-    await db
+    await executor
       .insert(issueLabel)
       .values(next.map((labelId) => ({ issueId, labelId })))
       .onConflictDoNothing();
@@ -1712,27 +1729,35 @@ export async function setIssueLabels(
   // A label change is an edit of the issue, and sorting by "recently updated" has
   // to place it accordingly.
   if (added.length > 0 || removed.length > 0) {
-    await db
+    await executor
       .update(issue)
       .set({ updatedAt: sql`now()` })
       .where(eq(issue.id, issueId));
   }
 
-  const names = await labelNames(projectId, [...added, ...removed]);
+  const names = await labelNames(projectId, [...added, ...removed], executor);
   const events: ActivityInput[] = [];
   for (const labelId of added)
     events.push({ action: 'label_add', to: rowSide(names.get(labelId), labelId) });
   for (const labelId of removed)
     events.push({ action: 'label_remove', from: rowSide(names.get(labelId), labelId) });
-  await recordActivity(issueId, events, actorUserId);
+  await recordActivity(issueId, events, actorUserId, executor);
 
   if (emitEvent && (added.length > 0 || removed.length > 0)) {
-    const issueRow = await getIssue(issueId);
+    // The read-back goes through the same executor for the same reason as the name snapshot:
+    // the payload has to describe the issue as this transaction sees it.
+    const issueRow = await getIssue(issueId, executor);
     if (issueRow) {
       const named = (ids: number[]) => ids.map((id) => ({ id, name: names.get(id) ?? null }));
-      await emitIssueEvent('issue.label_changed', issueRow, actorUserId, {
-        labelChange: { added: named(added), removed: named(removed) },
-      });
+      await emitIssueEvent(
+        'issue.label_changed',
+        issueRow,
+        actorUserId,
+        {
+          labelChange: { added: named(added), removed: named(removed) },
+        },
+        executor,
+      );
     }
   }
 }
