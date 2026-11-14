@@ -910,11 +910,13 @@ async function attachFieldValues(
 // The snapshot columns of an issue, without the label and project-key joins a
 // full load does. Used as the "before" state for the change-log diff, which
 // needs only these columns, plus the project id the update's scope checks run
-// against.
+// against. A writer that must judge the card on its own locked transaction passes that
+// executor; the default client is what the ordinary change-log read uses.
 async function loadSnapshot(
   id: number,
+  executor: DbExecutor = db,
 ): Promise<(IssueSnapshot & { projectId: number; parentId: number | null }) | null> {
-  const rows = await db
+  const rows = await executor
     .select({
       id: issue.id,
       projectId: issue.projectId,
@@ -1195,6 +1197,271 @@ async function lockProjectRig(executor: DbExecutor, projectId: number): Promise<
   const row = rows[0];
   if (!row) throw new HttpError(404, 'Project not found');
   return row.rig_id === null ? null : Number(row.rig_id);
+}
+
+// The ordinary update's one added recheck, under the transaction's own read: a project that
+// acquires a rig between the pool read and the write would otherwise pass ungated, so the
+// project row is re-read FOR SHARE and a non-null rig is the same 409 retry the gated path
+// gives when it loses the race the other way. The parent board lock goes BEFORE that read:
+// an ordinary create takes the board lock and then the project row's write lock, so taking
+// the project row first here would let a parented update and a parented create on one
+// project hold the two locks in opposite orders and deadlock (40P01). Board before project
+// everywhere matches create and the gated path, and assertTreeLink stays after both. FOR
+// SHARE does not block other ordinary writes, so the board's drag traffic keeps its cost.
+// No owner config, read or spawn happens here: an ordinary project stays exactly as fast
+// as it was.
+async function ordinaryUpdatePrep(
+  tx: DbExecutor,
+  projectId: number,
+  parentId: number | null | undefined,
+  id: number,
+  set: Partial<typeof issue.$inferInsert>,
+): Promise<Partial<typeof issue.$inferInsert>> {
+  if (parentId != null) await lockIssueTree(tx, projectId);
+  const rows = (await tx.execute(
+    sql`SELECT rig_id FROM project WHERE id = ${projectId} FOR SHARE`,
+  )) as unknown as { rig_id: number | string | null }[];
+  if (rows[0] && rows[0].rig_id != null) {
+    throw new HttpError(
+      409,
+      'This project changed its rig while the issue was being updated; try again',
+    );
+  }
+  if (parentId != null) await assertTreeLink(id, parentId, tx);
+  return set;
+}
+
+// The gated update's pre-write decision, made on the caller's own locked transaction and
+// returned as the set the guarded UPDATE applies — or null when the write must not run at all
+// (the issue row vanished under the lock, or a move into a hard-limited column was dropped by
+// the caller's skip). The shared lock order is the rig row, then the board, then the project
+// row and the issue row, and only under all of them are the facts the owner is judged on read:
+// the stored labels, the ledger's bead id and the column states. Body-supplied overrides and
+// routing or close facts are never attached: the write the owner sees is the write the locks
+// hold, and a refusal rolls the whole transaction back instead of leaving a partial write.
+async function gateUpdateWrite(
+  tx: DbExecutor,
+  input: {
+    rigHint: number;
+    id: number;
+    before: IssueSnapshot & { projectId: number; parentId: number | null };
+    patch: IssuePatch;
+    set: Partial<typeof issue.$inferInsert>;
+    skipIfColumnFull: boolean;
+  },
+): Promise<Partial<typeof issue.$inferInsert> | null> {
+  const { id, before, patch, set, skipIfColumnFull } = input;
+  const rigRows = (await tx.execute(
+    sql`SELECT id FROM rig WHERE id = ${input.rigHint} FOR UPDATE`,
+  )) as unknown as { id: number | string }[];
+  if (rigRows.length === 0) {
+    // The rig row the hint named is gone: the project's rig is no longer what the write judged.
+    throw new HttpError(
+      409,
+      'This project changed its rig while the issue was being updated; try again',
+    );
+  }
+  await lockIssueTree(tx, before.projectId);
+  const rigId = await lockProjectRig(tx, before.projectId);
+  if (rigId !== input.rigHint) {
+    throw new HttpError(
+      409,
+      'This project changed its rig while the issue was being updated; try again',
+    );
+  }
+  // The card itself is locked before the previous state is read, so the previous state is the
+  // row the write will actually change and no other writer can move it underneath the gate.
+  const issueRows = (await tx.execute(
+    sql`SELECT id FROM issue WHERE id = ${id} FOR UPDATE`,
+  )) as unknown as { id: number }[];
+  if (issueRows.length === 0) return null;
+  const lockedBefore = await loadSnapshot(id, tx);
+  if (lockedBefore === null) return null;
+  if (lockedBefore.projectId !== before.projectId) {
+    // The scope checks above ran against the project the card was in on the pool read; a card
+    // that moved projects under the locks is not the write those checks cover.
+    throw new HttpError(409, 'This issue moved projects while it was being updated; try again');
+  }
+  if (patch.parentId != null) await assertTreeLink(id, patch.parentId, tx);
+  // The pool's answers were early only: whether the write is a move at all is judged against
+  // the locked row, so a card another writer already put in the target column is not counted
+  // against WIP, not auto-assigned and not judged a close.
+  const movedToColumnId =
+    patch.columnId !== undefined && patch.columnId !== lockedBefore.columnId
+      ? patch.columnId
+      : null;
+  // The date order is judged again from the locked dates for the side the patch does not
+  // set, so a stale pool start/due pair cannot clear or fail the check.
+  assertDateOrder(
+    patch.startDate !== undefined ? patch.startDate : lockedBefore.startDate,
+    patch.dueDate !== undefined ? patch.dueDate : lockedBefore.dueDate,
+  );
+  const writeSet = { ...set };
+  if (movedToColumnId !== null) {
+    // The limit and the auto-assignee are decided again on the locked rows.
+    const breach = await wipLimitBreach(movedToColumnId, 1, tx);
+    if (breach) {
+      if (!skipIfColumnFull) throw breach;
+      return null; // the move is dropped, the same no-write answer the ordinary path gives
+    }
+    if (patch.assigneeUserId !== undefined) writeSet.assigneeUserId = patch.assigneeUserId;
+    else {
+      const txAutoAssignee = await columnAutoAssignee(movedToColumnId, tx);
+      if (txAutoAssignee) writeSet.assigneeUserId = txAutoAssignee;
+      else delete writeSet.assigneeUserId;
+    }
+  } else if (patch.assigneeUserId === undefined) {
+    // The pool saw a move the locked row does not: its auto-assignee must not ride along.
+    delete writeSet.assigneeUserId;
+  }
+  const op = await buildUpdateOp(tx, {
+    id,
+    rigId,
+    lockedBefore,
+    patch,
+    movedToColumnId,
+    set: writeSet,
+  });
+  await gateIssueWrite({ rigId, op });
+  // The writer-side close backstop, after the gate: even a future owner config that relaxed
+  // the close rule must not let this seam commit a close, because it has no verified close
+  // facts. The gate's own refusal covers the current rule; this is the second wall.
+  if (op.op === 'close') {
+    throw new HttpError(
+      409,
+      'This issue cannot be closed until verified close facts exist',
+      'close-facts-missing',
+    );
+  }
+  return writeSet;
+}
+
+// The operation the rule owner judges a gated update on, built only from facts this
+// transaction read under its own locks. The bead id is the ledger's immutable fact, never
+// something the title or the caller suggested; the previous and proposed states carry the
+// stored labels and the column states, because the owner's size and description decisions
+// judge the complete post-write state, not the delta. The description is top-level only when
+// the patch carries one, so the owner's carry-forward rule compares it with the stored text;
+// the states always carry it, stored or proposed. An effective assignee or delegate change
+// carries routing_facts null, because this seam has no authenticated routing facts yet and the
+// owner refuses the missing facts with its own wording; a move from a non-terminal state
+// into a completed or canceled column is op 'close' with close_facts null for the same
+// reason, while an edit of a card already in a terminal column stays op 'update'. A
+// body-supplied override or routing or close fact is never attached: nothing the caller
+// sent can open the gate.
+async function buildUpdateOp(
+  tx: DbExecutor,
+  input: {
+    id: number;
+    rigId: number;
+    lockedBefore: IssueSnapshot & { projectId: number; parentId: number | null };
+    patch: IssuePatch;
+    movedToColumnId: number | null;
+    set: Partial<typeof issue.$inferInsert>;
+  },
+): Promise<Record<string, unknown>> {
+  const { id, rigId, lockedBefore, patch, movedToColumnId, set } = input;
+  const columnIds = [lockedBefore.columnId, ...(movedToColumnId !== null ? [movedToColumnId] : [])];
+  const stateRows = (await tx.execute(
+    sql`SELECT id, state_type FROM project_column WHERE id IN (${sql.join(
+      columnIds.map((columnId) => sql`${columnId}`),
+      sql`, `,
+    )})`,
+  )) as unknown as { id: number | string; state_type: string }[];
+  // A column the card names or targets with no row is a fact the seam cannot judge: refuse
+  // it instead of inventing a state.
+  const stateType = (columnId: number): string => {
+    const row = stateRows.find((r) => Number(r.id) === columnId);
+    if (!row) throw new HttpError(404, 'Column not found');
+    return row.state_type;
+  };
+  const labelRows = (await tx.execute(
+    sql`SELECT l.name FROM issue_label il JOIN label l ON l.id = il.label_id
+        WHERE il.issue_id = ${id} ORDER BY l.name`,
+  )) as unknown as { name: string }[];
+  const labels = labelRows.map((row) => row.name);
+  const identityRows = (await tx.execute(
+    sql`SELECT r.prefix, b.local_token FROM bead_identity b
+        JOIN rig r ON r.id = b.rig_id
+        WHERE b.issue_id = ${id} AND b.rig_id = ${rigId}`,
+  )) as unknown as { prefix: string; local_token: string }[];
+  // One fact of the locked rig's ledger names the card. An identity that exists only in
+  // another rig, like none at all, is an identity this seam cannot judge, and the answer is
+  // the caller's own 409, not a guess from the title.
+  if (identityRows.length !== 1) {
+    throw new HttpError(
+      409,
+      'This issue holds no bead identity in its rig, so its update cannot be judged',
+      'issue-without-identity',
+    );
+  }
+  const beadId = `${identityRows[0].prefix}-${identityRows[0].local_token}`;
+  const previousAssignee = lockedBefore.assigneeUserId ?? null;
+  const proposedAssignee = set.assigneeUserId === undefined ? previousAssignee : set.assigneeUserId;
+  const previousDelegate = lockedBefore.delegateUserId ?? null;
+  const proposedDelegate = set.delegateUserId === undefined ? previousDelegate : set.delegateUserId;
+  const routingChanged =
+    proposedAssignee !== previousAssignee || proposedDelegate !== previousDelegate;
+  // A close is a move INTO a terminal state from a non-terminal one. An edit of a card that
+  // already sits in a completed or canceled column, or a move between terminal columns,
+  // stays op 'update' with full states: a done card keeps being editable, and the identity
+  // rule owns those states.
+  const targetColumnId = movedToColumnId !== null ? movedToColumnId : lockedBefore.columnId;
+  const targetState = stateType(targetColumnId);
+  const previousState = stateType(lockedBefore.columnId);
+  const isTerminal = (state: string) => state === 'completed' || state === 'canceled';
+  const isClose = movedToColumnId !== null && isTerminal(targetState) && !isTerminal(previousState);
+  const previous = {
+    title: lockedBefore.title,
+    description: lockedBefore.description ?? '',
+    labels,
+    bead_id: beadId,
+    column_state: previousState,
+    assignee_user_id: previousAssignee,
+    delegate_user_id: previousDelegate,
+    parent_id: lockedBefore.parentId,
+  };
+  const proposed = {
+    title: set.title === undefined ? lockedBefore.title : set.title,
+    description: set.description === undefined ? (lockedBefore.description ?? '') : set.description,
+    labels,
+    bead_id: beadId,
+    column_state: targetState,
+    assignee_user_id: proposedAssignee,
+    delegate_user_id: proposedDelegate,
+    parent_id: set.parentId === undefined ? lockedBefore.parentId : set.parentId,
+  };
+  const op: Record<string, unknown> = {
+    op: isClose ? 'close' : 'update',
+    id: beadId,
+    rig_prefix: identityRows[0].prefix,
+  };
+  if (isClose) {
+    // A non-terminal -> terminal move is op 'close' with close_facts null: this seam has no
+    // verified close facts yet, and the owner's close rule refuses the missing facts with its
+    // own wording. The close op carries no states, because the identity rule owns a whole
+    // proposed state only for the mutating ops and a close with one refuses before the close
+    // rule ever answers; nothing the caller sent can open the close.
+    op.close_facts = null;
+    return op;
+  }
+  op.labels = labels;
+  op.previous_state = previous;
+  op.proposed_state = proposed;
+  if (patch.title !== undefined) op.title = patch.title;
+  // Only when the patch carries the text: a write that never names the description leaves the
+  // stored text in place, and the owner's trap rule needs the bytes the write would leave to
+  // judge them against the stored text it read on the same transaction.
+  if (patch.description !== undefined) op.description = patch.description;
+  if (routingChanged) {
+    // This seam has no authenticated routing facts yet: the change is declared with the facts
+    // set to null, and the owner's routing rule refuses the missing facts with its own wording
+    // until the authenticated seam lands. The write never pretends the routing was judged.
+    if (proposedAssignee !== previousAssignee && proposedAssignee !== null)
+      op.assignee = proposedAssignee;
+    op.routing_facts = null;
+  }
+  return op;
 }
 
 // The bead identity for a new gated issue, allocated inside the caller's transaction. A
@@ -1662,13 +1929,33 @@ export async function updateIssue(
       opts?.onlyIfColumnId == null
         ? eq(issue.id, id)
         : and(eq(issue.id, id), eq(issue.columnId, opts.onlyIfColumnId));
-    const updated = await db.transaction(async (tx) => {
-      if (patch.parentId != null) {
-        await lockIssueTree(tx, before.projectId);
-        await assertTreeLink(id, patch.parentId, tx);
-      }
-      return tx.update(issue).set(set).where(guard).returning({ id: issue.id });
-    });
+    const updated = await db
+      .transaction(async (tx) => {
+        const rigHint = await projectRigHint(tx, before.projectId);
+        const writeSet =
+          rigHint === null
+            ? await ordinaryUpdatePrep(tx, before.projectId, patch.parentId, id, set)
+            : await gateUpdateWrite(tx, {
+                rigHint,
+                id,
+                before,
+                patch,
+                set,
+                skipIfColumnFull: opts?.skipIfColumnFull === true,
+              });
+        if (writeSet === null) return [] as { id: number }[];
+        return tx.update(issue).set(writeSet).where(guard).returning({ id: issue.id });
+      })
+      .catch((error) => {
+        // The shared @repo/db refusal cannot import an API HttpError, so the gate's refusal is
+        // mapped next to the write it stopped, the same shape the gated create gives a caller.
+        // Every other throw is the writer's own and keeps its status and wording.
+        if (isTrackerGateRefusal(error)) {
+          const safe = error.safe_form ? ` Compliant form: ${error.safe_form}.` : '';
+          throw new HttpError(409, `${error.rule}: ${error.message}.${safe}`, error.code);
+        }
+        throw error;
+      });
     if (updated.length === 0) return getIssue(id);
   }
   const after = await getIssue(id);
