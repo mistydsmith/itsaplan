@@ -26,6 +26,7 @@ import {
 import {
   allocateBeadToken,
   attachBeadIdentity,
+  type AllocationMode,
   type BeadAllocation,
   type IdentityTransaction,
 } from '@repo/db/issue-identity';
@@ -1003,6 +1004,9 @@ export interface NewIssueInput {
   startDate?: string | null;
   dueDate?: string | null;
   labelIds?: number[];
+  // How a gated project mints this issue's bead identity. The route validates the three names; an
+  // ordinary project ignores it.
+  beadAllocationMode?: AllocationMode;
 }
 
 // Enforces that assignee holds a project member and delegate holds an agent of the
@@ -1176,11 +1180,13 @@ async function allocateIssueIdentity(
   rigId: number,
   projectId: number,
   parentId: number | null | undefined,
+  mode: AllocationMode | undefined,
 ): Promise<BeadAllocation> {
   const allocated = await allocateBeadToken(executor, {
     rigId,
     projectId,
     parentId: parentId ?? null,
+    mode: mode ?? 'auto',
   });
   if (allocated.ok) return allocated.allocation;
   if (allocated.code === 'missing-rig') {
@@ -1226,7 +1232,13 @@ export async function createIssue(
     const allocation =
       rigHint === null
         ? null
-        : await allocateIssueIdentity(tx, rigHint, project.id, input.parentId);
+        : await allocateIssueIdentity(
+            tx,
+            rigHint,
+            project.id,
+            input.parentId,
+            input.beadAllocationMode,
+          );
     // Every gated create takes the board lock, root creates included, because a project can
     // become gated or change rig while this transaction waits. An ordinary parent write keeps
     // taking it for the same reason it always did.

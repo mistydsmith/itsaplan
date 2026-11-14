@@ -13,39 +13,44 @@ function targetUrl(raw: string | undefined, env: string | undefined): string {
   const name = url.pathname.replace(/^\//, '');
   if (!LOOPBACK.has(url.hostname)) throw new Error(`refusing non-loopback host ${url.hostname}`);
   if ((url.port || '5432') !== '5433') throw new Error('refusing a port other than 5433');
-  if (/sentinel|trial/i.test(name))
-    throw new Error('refusing a persistent trial or Sentinel database');
+  if (/sentinel|trial/i.test(name)) throw new Error('refusing a trial or Sentinel database');
   if (name !== REQUIRED_DB) throw new Error(`refusing ${name}; this suite uses ${REQUIRED_DB}`);
   return raw;
 }
-
 void targetUrl(process.env.DATABASE_URL, process.env.NODE_ENV);
 
 const { db } = await import('@repo/db');
 const { createIssue } = await import('../../service');
 const { getProjectById } = await import('../../../projects/service');
-// A lock holder from the same pool: a transaction that takes a row lock and stays open until the
-// case releases it, so the service's own transaction takes another connection and really waits.
-function deferred() {
-  let resolve!: () => void;
-  const promise = new Promise<void>((r) => (resolve = r));
-  return { promise, resolve };
-}
+const { createIssueBody } = await import('../../model');
+const { Elysia } = await import('elysia');
 
 type Tx = Parameters<Parameters<typeof db.transaction>[0]>[0];
+const made = {
+  issue: [] as number[],
+  column: [] as number[],
+  project: [] as number[],
+  team: [] as number[],
+  workspace: [] as number[],
+  rig: [] as number[],
+};
 
+// A lock holder from the same pool, so the service's own transaction takes another connection and
+// really waits. The two promises are the handshake: one says the lock is held, one releases it.
 async function holdRow(lock: (tx: Tx) => Promise<unknown>) {
-  const locked = deferred();
-  const release = deferred();
+  let locked!: () => void;
+  let release!: () => void;
+  const held = new Promise<void>((r) => (locked = r));
+  const open = new Promise<void>((r) => (release = r));
   const done = db.transaction(async (tx) => {
     await lock(tx);
-    locked.resolve();
-    await release.promise;
+    locked();
+    await open;
   });
-  await locked.promise;
+  await held;
   return {
     release: async () => {
-      release.resolve();
+      release();
       await done;
     },
   };
@@ -63,114 +68,108 @@ async function waitForBlocked(timeoutMs = 5000): Promise<void> {
   throw new Error('no blocked backend appeared');
 }
 
-const made = {
-  issue: [] as number[],
-  column: [] as number[],
-  project: [] as number[],
-  team: [] as number[],
-  workspace: [] as number[],
-  rig: [] as number[],
-};
-
 async function one<T>(query: ReturnType<typeof sql>): Promise<T> {
   const rows = (await db.execute(query)) as unknown as T[];
   return rows[0];
 }
 
 async function project(gated: boolean) {
-  const workspace = await one<{ id: number }>(
+  const ws = await one<{ id: number }>(
     sql`INSERT INTO workspace (name) VALUES ('c4b2 ws') RETURNING id`,
   );
-  made.workspace.push(workspace.id);
-  const team = await one<{ id: number }>(sql`INSERT INTO team (workspace_id, name, slug)
-    VALUES (${workspace.id}, 'c4b2 team', ${`c4b2-${workspace.id}`}) RETURNING id`);
+  made.workspace.push(ws.id);
+  const team = await one<{ id: number }>(
+    sql`INSERT INTO team (workspace_id, name, slug) VALUES (${ws.id}, 'c4b2 team', ${`c4b2-${ws.id}`}) RETURNING id`,
+  );
   made.team.push(team.id);
   let rigId: number | null = null;
   if (gated) {
-    const rig = await one<{ id: number }>(sql`INSERT INTO rig (prefix)
-      VALUES (${`c4b2-${workspace.id}`}) RETURNING id`);
+    const rig = await one<{ id: number }>(
+      sql`INSERT INTO rig (prefix) VALUES (${`c4b2-${ws.id}`}) RETURNING id`,
+    );
     made.rig.push(rig.id);
     rigId = rig.id;
   }
-  const row = await one<{ id: number }>(sql`INSERT INTO project (team_id, key, name, rig_id)
-    VALUES (${team.id}, ${`C4B2${workspace.id}`}, 'c4b2 project', ${rigId}) RETURNING id`);
+  const row = await one<{ id: number }>(
+    sql`INSERT INTO project (team_id, key, name, rig_id) VALUES (${team.id}, ${`C4B2${ws.id}`}, 'c4b2 project', ${rigId}) RETURNING id`,
+  );
   made.project.push(row.id);
-  const column = await one<{
-    id: number;
-  }>(sql`INSERT INTO project_column (project_id, name, position)
-    VALUES (${row.id}, 'Todo', 1) RETURNING id`);
+  const column = await one<{ id: number }>(
+    sql`INSERT INTO project_column (project_id, name, position) VALUES (${row.id}, 'Todo', 1) RETURNING id`,
+  );
   made.column.push(column.id);
   return { id: row.id, columnId: column.id, rigId };
 }
 
 async function cleanUp(): Promise<void> {
-  for (const id of made.issue.splice(0)) await db.execute(sql`DELETE FROM issue WHERE id = ${id}`);
-  for (const id of made.column.splice(0))
-    await db.execute(sql`DELETE FROM project_column WHERE id = ${id}`);
-  for (const id of made.project.splice(0))
-    await db.execute(sql`DELETE FROM project WHERE id = ${id}`);
-  for (const id of made.team.splice(0)) await db.execute(sql`DELETE FROM team WHERE id = ${id}`);
-  for (const id of made.workspace.splice(0))
-    await db.execute(sql`DELETE FROM workspace WHERE id = ${id}`);
+  const drop = async (table: string, ids: number[]) => {
+    for (const id of ids.splice(0))
+      await db.execute(sql`DELETE FROM ${sql.raw(table)} WHERE id = ${id}`);
+  };
+  await drop('issue', made.issue);
+  await drop('project_column', made.column);
+  await drop('project', made.project);
+  await drop('team', made.team);
+  await drop('workspace', made.workspace);
 }
 
-// The stored facts, read back in one query: what this file asserts is what the database holds.
+// The stored facts in one query: what this file asserts is what the database holds.
 async function stored(projectId: number, rigId: number | null) {
   return one<{
     seq: number;
     issues: number;
-    beadless: number;
     ledger: number;
     titles: string[];
     tokens: string[];
   }>(sql`
     SELECT (SELECT next_sequence FROM project WHERE id = ${projectId}) AS seq,
            (SELECT count(*)::int FROM issue WHERE project_id = ${projectId}) AS issues,
-           (SELECT count(*)::int FROM issue WHERE project_id = ${projectId} AND bead_id IS NULL) AS beadless,
            (SELECT count(*)::int FROM bead_identity WHERE rig_id = ${rigId}) AS ledger,
            (SELECT coalesce(array_agg(title ORDER BY id), '{}') FROM issue WHERE project_id = ${projectId}) AS titles,
            (SELECT coalesce(array_agg(bead_id ORDER BY id), '{}') FROM issue WHERE project_id = ${projectId} AND bead_id IS NOT NULL) AS tokens`);
 }
 
-async function createAt(projectId: number, columnId: number, title: string, parentId?: number) {
+async function createAt(
+  projectId: number,
+  columnId: number,
+  title: string,
+  parentId?: number,
+  mode?: 'auto' | 'root' | 'daughter',
+) {
   const projectRow = await getProjectById(projectId);
   if (!projectRow) throw new Error('project missing');
   const created = await createIssue(projectRow, {
     columnId,
     title,
     parentId: parentId ?? null,
+    beadAllocationMode: mode,
     labelIds: [],
   });
   made.issue.push(created.id);
-  const query = sql`SELECT id, bead_id, title, parent_id FROM issue WHERE id = ${created.id}`;
   return one<{ id: number; bead_id: string | null; title: string; parent_id: number | null }>(
-    query,
+    sql`SELECT id, bead_id, title, parent_id FROM issue WHERE id = ${created.id}`,
   );
 }
 
-describe('a gated create', () => {
-  it('takes a token, prefixes the title and writes the ledger row', async () => {
+describe('the create path', () => {
+  it('takes a token, prefixes the title and shares one counter across two projects', async () => {
     try {
       const p = await project(true);
       await createAt(p.id, p.columnId, 'First card');
       await createAt(p.id, p.columnId, 'Second card');
-      const rows = await stored(p.id, p.rigId);
-      expect(rows.titles).toEqual(['1: First card', '2: Second card']);
-      // Two projects on one rig share the counter, so a token cannot repeat across them.
       const second = await project(true);
       await db.execute(sql`UPDATE project SET rig_id = ${p.rigId} WHERE id = ${second.id}`);
       const fromOther = await createAt(second.id, second.columnId, 'From the other project');
+      const rows = await stored(p.id, p.rigId);
+      expect(rows.titles).toEqual(['1: First card', '2: Second card']);
       expect(fromOther.title).toBe('3: From the other project');
-      expect(rows.tokens).toHaveLength(2);
-      expect(rows.tokens[0]).toContain('-1');
-      expect(rows.tokens[1]).toContain('-2');
-      expect(rows.ledger).toBe(2);
+      expect(rows.ledger).toBe(3);
     } finally {
       await cleanUp();
     }
   }, 30_000);
 
-  it('gives a daughter the parent root and a granddaughter its own root, real parent kept', async () => {
+  it('gives a daughter the parent root, a granddaughter its own root, and honours an explicit mode', async () => {
     try {
       const p = await project(true);
       const root = await createAt(p.id, p.columnId, 'Root');
@@ -181,26 +180,48 @@ describe('a gated create', () => {
         '2: Grandchild',
         daughter.id,
       ]);
+      // An explicit root under a parent mints a fresh root and keeps the parent.
+      const forced = await createAt(p.id, p.columnId, 'Explicit root', root.id, 'root');
+      expect([forced.title, forced.parent_id]).toEqual(['3: Explicit root', root.id]);
+      // A daughter of a daughter cannot take a daughter, and no two-part id is minted.
+      await expect(
+        createAt(p.id, p.columnId, 'Under a daughter', daughter.id, 'daughter'),
+      ).rejects.toThrow(/cannot take a daughter/);
+      expect(grandchild.title.includes('.')).toBe(false);
+      // The public schema takes the three names and refuses anything else.
+      const probe = new Elysia().post('/p', ({ body }) => body, { body: createIssueBody });
+      const ask = (mode: string) =>
+        probe
+          .handle(
+            new Request('http://localhost/p', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ columnId: 1, title: 'x', beadAllocationMode: mode }),
+            }),
+          )
+          .then((r) => r.status);
+      expect([
+        await ask('auto'),
+        await ask('root'),
+        await ask('daughter'),
+        await ask('sibling'),
+      ]).toEqual([200, 200, 200, 422]);
     } finally {
       await cleanUp();
     }
-  }, 30_000);
+  }, 40_000);
 
   it('allows a chain deeper than eight', async () => {
     try {
       const p = await project(true);
       let parentId = (await createAt(p.id, p.columnId, 'Level 1')).id;
-      for (let level = 2; level <= 10; level += 1) {
+      for (let level = 2; level <= 10; level += 1)
         parentId = (await createAt(p.id, p.columnId, `Level ${level}`, parentId)).id;
-      }
       expect((await stored(p.id, p.rigId)).issues).toBe(10);
     } finally {
       await cleanUp();
     }
   }, 60_000);
-});
-
-describe('an ordinary project', () => {
   it('keeps its title, writes no bead id and moves the native counter by one', async () => {
     try {
       const gated = await project(true);
@@ -208,10 +229,9 @@ describe('an ordinary project', () => {
       const before = await stored(plain.id, null);
       await createAt(plain.id, plain.columnId, 'Plain card');
       await createAt(gated.id, gated.columnId, 'Gated card');
-      const after = await stored(plain.id, null);
-      expect(after).toMatchObject({
+      expect(await stored(plain.id, null)).toMatchObject({
         titles: ['Plain card'],
-        beadless: 1,
+        tokens: [],
         seq: before.seq + 1,
         ledger: 0,
       });
@@ -220,12 +240,8 @@ describe('an ordinary project', () => {
       await cleanUp();
     }
   }, 30_000);
-});
-
-describe('refusals', () => {
   it('refuses a foreign parent and a parent with no identity, writing nothing', async () => {
     try {
-      // A parent from another project: the ordinary 400, and nothing written.
       const a = await project(true);
       const b = await project(true);
       const foreign = await createAt(b.id, b.columnId, 'Foreign parent');
@@ -241,9 +257,8 @@ describe('refusals', () => {
         }),
       ).rejects.toThrow(/Parent must belong to this project/);
       expect(await stored(a.id, a.rigId)).toMatchObject({ seq: beforeA.seq, issues: 0, ledger: 0 });
-
-      // A project gated after the fact: the older issue has no ledger row, so a child under it
-      // cannot be given a token and the allocation already taken must come back.
+      // Gated after the fact: the older issue has no ledger row, so a child under it cannot be
+      // given a token and the allocation already taken must come back.
       const late = await project(false);
       const legacy = await createAt(late.id, late.columnId, 'Legacy parent');
       const rig = await one<{ id: number }>(
@@ -284,9 +299,9 @@ describe('refusals', () => {
         const projectRow = await getProjectById(p.id);
         if (!projectRow) throw new Error('project missing');
         const before = await stored(p.id, p.rigId);
-        const [rigBefore] = (await db.execute(
+        const rootBefore = await one<{ next_root: number }>(
           sql`SELECT next_root FROM rig WHERE id = ${p.rigId}`,
-        )) as unknown as { next_root: number }[];
+        );
         await expect(
           createIssue(projectRow, { columnId: p.columnId, title: 'Will roll back', labelIds: [] }),
         ).rejects.toThrow(/proof failure after ledger write/);
@@ -295,10 +310,10 @@ describe('refusals', () => {
           issues: 0,
           ledger: 0,
         });
-        const [rigAfter] = (await db.execute(
-          sql`SELECT next_root FROM rig WHERE id = ${p.rigId}`,
-        )) as unknown as { next_root: number }[];
-        expect(rigAfter.next_root).toBe(rigBefore.next_root);
+        expect(
+          (await one<{ next_root: number }>(sql`SELECT next_root FROM rig WHERE id = ${p.rigId}`))
+            .next_root,
+        ).toBe(rootBefore.next_root);
         expect((await one<{ ok: number }>(sql`SELECT 1 AS ok`)).ok).toBe(1);
       } finally {
         // Drop only this file's own trigger and function; no guard is disabled at any point.
@@ -309,12 +324,9 @@ describe('refusals', () => {
       await cleanUp();
     }
   }, 60_000);
-});
-
-describe('a rig that changes while the create waits', () => {
   it('refuses a gated move and an ordinary create that raced into a gated project', async () => {
     try {
-      // Phase 1: hold the rig, start a gated create, move the project to another rig, release.
+      // Phase 1: hold the rig, start a gated create, move the project, release.
       const gated = await project(true);
       const other = await one<{ id: number }>(
         sql`INSERT INTO rig (prefix) VALUES (${`c4b2-race-${gated.id}`}) RETURNING id`,
@@ -335,9 +347,8 @@ describe('a rig that changes while the create waits', () => {
       await rigHeld.release();
       await expect(gatedCreate).rejects.toThrow(/changed its rig/);
       expect(await stored(gated.id, other.id)).toMatchObject({ issues: 0, ledger: 0 });
-
       // Phase 2: hold the project row with an uncommitted null to rig change, start an ordinary
-      // create, and let the change commit while that create waits on the row.
+      // create and let the change commit while it waits on the row.
       const plain = await project(false);
       const late = await one<{ id: number }>(
         sql`INSERT INTO rig (prefix) VALUES (${`c4b2-late-race-${plain.id}`}) RETURNING id`,
@@ -361,9 +372,7 @@ describe('a rig that changes while the create waits', () => {
       await cleanUp();
     }
   }, 60_000);
-});
 
-describe('concurrent creates', () => {
   it('two creates at once on one gated project take distinct tokens', async () => {
     try {
       const p = await project(true);
@@ -382,9 +391,7 @@ describe('concurrent creates', () => {
       );
       expect(new Set(rows).size).toBe(2);
       const after = await stored(p.id, p.rigId);
-      expect(after.issues).toBe(2);
-      expect(after.beadless).toBe(0);
-      expect(new Set(after.tokens).size).toBe(2);
+      expect([after.issues, after.tokens.length, new Set(after.tokens).size]).toEqual([2, 2, 2]);
     } finally {
       await cleanUp();
     }

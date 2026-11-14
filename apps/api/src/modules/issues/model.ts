@@ -515,6 +515,14 @@ export const createIssueBody = t.Object({
   labelIds: t.Optional(
     t.Array(t.Integer(), { description: 'Label ids to attach. From get_project.labels.' }),
   ),
+  // A gated project mints one bead identity per issue. 'auto' takes a daughter when the parent is
+  // a root and a fresh root otherwise, 'root' mints a root even though a parent is given, and
+  // 'daughter' insists on a daughter. An ordinary project ignores the field.
+  beadAllocationMode: t.Optional(
+    t.Union([t.Literal('auto'), t.Literal('root'), t.Literal('daughter')], {
+      description: "How a gated project mints this issue's bead identity: auto, root or daughter.",
+    }),
+  ),
 });
 
 export const bulkUpdateIssuesBody = t.Object({
