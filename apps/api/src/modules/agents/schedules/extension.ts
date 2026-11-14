@@ -1,5 +1,6 @@
 import { HttpError } from '#shared/lib';
 import type { CopyIdMaps } from '#modules/projects/copy';
+import type { DbExecutor } from '@repo/db';
 
 // What an extension of the api installs into agent schedules: types of its own beside
 // 'cron' and 'status', the options it keeps on a schedule, and which issues start a
@@ -68,7 +69,14 @@ export function isScheduleSupported(schedule: { type: string; options: ScheduleO
   return optionsCheck !== noOptions || Object.keys(schedule.options).length === 0;
 }
 
-type IssueFilter = (schedule: ScheduleForExtension, issueIds: number[]) => Promise<number[]>;
+// The trailing executor is the transaction a run is queued in: a filter that reads the
+// board sees the caller's uncommitted state. A callback made before it existed takes two
+// arguments and simply never sees it.
+type IssueFilter = (
+  schedule: ScheduleForExtension,
+  issueIds: number[],
+  executor?: DbExecutor,
+) => Promise<number[]>;
 
 const everyIssue: IssueFilter = async (_schedule, issueIds) => issueIds;
 
@@ -83,6 +91,7 @@ export function setScheduleIssueFilter(next = everyIssue): void {
 export function filterScheduleIssues(
   schedule: ScheduleForExtension,
   issueIds: number[],
+  executor?: DbExecutor,
 ): Promise<number[]> {
-  return issueFilter(schedule, issueIds);
+  return issueFilter(schedule, issueIds, executor);
 }

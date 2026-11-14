@@ -1,4 +1,13 @@
-import { db, agentRun, agentSchedule, aiAgent, issue, project, projectColumn } from '@repo/db';
+import {
+  db,
+  agentRun,
+  agentSchedule,
+  aiAgent,
+  issue,
+  project,
+  projectColumn,
+  type DbExecutor,
+} from '@repo/db';
 import { and, eq, inArray, ne, notInArray, sql } from 'drizzle-orm';
 import { emitRunsCanceled } from '../core/run-finished';
 import { filterScheduleIssues, isScheduleSupported, type ScheduleForExtension } from './extension';
@@ -36,13 +45,17 @@ function notActor(actorUserId: string | null | undefined) {
 // started, so an issue moved on before its run starts does not start it. A run deferred
 // before it started has not started either: deferRun sets its attempts back to 0.
 // Then queues a run of every active status schedule of the column on each issue.
+// The trailing executor keeps every read and write of one queueing call in the caller's
+// transaction, so a schedule run queued on an outer write commits and undoes with it;
+// the default is the pool, which is what a standalone call still does.
 export async function queueStatusRuns(
   issueIds: number[],
   columnId: number,
   actorUserId: string | null | undefined,
+  executor: DbExecutor = db,
 ): Promise<void> {
   if (issueIds.length === 0) return;
-  const canceled = await db
+  const canceled = await executor
     .update(agentRun)
     .set({ status: 'canceled', executionStartedAt: null, finishedAt: new Date() })
     .where(
@@ -61,9 +74,10 @@ export async function queueStatusRuns(
   await emitRunsCanceled(
     canceled.map((row) => row.id),
     actorUserId,
+    executor,
   );
 
-  const schedules = await db
+  const schedules = await executor
     .select({ ...scheduleFields, columnName: projectColumn.name })
     .from(agentSchedule)
     .innerJoin(aiAgent, eq(aiAgent.id, agentSchedule.agentId))
@@ -82,6 +96,7 @@ export async function queueStatusRuns(
         `Work item ${row.identifier}: "${row.title}" entered the "${schedule.columnName}" status.`,
     })),
     issueIds,
+    executor,
   );
 }
 
@@ -93,9 +108,10 @@ export async function queueScheduleRuns(
   issueIds: number[],
   actorUserId: string | null | undefined,
   lead: IssueLead,
+  executor: DbExecutor = db,
 ): Promise<void> {
   if (scheduleIds.length === 0 || issueIds.length === 0) return;
-  const schedules = await db
+  const schedules = await executor
     .select(scheduleFields)
     .from(agentSchedule)
     .innerJoin(aiAgent, eq(aiAgent.id, agentSchedule.agentId))
@@ -110,13 +126,18 @@ export async function queueScheduleRuns(
   await insertIssueRuns(
     schedules.map((schedule) => ({ ...schedule, lead })),
     issueIds,
+    executor,
   );
 }
 
-async function insertIssueRuns(all: IssueSchedule[], issueIds: number[]): Promise<void> {
+async function insertIssueRuns(
+  all: IssueSchedule[],
+  issueIds: number[],
+  executor: DbExecutor = db,
+) {
   const schedules = all.filter(isScheduleSupported);
   if (schedules.length === 0) return;
-  const issues = await db
+  const issues = await executor
     .select({
       id: issue.id,
       projectId: issue.projectId,
@@ -135,6 +156,7 @@ async function insertIssueRuns(all: IssueSchedule[], issueIds: number[]): Promis
         await filterScheduleIssues(
           schedule,
           own.map((row) => row.id),
+          executor,
         ),
       );
       return own
@@ -152,8 +174,8 @@ async function insertIssueRuns(all: IssueSchedule[], issueIds: number[]): Promis
   );
   const runs = perSchedule.flat();
   if (runs.length === 0) return;
-  await db.insert(agentRun).values(runs);
-  await db
+  await executor.insert(agentRun).values(runs);
+  await executor
     .update(agentSchedule)
     .set({ lastRunAt: new Date() })
     .where(inArray(agentSchedule.id, [...new Set(runs.map((run) => run.scheduleId))]));
@@ -166,8 +188,11 @@ function issueRunPrompt(lead: string, task: string): string {
 // Whether a status schedule of the column has a run that has not finished: one waiting
 // out its delay or one being executed. Deleting the column deletes the schedule and
 // its runs with it.
-export async function hasUnfinishedStatusRuns(columnId: number): Promise<boolean> {
-  const [row] = await db
+export async function hasUnfinishedStatusRuns(
+  columnId: number,
+  executor: DbExecutor = db,
+): Promise<boolean> {
+  const [row] = await executor
     .select({ id: agentRun.id })
     .from(agentRun)
     .innerJoin(agentSchedule, eq(agentSchedule.id, agentRun.scheduleId))
