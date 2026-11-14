@@ -10,6 +10,7 @@ import {
   projectColumn,
   projectDocument,
   type ActivityPayload,
+  type DbExecutor,
 } from '@repo/db';
 import { and, desc, eq, inArray, isNotNull, lt, or, sql, isNull } from 'drizzle-orm';
 import { addedMentionHandles, resolveMentionHandles, type MentionedUsers } from '#shared/mentions';
@@ -45,18 +46,22 @@ export interface NewNotificationRow {
 // Keeps only the ids that are members of the project. Filters out non-members (an
 // agent's bot user is assigned via delegate but is not a member) and users who have
 // lost access.
-async function keepProjectMembers(projectId: number, ids: string[]): Promise<Set<string>> {
+async function keepProjectMembers(
+  projectId: number,
+  ids: string[],
+  executor: DbExecutor = db,
+): Promise<Set<string>> {
   if (ids.length === 0) return new Set();
-  const rows = await db
+  const rows = await executor
     .select({ userId: projectMember.userId })
     .from(projectMember)
     .where(and(eq(projectMember.projectId, projectId), inArray(projectMember.userId, ids)));
   return new Set(rows.map((r) => r.userId));
 }
 
-async function actorName(id: string | null): Promise<string | null> {
+async function actorName(id: string | null, executor: DbExecutor = db): Promise<string | null> {
   if (id == null) return null;
-  const rows = await db.select({ name: user.name }).from(user).where(eq(user.id, id));
+  const rows = await executor.select({ name: user.name }).from(user).where(eq(user.id, id));
   return rows[0]?.name ?? null;
 }
 
@@ -64,16 +69,24 @@ async function actorName(id: string | null): Promise<string | null> {
 async function insertNotifications(
   rows: NewNotificationRow[],
   commentId: number | null = null,
+  executor: DbExecutor = db,
 ): Promise<void> {
   if (rows.length === 0) return;
-  const name = await actorName(rows[0].actorUserId);
-  await db.insert(notification).values(rows.map((r) => ({ ...r, actorName: name })));
-  // Fan out to the project's enabled delivery channels (email, Telegram). Best-effort:
-  // a delivery failure must not break the inbox insert or the domain mutation.
-  try {
-    await enqueueOutbound(rows, name, commentId);
-  } catch (err) {
-    console.error('[notifications] outbound enqueue failed:', err);
+  const name = await actorName(rows[0].actorUserId, executor);
+  await executor.insert(notification).values(rows.map((r) => ({ ...r, actorName: name })));
+  // Fan out to the project's enabled delivery channels (email, Telegram) on the
+  // default client only. A caller holding an executor is inside a transaction the
+  // rows may still roll back out of, and enqueueOutbound writes on its own
+  // connection: a failed write must not leak past the rollback, and the fan-out
+  // joins the owning write's transaction from that write's own plumbing.
+  // Best-effort on the default path: a delivery failure must not break the inbox
+  // insert or the domain mutation.
+  if (executor === db) {
+    try {
+      await enqueueOutbound(rows, name, commentId);
+    } catch (err) {
+      console.error('[notifications] outbound enqueue failed:', err);
+    }
   }
 }
 
@@ -149,15 +162,18 @@ export async function notifyEditedCommentMentions(
 // people it already named. Being mentioned subscribes to the issue, the same as it
 // does in a comment. A text reaches only the members it names (see mentionReach): an
 // agent is addressed in a comment, or given an issue by delegation.
-export async function notifyTextMentions(input: {
-  projectId: number;
-  issueId: number;
-  actorUserId: string | null;
-  // The change-log entry the write recorded, so the inbox item links to it.
-  sourceActivityId: number | null;
-  before: string;
-  after: string;
-}): Promise<void> {
+export async function notifyTextMentions(
+  input: {
+    projectId: number;
+    issueId: number;
+    actorUserId: string | null;
+    // The change-log entry the write recorded, so the inbox item links to it.
+    sourceActivityId: number | null;
+    before: string;
+    after: string;
+  },
+  executor: DbExecutor = db,
+): Promise<void> {
   const { projectId, issueId, actorUserId: actor } = input;
   const handles = addedMentionHandles(input.before, input.after);
   if (handles.length === 0) return;
@@ -180,6 +196,8 @@ export async function notifyTextMentions(input: {
         type: 'mentioned' as const,
         actorUserId: actor,
       })),
+    null,
+    executor,
   );
 }
 
@@ -187,22 +205,25 @@ export async function notifyTextMentions(input: {
 // not the actor) gets 'assigned'; a status change notifies the issue's watchers with
 // 'state_changed'. The actor is never notified. Being assigned subscribes to the
 // issue, and stays that way when the issue is later handed to someone else.
-export async function notifyIssueChange(input: {
-  projectId: number;
-  issueId: number;
-  actorUserId: string | null;
-  assignedUserId?: string | null;
-  assignedActivityId?: number | null;
-  statusChanged?: boolean;
-  statusActivityId?: number | null;
-}): Promise<void> {
+export async function notifyIssueChange(
+  input: {
+    projectId: number;
+    issueId: number;
+    actorUserId: string | null;
+    assignedUserId?: string | null;
+    assignedActivityId?: number | null;
+    statusChanged?: boolean;
+    statusActivityId?: number | null;
+  },
+  executor: DbExecutor = db,
+): Promise<void> {
   const { projectId, issueId, actorUserId: actor } = input;
   const rows: NewNotificationRow[] = [];
 
   if (input.assignedUserId) {
     await autoWatchIssue(projectId, issueId, [input.assignedUserId]);
     if (input.assignedUserId !== actor) {
-      const members = await keepProjectMembers(projectId, [input.assignedUserId]);
+      const members = await keepProjectMembers(projectId, [input.assignedUserId], executor);
       if (members.has(input.assignedUserId)) {
         rows.push({
           userId: input.assignedUserId,
@@ -233,7 +254,7 @@ export async function notifyIssueChange(input: {
     }
   }
 
-  await insertNotifications(rows);
+  await insertNotifications(rows, null, executor);
 }
 
 // Fan out a mention in a document: in its text, or in the comment documentCommentId

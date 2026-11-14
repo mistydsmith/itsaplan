@@ -1,4 +1,4 @@
-import { db, issueStatus, projectColumn } from '@repo/db';
+import { db, issueStatus, projectColumn, type DbExecutor } from '@repo/db';
 import { and, asc, eq, inArray, isNull, sql } from 'drizzle-orm';
 import { iso } from '#shared/lib';
 
@@ -16,14 +16,15 @@ export async function recordStatusChange(
   issueIds: number[],
   columnId: number,
   enteredAt?: Date,
+  executor: DbExecutor = db,
 ): Promise<void> {
   if (issueIds.length === 0) return;
-  const [column] = await db
+  const [column] = await executor
     .select({ name: projectColumn.name, stateType: projectColumn.stateType })
     .from(projectColumn)
     .where(eq(projectColumn.id, columnId));
   const at = enteredAt ?? sql`now()`;
-  await db.transaction(async (tx) => {
+  const write = async (tx: DbExecutor) => {
     await tx
       .update(issueStatus)
       .set({ leftAt: at })
@@ -37,7 +38,15 @@ export async function recordStatusChange(
         enteredAt: at,
       })),
     );
-  });
+  };
+  // Default callers keep the existing single transaction. A caller that supplies
+  // an executor is inside its own transaction: a nested db.transaction would commit
+  // the close independently of that caller's write.
+  if (executor === db) {
+    await db.transaction(write);
+    return;
+  }
+  await write(executor);
 }
 
 // --- Status timeline --------------------------------------------------------------

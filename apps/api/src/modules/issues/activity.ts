@@ -10,6 +10,7 @@ import {
   cycle,
   type ActivityPayload,
   type ActivitySide,
+  type DbExecutor,
 } from '@repo/db';
 import { and, asc, desc, eq, gte, inArray, isNull, lt, ne, sql } from 'drizzle-orm';
 import { HttpError, iso } from '#shared/lib';
@@ -533,19 +534,18 @@ export function actorId(actor: ActivityActor): string | null {
   return typeof actor === 'string' ? actor : null;
 }
 
-// What a write runs on: the pool, or the transaction the caller is inside.
-type Executor = typeof db | Parameters<Parameters<typeof db.transaction>[0]>[0];
-
 // Records the given events for an issue. actor_name is snapshotted from the actor
 // so the entry survives the user being renamed or deleted.
 export async function recordActivity(
   issueId: number,
   events: ActivityInput[],
   actor?: ActivityActor,
+  executor: DbExecutor = db,
 ): Promise<{ id: number; action: string | null }[]> {
   return recordActivityEntries(
     events.map((event) => ({ issueId, event })),
     actor,
+    executor,
   );
 }
 
@@ -556,10 +556,12 @@ export async function recordActivityForIssues(
   issueIds: number[],
   event: ActivityInput,
   actor?: ActivityActor,
+  executor: DbExecutor = db,
 ): Promise<void> {
   await recordActivityEntries(
     issueIds.map((issueId) => ({ issueId, event })),
     actor,
+    executor,
   );
 }
 
@@ -570,7 +572,7 @@ export async function recordActivityForIssues(
 export async function recordActivityEntries(
   entries: { issueId: number; event: ActivityInput }[],
   actor?: ActivityActor,
-  on: Executor = db,
+  on: DbExecutor = db,
 ): Promise<{ id: number; action: string | null }[]> {
   if (!entries.length) return [];
   const resolvedActorId = actorId(actor);
@@ -598,41 +600,44 @@ export async function recordActivityEntries(
 }
 
 // The sides that read their text from the row they name, looked up at change time.
-async function columnSide(id: number | null): Promise<ActivitySide | undefined> {
+async function columnSide(id: number | null, executor: DbExecutor = db) {
   if (id == null) return undefined;
-  const rows = await db
+  const rows = await executor
     .select({ id: projectColumn.id, name: projectColumn.name, stateType: projectColumn.stateType })
     .from(projectColumn)
     .where(eq(projectColumn.id, id));
   return rows[0] ? statusSide(rows[0]) : undefined;
 }
-async function typeSide(id: number | null): Promise<ActivitySide | undefined> {
+async function typeSide(id: number | null, executor: DbExecutor = db) {
   if (id == null) return undefined;
-  const rows = await db
+  const rows = await executor
     .select({ name: issueType.name })
     .from(issueType)
     .where(eq(issueType.id, id));
   return rowSide(rows[0]?.name, id);
 }
-async function initiativeSide(id: number | null): Promise<ActivitySide | undefined> {
+async function initiativeSide(id: number | null, executor: DbExecutor = db) {
   if (id == null) return undefined;
-  const rows = await db
+  const rows = await executor
     .select({ title: initiative.title })
     .from(initiative)
     .where(eq(initiative.id, id));
   return rowSide(rows[0]?.title, id);
 }
-async function cycleSide(id: number | null): Promise<ActivitySide | undefined> {
+async function cycleSide(id: number | null, executor: DbExecutor = db) {
   if (id == null) return undefined;
-  const rows = await db.select({ name: cycle.name }).from(cycle).where(eq(cycle.id, id));
+  const rows = await executor.select({ name: cycle.name }).from(cycle).where(eq(cycle.id, id));
   return rowSide(rows[0]?.name, id);
 }
-export async function userSide(id: string | null): Promise<ActivitySide | undefined> {
-  return rowSide(await userName(id), id);
+export async function userSide(id: string | null, executor: DbExecutor = db) {
+  return rowSide(await userName(id, executor), id);
 }
-export async function userName(id: string | null): Promise<string | null> {
+export async function userName(
+  id: string | null,
+  executor: DbExecutor = db,
+): Promise<string | null> {
   if (id == null) return null;
-  const rows = await db.select({ name: user.name }).from(user).where(eq(user.id, id));
+  const rows = await executor.select({ name: user.name }).from(user).where(eq(user.id, id));
   return rows[0]?.name ?? null;
 }
 // Name snapshots for a set of labels in one query, resolved at change time so a log
@@ -689,6 +694,7 @@ export async function logIssueUpdate(
   before: IssueSnapshot,
   after: IssueSnapshot,
   actor?: ActivityActor,
+  executor: DbExecutor = db,
 ): Promise<void> {
   const events: ActivityInput[] = [];
   if (before.title !== after.title)
@@ -698,38 +704,38 @@ export async function logIssueUpdate(
   if (before.columnId !== after.columnId)
     events.push({
       action: 'status',
-      from: await columnSide(before.columnId),
-      to: await columnSide(after.columnId),
+      from: await columnSide(before.columnId, executor),
+      to: await columnSide(after.columnId, executor),
     });
   if (before.typeId !== after.typeId)
     events.push({
       action: 'type',
-      from: await typeSide(before.typeId),
-      to: await typeSide(after.typeId),
+      from: await typeSide(before.typeId, executor),
+      to: await typeSide(after.typeId, executor),
     });
   if (before.initiativeId !== after.initiativeId)
     events.push({
       action: 'initiative',
-      from: await initiativeSide(before.initiativeId),
-      to: await initiativeSide(after.initiativeId),
+      from: await initiativeSide(before.initiativeId, executor),
+      to: await initiativeSide(after.initiativeId, executor),
     });
   if (before.cycleId !== after.cycleId)
     events.push({
       action: 'cycle',
-      from: await cycleSide(before.cycleId),
-      to: await cycleSide(after.cycleId),
+      from: await cycleSide(before.cycleId, executor),
+      to: await cycleSide(after.cycleId, executor),
     });
   if (before.assigneeUserId !== after.assigneeUserId)
     events.push({
       action: 'assignee',
-      from: await userSide(before.assigneeUserId),
-      to: await userSide(after.assigneeUserId),
+      from: await userSide(before.assigneeUserId, executor),
+      to: await userSide(after.assigneeUserId, executor),
     });
   if (before.delegateUserId !== after.delegateUserId)
     events.push({
       action: 'delegate',
-      from: await userSide(before.delegateUserId),
-      to: await userSide(after.delegateUserId),
+      from: await userSide(before.delegateUserId, executor),
+      to: await userSide(after.delegateUserId, executor),
     });
   if ((before.priority ?? '') !== (after.priority ?? ''))
     events.push({
@@ -763,7 +769,7 @@ export async function logIssueUpdate(
       from: textSide(before.dueDate),
       to: textSide(after.dueDate),
     });
-  const inserted = await recordActivity(after.id, events, actor);
+  const inserted = await recordActivity(after.id, events, actor, executor);
 
   // Inbox notifications for the events with a dedicated notification type: a new
   // assignee, a status change, and the mentions a rewritten description added. Each
@@ -772,7 +778,7 @@ export async function logIssueUpdate(
   const statusChanged = before.columnId !== after.columnId;
   const descriptionChanged = before.description !== after.description;
   if (!assigneeChanged && !statusChanged && !descriptionChanged) return;
-  const [row] = await db
+  const [row] = await executor
     .select({ projectId: issue.projectId })
     .from(issue)
     .where(eq(issue.id, after.id));
@@ -780,24 +786,30 @@ export async function logIssueUpdate(
 
   const idByAction = new Map(inserted.map((r) => [r.action, r.id]));
   if (assigneeChanged || statusChanged) {
-    await notifyIssueChange({
-      projectId: row.projectId,
-      issueId: after.id,
-      actorUserId: actorId(actor),
-      assignedUserId: assigneeChanged ? after.assigneeUserId : null,
-      assignedActivityId: idByAction.get('assignee') ?? null,
-      statusChanged,
-      statusActivityId: idByAction.get('status') ?? null,
-    });
+    await notifyIssueChange(
+      {
+        projectId: row.projectId,
+        issueId: after.id,
+        actorUserId: actorId(actor),
+        assignedUserId: assigneeChanged ? after.assigneeUserId : null,
+        assignedActivityId: idByAction.get('assignee') ?? null,
+        statusChanged,
+        statusActivityId: idByAction.get('status') ?? null,
+      },
+      executor,
+    );
   }
   if (descriptionChanged) {
-    await notifyTextMentions({
-      projectId: row.projectId,
-      issueId: after.id,
-      actorUserId: actorId(actor),
-      sourceActivityId: idByAction.get('description') ?? null,
-      before: before.description,
-      after: after.description,
-    });
+    await notifyTextMentions(
+      {
+        projectId: row.projectId,
+        issueId: after.id,
+        actorUserId: actorId(actor),
+        sourceActivityId: idByAction.get('description') ?? null,
+        before: before.description,
+        after: after.description,
+      },
+      executor,
+    );
   }
 }
