@@ -1248,8 +1248,14 @@ export async function createIssue(
   await assertIssueLabels(project.id, input.labelIds);
   // An issue created in a column enters it the same way a moved one does, so the
   // column's auto-assignee applies. An assignee sent with the create wins over it.
-  const assigneeUserId = input.assigneeUserId ?? (await columnAutoAssignee(input.columnId));
-  const { id: issueId, createdAt } = await db
+  // Ordinary projects keep the pool read they have always used for the column's auto-assignee.
+  // A gated create rereads it on its own transaction below, because that answer is a write value.
+  const poolAssignee = input.assigneeUserId ?? (await columnAutoAssignee(input.columnId));
+  const {
+    id: issueId,
+    createdAt,
+    created: finished,
+  } = await db
     .transaction(async (tx) => {
       // The rig is read here as a lock-order hint only. When the project is gated the allocation
       // takes the rig lock, which keeps it ahead of the board lock; the hint itself is never
@@ -1366,6 +1372,12 @@ export async function createIssue(
         .select({ pos: sql<number>`COALESCE(MAX(${issue.position}), 0) + 1000` })
         .from(issue)
         .where(eq(issue.columnId, input.columnId));
+      // The assignee is a write value, so a gated create rereads it under the locks it already
+      // holds rather than trusting the answer the pool gave before this transaction started.
+      const assigneeUserId =
+        rigId === null
+          ? poolAssignee
+          : (input.assigneeUserId ?? (await columnAutoAssignee(input.columnId, tx)));
       const [row] = await tx
         .insert(issue)
         .values({
@@ -1397,8 +1409,18 @@ export async function createIssue(
         // reserved row is not an option.
         const attached = await attachBeadIdentity(tx, { allocation, issueId: row.id });
         if (!attached.ok) throw new HttpError(409, attached.message);
+        // Gated: every creation side effect runs on this transaction, so a late failure takes the
+        // reserved identity, the sequence and the issue row with it instead of leaving them behind.
+        const created = await finishCreate(tx, {
+          projectId: project.id,
+          issueId: row.id,
+          createdAt: row.createdAt,
+          input,
+          actorUserId: actorUserId ?? null,
+        });
+        return { ...row, created };
       }
-      return row;
+      return { ...row, created: null };
     })
     .catch((error) => {
       // Two shared @repo/db refusals can arrive here, and neither package can import an API
@@ -1428,45 +1450,77 @@ export async function createIssue(
       throw error;
     });
 
-  // The first stretch of the status history starts when the issue does, so the
-  // entries of its creation fall inside it.
-  await recordStatusChange([issueId], input.columnId, createdAt);
-  await recordActivity(issueId, [{ action: 'created' }], actorUserId);
-  if (input.cycleId != null) await recordCycleChange(issueId, null, input.cycleId);
-  if (input.parentId != null) await recordParentChange(issueId, null, input.parentId, actorUserId);
-  // Suppress the label_changed event on creation — the initial labels are part of
-  // the issue.created payload, so a separate change event would be redundant.
-  if (input.labelIds?.length)
-    await setIssueLabels(project.id, issueId, input.labelIds, actorUserId, false);
-  const created = (await getIssue(issueId))!;
-  // The author follows what they filed; the assignee is subscribed by the
-  // assignment notification below, the same as a later assignment does.
-  await autoWatchIssue(project.id, issueId, [actorUserId]);
-  await emitIssueEvent('issue.created', created, actorUserId);
-  // An issue created already delegated to an agent enqueues a run, the same as
-  // delegating one later does.
-  await enqueueDelegateRun(created, actorUserId);
-  await queueStatusRuns([issueId], input.columnId, actorUserId);
-  // An issue created already assigned to a member notifies them, the same as
-  // assigning one later does.
-  if (created.assigneeUserId) {
-    await notifyIssueChange({
-      projectId: project.id,
-      issueId,
-      actorUserId: actorUserId ?? null,
-      assignedUserId: created.assigneeUserId,
-    });
-  }
-  // A description written on creation reaches the people it mentions, the same as
-  // one written into an existing issue does.
-  await notifyTextMentions({
+  // Gated returns the row its transaction finished; an ordinary project keeps its existing shape and
+  // runs the same sequence after the commit, on the default client.
+  if (finished !== null) return finished;
+  return await finishCreate(db, {
     projectId: project.id,
     issueId,
+    createdAt,
+    input,
     actorUserId: actorUserId ?? null,
-    sourceActivityId: null,
-    before: '',
-    after: created.description,
   });
+}
+
+// The creation side effects, in the order they have always run. A gated create passes its transaction
+// so a failure here rolls the create back with them; an ordinary project passes the default client
+// after the commit, which is exactly what that branch did before this helper existed.
+async function finishCreate(
+  executor: DbExecutor,
+  creation: {
+    projectId: number;
+    issueId: number;
+    createdAt: Date;
+    input: NewIssueInput;
+    actorUserId: string | null;
+  },
+): Promise<IssueRow> {
+  const { projectId, issueId, createdAt, input, actorUserId } = creation;
+  // The first stretch of the status history starts when the issue does, so the entries of its
+  // creation fall inside it.
+  await recordStatusChange([issueId], input.columnId, createdAt, executor);
+  await recordActivity(issueId, [{ action: 'created' }], actorUserId, executor);
+  if (input.cycleId != null) await recordCycleChange(issueId, null, input.cycleId, executor);
+  if (input.parentId != null)
+    await recordParentChange(issueId, null, input.parentId, actorUserId, executor);
+  // Suppress the label_changed event on creation - the initial labels are part of the issue.created
+  // payload, so a separate change event would be redundant.
+  if (input.labelIds?.length)
+    await setIssueLabels(projectId, issueId, input.labelIds, actorUserId, false, executor);
+  // Read after the labels, so the payload the webhook and the inbox carry already names them.
+  const created = (await getIssue(issueId, executor))!;
+  // The author follows what they filed; the assignee is subscribed by the assignment notification
+  // below, the same as a later assignment does.
+  await autoWatchIssue(projectId, issueId, [actorUserId], executor);
+  await emitIssueEvent('issue.created', created, actorUserId, {}, executor);
+  // An issue created already delegated to an agent enqueues a run, the same as delegating one later.
+  await enqueueDelegateRun(created, actorUserId, executor);
+  await queueStatusRuns([issueId], input.columnId, actorUserId, executor);
+  // An issue created already assigned to a member notifies them, the same as assigning one does.
+  if (created.assigneeUserId) {
+    await notifyIssueChange(
+      {
+        projectId,
+        issueId,
+        actorUserId: actorUserId ?? null,
+        assignedUserId: created.assigneeUserId,
+      },
+      executor,
+    );
+  }
+  // A description written on creation reaches the people it mentions, the same as one written into an
+  // existing issue does.
+  await notifyTextMentions(
+    {
+      projectId,
+      issueId,
+      actorUserId: actorUserId ?? null,
+      sourceActivityId: null,
+      before: '',
+      after: created.description,
+    },
+    executor,
+  );
   return created;
 }
 
@@ -1646,19 +1700,26 @@ export async function updateIssue(
 // can act on the issue. Skipped when the agent delegated to itself (an agent setting
 // itself off). The run is executed later — by the poller or by the agent's runner —
 // so the write is never blocked on it.
-async function enqueueDelegateRun(after: IssueRow, actor?: ActivityActor): Promise<void> {
+async function enqueueDelegateRun(
+  after: IssueRow,
+  actor?: ActivityActor,
+  executor: DbExecutor = db,
+): Promise<void> {
   const delegate = after.delegateUserId;
   if (!delegate || delegate === actorId(actor)) return;
-  const agent = await getAssignTriggerAgent(after.projectId, delegate, actorId(actor));
+  const agent = await getAssignTriggerAgent(after.projectId, delegate, actorId(actor), executor);
   if (!agent) return;
-  await enqueueAgentRun({
-    agentId: agent.id,
-    projectId: after.projectId,
-    issueId: after.id,
-    sourceActivityId: null,
-    prompt: `Work item ${after.identifier}: "${after.title}" has been delegated to you. Review it and take the appropriate next step.`,
-    delaySeconds: agent.delegationDelaySec,
-  });
+  await enqueueAgentRun(
+    {
+      agentId: agent.id,
+      projectId: after.projectId,
+      issueId: after.id,
+      sourceActivityId: null,
+      prompt: `Work item ${after.identifier}: "${after.title}" has been delegated to you. Review it and take the appropriate next step.`,
+      delaySeconds: agent.delegationDelaySec,
+    },
+    executor,
+  );
 }
 
 // Deletes an issue and everything attached to it. Field options/values, labels,
