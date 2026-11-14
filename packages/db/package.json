@@ -6,7 +6,8 @@
   "exports": {
     ".": "./src/index.ts",
     "./schema": "./src/schema/index.ts",
-    "./issue-identity": "./src/issue-identity.ts"
+    "./issue-identity": "./src/issue-identity.ts",
+    "./tracker-rules": "./src/tracker-rules.ts"
   },
   "scripts": {
     "db:generate": "drizzle-kit generate",
