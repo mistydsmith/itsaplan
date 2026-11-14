@@ -8,15 +8,18 @@ import {
   label,
   initiative,
   cycle,
+  lockIssueTree,
   type ActivityPayload,
   type ActivitySide,
   type DbExecutor,
 } from '@repo/db';
+import { gateIssueWrite, isTrackerGateRefusal } from '@repo/db/tracker-gate';
 import { and, asc, desc, eq, gte, inArray, isNull, lt, ne, sql } from 'drizzle-orm';
 import { HttpError, iso } from '#shared/lib';
 import { emitCommentEvent } from './webhook-payload';
 import { addedMentionHandles, parseMentionHandles, resolveMentionHandles } from '#shared/mentions';
-import { mentionReach, queueMentionRuns } from '#modules/mentions/service';
+import { isAgentUser } from '#modules/agents/core/service';
+import { mentionReach, queueMentionRuns, type MentionReach } from '#modules/mentions/service';
 import {
   notifyComment,
   notifyEditedCommentMentions,
@@ -321,7 +324,15 @@ export async function listGroupedFeed(
   return { groups, nextCursor: page.nextCursor };
 }
 
-export async function createComment(input: {
+// A comment on a rig-tracked card is an owner-judged card write (C1: comment_create
+// is a gate-covered op): the rig, the board, the project and the issue are locked in
+// the same order create and update use, the owner judges the FULL post-write state —
+// saved labels, saved comments, incoming body — BEFORE the INSERT, and every gated
+// side effect (comment.created delivery, mention run queue, notification) runs in the
+// same transaction, so a refusal rolls the whole write back. An ordinary card keeps
+// today's post-commit side effects; only a short FOR SHARE fence is added so a
+// project that gains a rig mid-write gets a 409 retry, never an unjudged comment.
+type CreateCommentParams = {
   issueId: number;
   actorUserId?: string | null;
   body: string;
@@ -330,48 +341,295 @@ export async function createComment(input: {
   // The name of an author without an account, such as someone writing in through a
   // build's public page. Their mentions reach nobody: they are not in the team.
   authorName?: string;
-}): Promise<FeedItemRow> {
+};
+
+export async function createComment(input: CreateCommentParams): Promise<FeedItemRow> {
   const actorUserId = input.actorUserId ?? null;
-  const actorName = input.authorName ?? (await userName(actorUserId));
   const replyToId = input.replyToId ?? null;
-  if (replyToId != null) {
-    const [parent] = await db
-      .select({ issueId: issueActivity.issueId, kind: issueActivity.kind })
-      .from(issueActivity)
-      .where(eq(issueActivity.id, replyToId));
-    if (!parent || parent.issueId !== input.issueId || parent.kind !== 'comment')
-      throw new HttpError(400, 'replyToId must be a comment on this issue');
-  }
-  const [row] = await db
-    .insert(issueActivity)
-    .values({
-      issueId: input.issueId,
-      kind: 'comment',
-      replyToId,
-      actorUserId,
-      actorName,
-      body: input.body,
-    })
-    .returning();
-  const comment = mapFeedItem(row);
+  // Unlocked hint read: it only chooses which fencing this write takes. Never write
+  // authority — the locked rows decide.
+  const hintRows = (await db.execute(
+    sql`SELECT i.project_id, p.rig_id
+        FROM issue i
+        JOIN project p ON p.id = i.project_id
+        WHERE i.id = ${input.issueId}`,
+  )) as unknown as { project_id: number | string; rig_id: number | string | null }[];
+  const hint = hintRows[0];
+  if (!hint) throw new HttpError(404, 'Issue not found');
+  const projectId = Number(hint.project_id);
+  const rigHint = hint.rig_id == null ? null : Number(hint.rig_id);
+  return rigHint == null
+    ? ordinaryCreateComment({ params: input, actorUserId, replyToId, projectId })
+    : gatedCreateComment({ params: input, actorUserId, replyToId, projectId, rigHint });
+}
 
-  const projectRows = await db
-    .select({ projectId: issue.projectId })
-    .from(issue)
-    .where(eq(issue.id, input.issueId));
-  const projectId = projectRows[0]?.projectId;
-  if (projectId != null) {
-    await emitCommentEvent(projectId, 'comment.created', comment, actorUserId);
-    // Resolved once: the agent halves start runs, the member half is notified.
-    const mentioned = await resolveMentionHandles(
-      projectId,
-      input.authorName === undefined ? parseMentionHandles(comment.body ?? '') : [],
-    );
-    await enqueueMentionRuns(projectId, comment, mentioned.agentUserIds);
-    await notifyComment(projectId, comment, mentioned);
+async function gatedCreateComment(input: {
+  params: CreateCommentParams;
+  actorUserId: string | null;
+  replyToId: number | null;
+  projectId: number;
+  rigHint: number;
+}): Promise<FeedItemRow> {
+  try {
+    return await db.transaction(async (tx) => {
+      // The rig fact first: the gate is a rig-specific rule set, so its lock is held
+      // before the gate is asked (the same order create and update use).
+      const rigRows = (await tx.execute(
+        sql`SELECT id FROM rig WHERE id = ${input.rigHint} FOR UPDATE`,
+      )) as unknown as { id: number | string }[];
+      if (rigRows.length === 0) {
+        throw new HttpError(
+          409,
+          'This project changed its rig while the comment was being written; try again',
+        );
+      }
+      // Board lock (advisory, held to commit), then the project row FOR UPDATE: a
+      // project gaining or losing its rig during the write is a 409 retry, and the rig
+      // it holds while locked is the rig the gate is asked on.
+      await lockIssueTree(tx, input.projectId);
+      const lockedRigId = await lockProjectRig(tx, input.projectId);
+      if (lockedRigId === null || lockedRigId !== input.rigHint) {
+        throw new HttpError(
+          409,
+          'This project changed its rig while the comment was being written; try again',
+        );
+      }
+      // The issue row FOR UPDATE under the board lock.
+      const issueRows = (await tx.execute(
+        sql`SELECT project_id, title, description FROM issue
+            WHERE id = ${input.params.issueId} FOR UPDATE`,
+      )) as unknown as {
+        project_id: number | string;
+        title: string | null;
+        description: string | null;
+      }[];
+      const issue = issueRows[0];
+      if (!issue) throw new HttpError(404, 'Issue not found');
+      if (Number(issue.project_id) !== input.projectId) {
+        throw new HttpError(
+          409,
+          'This issue moved projects while the comment was being written; try again',
+        );
+      }
+      // Reply validation and the author snapshot on the transaction.
+      await assertReplyParent(tx, input.replyToId, input.params.issueId);
+      const actorName = input.params.authorName ?? (await userName(input.actorUserId, tx));
+      // The mention reach is computed once, before the gate, from the locked rows, and
+      // reused for the post-INSERT queue: one reach per write. A comment that reaches
+      // an agent is routed by the lane rule, so the op carries routing_facts: null and
+      // the owner refuses it — agent comments write through the run lifecycle, not this
+      // endpoint — rather than this seam guessing a routing.
+      const mentioned = await resolveMentionHandles(
+        input.projectId,
+        input.params.authorName === undefined ? parseMentionHandles(input.params.body) : [],
+        tx,
+      );
+      const agents = await commentReach(
+        input.projectId,
+        { replyToId: input.replyToId, actorUserId: input.actorUserId },
+        mentioned.agentUserIds,
+        tx,
+      );
+      const agentReached =
+        agents.length > 0 &&
+        !(input.actorUserId != null && (await isAgentUser(input.actorUserId, tx)));
+      const op = await buildCommentOp(tx, {
+        issueId: input.params.issueId,
+        rigId: lockedRigId,
+        title: issue.title ?? '',
+        description: issue.description ?? '',
+        body: input.params.body,
+        agentReached,
+      });
+      // The owner judges BEFORE the INSERT; a refusal rolls the whole write back.
+      await gateIssueWrite({ rigId: lockedRigId, op });
+      const [row] = await tx
+        .insert(issueActivity)
+        .values({
+          issueId: input.params.issueId,
+          kind: 'comment',
+          replyToId: input.replyToId,
+          actorUserId: input.actorUserId,
+          actorName,
+          body: input.params.body,
+        })
+        .returning();
+      const comment = mapFeedItem(row);
+      // The gated side effects, all on this transaction: the delivery, the run queue
+      // and the inbox rows are all-or-nothing with the comment row.
+      await emitCommentEvent(input.projectId, 'comment.created', comment, input.actorUserId, tx);
+      await queueMentionRuns(
+        {
+          projectId: input.projectId,
+          actorUserId: comment.actorUserId,
+          agents,
+          prompt: comment.body ?? '',
+          source: { issueId: input.params.issueId, sourceActivityId: comment.id },
+        },
+        tx,
+      );
+      await notifyComment(input.projectId, comment, mentioned, tx);
+      return comment;
+    });
+  } catch (error) {
+    // Mapped next to the write it stopped, the same shape the gated create and update
+    // give a caller. Every other throw is the writer's own and keeps its status.
+    if (isTrackerGateRefusal(error)) {
+      const safe = error.safe_form ? ` Compliant form: ${error.safe_form}.` : '';
+      throw new HttpError(409, `${error.rule}: ${error.message}.${safe}`, error.code);
+    }
+    throw error;
   }
+}
 
+async function ordinaryCreateComment(input: {
+  params: CreateCommentParams;
+  actorUserId: string | null;
+  replyToId: number | null;
+  projectId: number;
+}): Promise<FeedItemRow> {
+  // The hint read saw no rig, so this write takes the ordinary path under a short
+  // FOR SHARE fence: the project and issue rows are share-locked around the reply
+  // check, the author snapshot and the INSERT, so a project that gains a rig — or an
+  // issue that moves — mid-write is a 409 retry, and no comment lands unjudged.
+  const comment = await db.transaction(async (tx) => {
+    const rigRows = (await tx.execute(
+      sql`SELECT rig_id FROM project WHERE id = ${input.projectId} FOR SHARE`,
+    )) as unknown as { rig_id: number | string | null }[];
+    if (rigRows.length > 0 && rigRows[0].rig_id !== null) {
+      throw new HttpError(
+        409,
+        'This project became tracked while the comment was being written; try again',
+      );
+    }
+    const issueRows = (await tx.execute(
+      sql`SELECT project_id FROM issue WHERE id = ${input.params.issueId} FOR SHARE`,
+    )) as unknown as { project_id: number | string }[];
+    const issue = issueRows[0];
+    if (!issue) throw new HttpError(404, 'Issue not found');
+    if (Number(issue.project_id) !== input.projectId) {
+      throw new HttpError(
+        409,
+        'This issue moved projects while the comment was being written; try again',
+      );
+    }
+    await assertReplyParent(tx, input.replyToId, input.params.issueId);
+    const actorName = input.params.authorName ?? (await userName(input.actorUserId, tx));
+    const [row] = await tx
+      .insert(issueActivity)
+      .values({
+        issueId: input.params.issueId,
+        kind: 'comment',
+        replyToId: input.replyToId,
+        actorUserId: input.actorUserId,
+        actorName,
+        body: input.params.body,
+      })
+      .returning();
+    return mapFeedItem(row);
+  });
+  // The ordinary path keeps today's post-commit side effects, unchanged: the comment
+  // row is committed before the delivery, the run queue and the inbox.
+  await emitCommentEvent(input.projectId, 'comment.created', comment, input.actorUserId);
+  const mentioned = await resolveMentionHandles(
+    input.projectId,
+    input.params.authorName === undefined ? parseMentionHandles(comment.body ?? '') : [],
+  );
+  await enqueueMentionRuns(input.projectId, comment, mentioned.agentUserIds);
+  await notifyComment(input.projectId, comment, mentioned);
   return comment;
+}
+
+// WHY a private copy of the rig lock instead of importing it from issues/service.ts:
+// service already imports THIS file (its writers record the activity log here), so
+// importing its rig readers back would close a module cycle. The SQL is the same read
+// the update path runs; keep the wording in lockstep with service.ts.
+//
+// Takes the project row's write lock and returns the rig it holds while that lock is
+// held, which is the point: another transaction can change the rig before this one
+// writes, and the only way to see that is to hold the row until commit. The row is
+// locked after the rig and the board on a gated path, never before them.
+async function lockProjectRig(executor: DbExecutor, projectId: number): Promise<number | null> {
+  const rows = (await executor.execute(
+    sql`SELECT rig_id FROM project WHERE id = ${projectId} FOR UPDATE`,
+  )) as unknown as { rig_id: number | string | null }[];
+  const row = rows[0];
+  if (!row) throw new HttpError(404, 'Project not found');
+  return row.rig_id === null ? null : Number(row.rig_id);
+}
+
+// The same reply check the ordinary path always ran, on the writer's executor so the
+// gated path reads the row it will commit.
+async function assertReplyParent(
+  executor: DbExecutor,
+  replyToId: number | null,
+  issueId: number,
+): Promise<void> {
+  if (replyToId == null) return;
+  const [parent] = await executor
+    .select({ issueId: issueActivity.issueId, kind: issueActivity.kind })
+    .from(issueActivity)
+    .where(eq(issueActivity.id, replyToId));
+  if (!parent || parent.issueId !== issueId || parent.kind !== 'comment')
+    throw new HttpError(400, 'replyToId must be a comment on this issue');
+}
+
+// The comment_create op the owner judges: the full post-write state built from the
+// locked rows — the card's labels and identity as stored, the retained comments in id
+// order, the incoming body last. An agent-reached comment additionally carries
+// routing_facts: null, so the lane rule refuses it with its own wording rather than
+// this seam guessing a routing.
+async function buildCommentOp(
+  tx: DbExecutor,
+  input: {
+    issueId: number;
+    rigId: number;
+    title: string;
+    description: string;
+    body: string;
+    agentReached: boolean;
+  },
+): Promise<Record<string, unknown>> {
+  const labelRows = (await tx.execute(
+    sql`SELECT l.name FROM issue_label il JOIN label l ON l.id = il.label_id
+        WHERE il.issue_id = ${input.issueId} ORDER BY l.name`,
+  )) as unknown as { name: string }[];
+  const labels = labelRows.map((row) => row.name);
+  const identityRows = (await tx.execute(
+    sql`SELECT r.prefix, b.local_token FROM bead_identity b
+        JOIN rig r ON r.id = b.rig_id
+        WHERE b.issue_id = ${input.issueId} AND b.rig_id = ${input.rigId}`,
+  )) as unknown as { prefix: string; local_token: string }[];
+  // One fact of the locked rig's ledger names the card. An identity that exists only
+  // in another rig, like none at all, is an identity this seam cannot judge, and the
+  // answer is the caller's own 409, not a guess from the title.
+  if (identityRows.length !== 1) {
+    throw new HttpError(
+      409,
+      'This issue holds no bead identity in its rig, so its comment cannot be judged',
+      'issue-without-identity',
+    );
+  }
+  const beadId = `${identityRows[0].prefix}-${identityRows[0].local_token}`;
+  const commentRows = (await tx.execute(
+    sql`SELECT body FROM issue_activity
+        WHERE issue_id = ${input.issueId} AND kind = 'comment' ORDER BY id`,
+  )) as unknown as { body: string | null }[];
+  const retained = commentRows.map((row) => row.body ?? '');
+  const base = { title: input.title, description: input.description, labels, bead_id: beadId };
+  const op: Record<string, unknown> = {
+    op: 'comment_create',
+    id: beadId,
+    rig_prefix: identityRows[0].prefix,
+    labels,
+    title: input.title,
+    description: input.description,
+    comment: input.body,
+    previous_state: { ...base, comments: retained },
+    proposed_state: { ...base, comments: [...retained, input.body] },
+  };
+  if (input.agentReached) op.routing_facts = null;
+  return op;
 }
 
 // The comment a route guard resolves: the issue it hangs on, the project behind
@@ -454,21 +712,20 @@ export async function deleteComment(
   return true;
 }
 
-// If the comment reaches agents, queue a run for each so they can reply. A mention
-// reaches the agents it names; a reply reaches the author of the comment it answers,
-// so answering an agent in its own thread does not have to tag it again. Only quick
-// queries run here; the work happens later — in the poller for an internal agent, on
-// the operator's runner for an external one — so creating a comment is never blocked
-// on it.
-async function enqueueMentionRuns(
+// The read-only half of enqueueMentionRuns: who is reached by mention or reply, from
+// the locked rows on the given executor. The gated create path calls this BEFORE the
+// gate and reuses the result for the post-INSERT queue, so one reach per write; the
+// ordinary path and the update path keep the combined helper below.
+async function commentReach(
   projectId: number,
-  comment: FeedItemRow,
+  comment: { replyToId: number | null; actorUserId: string | null },
   mentionedAgentUserIds: string[],
-): Promise<void> {
-  if (mentionedAgentUserIds.length === 0 && comment.replyToId == null) return;
+  executor: DbExecutor,
+): Promise<MentionReach['agents']> {
+  if (mentionedAgentUserIds.length === 0 && comment.replyToId == null) return [];
   const reachedUserIds = new Set(mentionedAgentUserIds);
   if (comment.replyToId != null) {
-    const [parent] = await db
+    const [parent] = await executor
       .select({ actorUserId: issueActivity.actorUserId })
       .from(issueActivity)
       .where(eq(issueActivity.id, comment.replyToId));
@@ -479,14 +736,42 @@ async function enqueueMentionRuns(
     comment.actorUserId,
     { on: 'issue', place: 'comment' },
     { memberIds: [], agentUserIds: [...reachedUserIds] },
+    executor,
   );
-  await queueMentionRuns({
+  return agents;
+}
+
+// If the comment reaches agents, queue a run for each so they can reply. A mention
+// reaches the agents it names; a reply reaches the author of the comment it answers,
+// so answering an agent in its own thread does not have to tag it again. Only quick
+// queries run here; the work happens later — in the poller for an internal agent, on
+// the operator's runner for an external one — so creating a comment is never blocked
+// on it. The executor defaults to the pool client: the ordinary path and the update
+// path queue after their writes commit, exactly as before; the gated create path never
+// calls this combined helper — it reaches before the gate and queues after the INSERT,
+// both on the write's transaction.
+async function enqueueMentionRuns(
+  projectId: number,
+  comment: FeedItemRow,
+  mentionedAgentUserIds: string[],
+  executor: DbExecutor = db,
+): Promise<void> {
+  const agents = await commentReach(
     projectId,
-    actorUserId: comment.actorUserId,
-    agents,
-    prompt: comment.body ?? '',
-    source: { issueId: comment.issueId, sourceActivityId: comment.id },
-  });
+    { replyToId: comment.replyToId, actorUserId: comment.actorUserId },
+    mentionedAgentUserIds,
+    executor,
+  );
+  await queueMentionRuns(
+    {
+      projectId,
+      actorUserId: comment.actorUserId,
+      agents,
+      prompt: comment.body ?? '',
+      source: { issueId: comment.issueId, sourceActivityId: comment.id },
+    },
+    executor,
+  );
 }
 
 // --- Activity log ----------------------------------------------------------------
