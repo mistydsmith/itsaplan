@@ -184,7 +184,7 @@ export async function notifyTextMentions(
     await resolveMentionHandles(projectId, handles),
   );
   if (memberIds.length === 0) return;
-  await autoWatchIssue(projectId, issueId, memberIds);
+  await autoWatchIssue(projectId, issueId, memberIds, executor);
   await insertNotifications(
     memberIds
       .filter((userId) => userId !== actor)
@@ -221,7 +221,7 @@ export async function notifyIssueChange(
   const rows: NewNotificationRow[] = [];
 
   if (input.assignedUserId) {
-    await autoWatchIssue(projectId, issueId, [input.assignedUserId]);
+    await autoWatchIssue(projectId, issueId, [input.assignedUserId], executor);
     if (input.assignedUserId !== actor) {
       const members = await keepProjectMembers(projectId, [input.assignedUserId], executor);
       if (members.has(input.assignedUserId)) {
@@ -239,7 +239,7 @@ export async function notifyIssueChange(
 
   if (input.statusChanged) {
     const assigned = input.assignedUserId ?? null;
-    const watchers = await watcherUserIds(projectId, issueId);
+    const watchers = await watcherUserIds(projectId, issueId, executor);
     for (const userId of watchers) {
       // Skip the actor and anyone already told they were just assigned.
       if (userId === actor || userId === assigned) continue;

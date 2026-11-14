@@ -8,6 +8,7 @@ import {
   user,
   aiAgent,
   userPreference,
+  type DbExecutor,
 } from '@repo/db';
 import { and, desc, eq, ilike, isNotNull, isNull, notExists, or, sql } from 'drizzle-orm';
 import { iso } from '#shared/lib';
@@ -118,8 +119,9 @@ export function toMemberContext(role: MemberRole, rolePermissions: unknown): Mem
 export async function getMemberContext(
   projectId: number,
   userId: string,
+  executor: DbExecutor = db,
 ): Promise<MemberContext | null> {
-  const rows = await db
+  const rows = await executor
     .select({
       role: projectMember.role,
       permissions: teamRole.permissions,
@@ -173,8 +175,11 @@ export async function getTeamPermissions(teamId: number, userId: string): Promis
 // Every member's resolved access in the project, keyed by user id — getMemberContext
 // in bulk, for a caller that judges several people at once (agents included: their
 // bot user is a member like any other).
-export async function listMemberContexts(projectId: number): Promise<Map<string, MemberContext>> {
-  const rows = await db
+export async function listMemberContexts(
+  projectId: number,
+  executor: DbExecutor = db,
+): Promise<Map<string, MemberContext>> {
+  const rows = await executor
     .select({
       userId: projectMember.userId,
       role: projectMember.role,

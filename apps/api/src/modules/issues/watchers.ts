@@ -1,4 +1,12 @@
-import { aiAgent, db, issueWatcher, projectMember, user, userPreference } from '@repo/db';
+import {
+  aiAgent,
+  db,
+  issueWatcher,
+  projectMember,
+  user,
+  userPreference,
+  type DbExecutor,
+} from '@repo/db';
 import { and, asc, eq, inArray, isNull, or } from 'drizzle-orm';
 import { getMemberContext, listMemberContexts, type MemberContext } from '#modules/members/service';
 import { hasPermission } from '#shared/permissions';
@@ -30,8 +38,9 @@ function canReadWorkItems(context: MemberContext | null | undefined): boolean {
 export async function listIssueWatchers(
   projectId: number,
   issueId: number,
+  executor: DbExecutor = db,
 ): Promise<IssueWatcherRow[]> {
-  const rows = await db
+  const rows = await executor
     .select({ userId: issueWatcher.userId, name: user.name, image: user.image })
     .from(issueWatcher)
     .innerJoin(user, eq(user.id, issueWatcher.userId))
@@ -44,12 +53,16 @@ export async function listIssueWatchers(
       and(eq(issueWatcher.issueId, issueId), eq(issueWatcher.subscribed, true), isNull(aiAgent.id)),
     )
     .orderBy(asc(user.name));
-  const contexts = await listMemberContexts(projectId);
+  const contexts = await listMemberContexts(projectId, executor);
   return rows.filter((row) => canReadWorkItems(contexts.get(row.userId)));
 }
 
-export async function watcherUserIds(projectId: number, issueId: number): Promise<Set<string>> {
-  const rows = await listIssueWatchers(projectId, issueId);
+export async function watcherUserIds(
+  projectId: number,
+  issueId: number,
+  executor: DbExecutor = db,
+): Promise<Set<string>> {
+  const rows = await listIssueWatchers(projectId, issueId, executor);
   return new Set(rows.map((r) => r.userId));
 }
 
@@ -98,10 +111,11 @@ export async function autoWatchIssue(
   projectId: number,
   issueId: number,
   userIds: (string | null | undefined)[],
+  executor: DbExecutor = db,
 ): Promise<void> {
   const ids = [...new Set(userIds.filter((id): id is string => Boolean(id)))];
   if (ids.length === 0) return;
-  const rows = await db
+  const rows = await executor
     .select({ userId: projectMember.userId })
     .from(projectMember)
     .leftJoin(userPreference, eq(userPreference.userId, projectMember.userId))
@@ -116,10 +130,10 @@ export async function autoWatchIssue(
       ),
     );
   if (rows.length === 0) return;
-  const contexts = await listMemberContexts(projectId);
+  const contexts = await listMemberContexts(projectId, executor);
   const eligible = rows.filter((row) => canReadWorkItems(contexts.get(row.userId)));
   if (eligible.length === 0) return;
-  await db
+  await executor
     .insert(issueWatcher)
     .values(eligible.map((r) => ({ issueId, userId: r.userId })))
     .onConflictDoNothing();
