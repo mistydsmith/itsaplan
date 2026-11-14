@@ -428,8 +428,15 @@ const triggerScopeColumns = {
 // Whether the member may send the agent a task, for the paths that queue a run
 // outside the mention and delegation triggers (a schedule). An agent that no longer
 // exists reads as triggerable — the caller's own lookup reports it missing.
-export async function canTriggerAgent(agentId: number, actorUserId: string): Promise<boolean> {
-  const rows = await db
+// `executor` defaults to the process pool; a caller already inside a transaction passes
+// it so this read sees that transaction's own uncommitted agent row and takes no second
+// connection.
+export async function canTriggerAgent(
+  agentId: number,
+  actorUserId: string,
+  executor: DbExecutor = db,
+): Promise<boolean> {
+  const rows = await executor
     .select(triggerScopeColumns)
     .from(aiAgent)
     .where(eq(aiAgent.id, agentId))
@@ -466,13 +473,15 @@ export async function listMentionTriggerAgents(
 
 // The agent working in the project whose bot user is userId and that reacts to being
 // delegated to, or null. Turns a new delegate into the agent that should run on
-// delegation.
+// delegation. `executor` defaults to the process pool, so a caller inside a transaction
+// reads the membership and trigger settings that transaction has not committed yet.
 export async function getAssignTriggerAgent(
   projectId: number,
   userId: string,
   actorUserId: string | null,
+  executor: DbExecutor = db,
 ): Promise<{ id: number; delegationDelaySec: number } | null> {
-  const rows = await db
+  const rows = await executor
     .select({
       id: aiAgent.id,
       delegationDelaySec: aiAgent.delegationDelaySec,
@@ -488,14 +497,16 @@ export async function getAssignTriggerAgent(
 
 // The agent working in the project whose bot user is userId and that reacts to being
 // set into that member field, or null. The counterpart of getAssignTriggerAgent for a
-// custom field.
+// custom field. `executor` defaults to the process pool, so the field trigger a caller
+// has just written inside its own transaction is visible to it.
 export async function getFieldTriggerAgent(
   projectId: number,
   userId: string,
   fieldId: number,
   actorUserId: string | null,
+  executor: DbExecutor = db,
 ): Promise<{ id: number; delaySec: number } | null> {
-  const rows = await db
+  const rows = await executor
     .select({
       id: aiAgent.id,
       delaySec: agentFieldTrigger.delaySec,
