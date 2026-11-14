@@ -23,6 +23,12 @@ import {
   parentLinkProblem,
   type DbExecutor,
 } from '@repo/db';
+import {
+  allocateBeadToken,
+  attachBeadIdentity,
+  type BeadAllocation,
+  type IdentityTransaction,
+} from '@repo/db/issue-identity';
 import { alias } from 'drizzle-orm/pg-core';
 import {
   and,
@@ -1138,6 +1144,56 @@ function assertDateOrder(startDate?: string | null, dueDate?: string | null) {
     throw new HttpError(400, 'Due date must not precede the start date');
 }
 
+// The rig a project is configured with right now. This is only a lock-order hint: it says
+// whether to take the rig lock first, and it is never trusted for the write.
+async function projectRigHint(executor: DbExecutor, projectId: number): Promise<number | null> {
+  const rows = (await executor.execute(
+    sql`SELECT rig_id FROM project WHERE id = ${projectId}`,
+  )) as unknown as { rig_id: number | string | null }[];
+  const row = rows[0];
+  if (!row) throw new HttpError(404, 'Project not found');
+  return row.rig_id === null ? null : Number(row.rig_id);
+}
+
+// Takes the project row's write lock and returns the rig it holds while that lock is held,
+// which is the point: another transaction can change the rig before this one writes, and the
+// only way to see that is to hold the row until commit. The row is locked after the rig and
+// the board on a gated path, never before them.
+async function lockProjectRig(executor: DbExecutor, projectId: number): Promise<number | null> {
+  const rows = (await executor.execute(
+    sql`SELECT rig_id FROM project WHERE id = ${projectId} FOR UPDATE`,
+  )) as unknown as { rig_id: number | string | null }[];
+  const row = rows[0];
+  if (!row) throw new HttpError(404, 'Project not found');
+  return row.rig_id === null ? null : Number(row.rig_id);
+}
+
+// The bead identity for a new gated issue, allocated inside the caller's transaction. A
+// project without a usable rig cannot create one, and the allocator's own refusal code is
+// kept so the reason survives into the message.
+async function allocateIssueIdentity(
+  executor: IdentityTransaction,
+  rigId: number,
+  projectId: number,
+  parentId: number | null | undefined,
+): Promise<BeadAllocation> {
+  const allocated = await allocateBeadToken(executor, {
+    rigId,
+    projectId,
+    parentId: parentId ?? null,
+  });
+  if (allocated.ok) return allocated.allocation;
+  if (allocated.code === 'missing-rig') {
+    throw new HttpError(409, 'This project needs a valid rig before you can create an issue');
+  }
+  // A parent ruled out on association answers with the same 400 an ordinary project gives, so
+  // one wording covers both branches; everything else keeps the allocator's own sentence.
+  if (allocated.code === 'parent-other-project' || allocated.code === 'parent-other-rig') {
+    throw new HttpError(400, 'Parent must belong to this project');
+  }
+  throw new HttpError(409, allocated.message);
+}
+
 // Atomic per-project sequence number (the "-42" in "MKT-42"): the UPDATE takes a
 // row lock on project, so concurrent createIssue calls for the same project never
 // hand out the same number.
@@ -1152,7 +1208,10 @@ export async function createIssue(
   await assertColumn(project.id, input.columnId);
   await assertWipLimit(input.columnId);
   await assertIssueType(project.id, input.typeId);
-  await assertParent(project.id, null, input.parentId);
+  // The subtasks feature is a project setting, so it is checked before the transaction.
+  // The parent's association and the tree rules are decided inside it, under the board lock,
+  // where the issue rows cannot move underneath the check.
+  if (input.parentId != null) await assertProjectFeature(project.id, 'subtasks');
   assertDateOrder(input.startDate, input.dueDate);
   // Also checked by setIssueLabels below, but here it fails before the issue exists.
   await assertIssueLabels(project.id, input.labelIds);
@@ -1160,9 +1219,32 @@ export async function createIssue(
   // column's auto-assignee applies. An assignee sent with the create wins over it.
   const assigneeUserId = input.assigneeUserId ?? (await columnAutoAssignee(input.columnId));
   const { id: issueId, createdAt } = await db.transaction(async (tx) => {
-    if (input.parentId != null) {
+    // The rig is read here as a lock-order hint only. When the project is gated the allocation
+    // takes the rig lock, which keeps it ahead of the board lock; the hint itself is never
+    // trusted for the write.
+    const rigHint = await projectRigHint(tx, project.id);
+    const allocation =
+      rigHint === null
+        ? null
+        : await allocateIssueIdentity(tx, rigHint, project.id, input.parentId);
+    // Every gated create takes the board lock, root creates included, because a project can
+    // become gated or change rig while this transaction waits. An ordinary parent write keeps
+    // taking it for the same reason it always did.
+    if (rigHint !== null || input.parentId != null) {
       await lockIssueTree(tx, project.id);
-      await assertTreeLink(null, input.parentId, tx);
+    }
+    if (input.parentId != null) {
+      await assertTreeLink(null, input.parentId, tx, { expectedProjectId: project.id });
+    }
+    // The authoritative check, under the project row's write lock and held until commit: a
+    // project that changed rig while this transaction waited must not receive an issue with a
+    // token from the rig it has left, and an ordinary create that raced into a gated project
+    // must refuse rather than write a null identity.
+    if ((await lockProjectRig(tx, project.id)) !== rigHint) {
+      throw new HttpError(
+        409,
+        'This project changed its rig while the issue was being created; try again',
+      );
     }
     const [seqRow] = await tx
       .update(projectTable)
@@ -1186,7 +1268,11 @@ export async function createIssue(
         delegateUserId: input.delegateUserId ?? null,
         columnId: input.columnId,
         parentId: input.parentId ?? null,
-        title: input.title,
+        // A gated create prefixes the title with its own token, so a card's title names the
+        // identity it holds. Every byte the caller sent after that prefix is preserved, and an
+        // ordinary project keeps its title exactly as given.
+        title: allocation === null ? input.title : `${allocation.localToken}: ${input.title}`,
+        beadId: allocation === null ? null : allocation.beadId,
         description: input.description ?? '',
         priority: input.priority ?? null,
         estimatePoints: input.estimatePoints == null ? null : String(input.estimatePoints),
@@ -1196,6 +1282,12 @@ export async function createIssue(
         position: Number(posRow.pos),
       })
       .returning({ id: issue.id, createdAt: issue.createdAt });
+    if (allocation !== null) {
+      // Inserted already attached: the C1 guard refuses a null link becoming non-null, so a
+      // reserved row is not an option.
+      const attached = await attachBeadIdentity(tx, { allocation, issueId: row.id });
+      if (!attached.ok) throw new HttpError(409, attached.message);
+    }
     return row;
   });
 
