@@ -1,4 +1,4 @@
-import { db, projectDocument } from '@repo/db';
+import { db, projectDocument, type DbExecutor } from '@repo/db';
 import { and, eq, or } from 'drizzle-orm';
 import { HttpError } from '#shared/lib';
 import { hasPermission } from '#shared/permissions';
@@ -35,18 +35,19 @@ export async function mentionReach(
   actorUserId: string | null,
   target: MentionTarget,
   users: MentionedUsers,
+  executor: DbExecutor = db,
 ): Promise<MentionReach> {
   let { memberIds } = users;
   let agentUserIds = target.place === 'comment' ? users.agentUserIds : [];
   if (target.on === 'document') {
-    const [document] = await db
+    const [document] = await executor
       .select({ isPrivate: projectDocument.isPrivate })
       .from(projectDocument)
       .where(
         and(eq(projectDocument.id, target.documentId), eq(projectDocument.projectId, projectId)),
       );
     if (!document || document.isPrivate) return { memberIds: [], agents: [] };
-    const contexts = await listMemberContexts(projectId);
+    const contexts = await listMemberContexts(projectId, executor);
     const may = (action: 'read' | 'edit') => (userId: string) => {
       const context = contexts.get(userId);
       return !!context && hasPermission(context.permissions, 'documents', action);
@@ -54,7 +55,7 @@ export async function mentionReach(
     memberIds = memberIds.filter(may('read'));
     agentUserIds = agentUserIds.filter(may('edit'));
   }
-  const agents = await listMentionTriggerAgents(projectId, agentUserIds, actorUserId);
+  const agents = await listMentionTriggerAgents(projectId, agentUserIds, actorUserId, executor);
   return { memberIds, agents };
 }
 
@@ -100,26 +101,32 @@ export async function listMentionCandidates(
 
 // Queues a run for each agent a comment reached. A comment an agent wrote starts no
 // run, which stops agents from setting each other, or themselves, off.
-export async function queueMentionRuns(input: {
-  projectId: number;
-  actorUserId: string | null;
-  agents: MentionReach['agents'];
-  prompt: string;
-  source:
-    | { issueId: number; sourceActivityId: number }
-    | { documentId: number; sourceDocumentCommentId: string };
-}): Promise<void> {
+export async function queueMentionRuns(
+  input: {
+    projectId: number;
+    actorUserId: string | null;
+    agents: MentionReach['agents'];
+    prompt: string;
+    source:
+      | { issueId: number; sourceActivityId: number }
+      | { documentId: number; sourceDocumentCommentId: string };
+  },
+  executor: DbExecutor = db,
+): Promise<void> {
   if (input.agents.length === 0) return;
-  if (input.actorUserId && (await isAgentUser(input.actorUserId))) return;
+  if (input.actorUserId && (await isAgentUser(input.actorUserId, executor))) return;
   for (const agent of input.agents) {
-    await enqueueAgentRun({
-      agentId: agent.id,
-      projectId: input.projectId,
-      issueId: null,
-      sourceActivityId: null,
-      ...input.source,
-      prompt: input.prompt,
-      trigger: 'mention',
-    });
+    await enqueueAgentRun(
+      {
+        agentId: agent.id,
+        projectId: input.projectId,
+        issueId: null,
+        sourceActivityId: null,
+        ...input.source,
+        prompt: input.prompt,
+        trigger: 'mention',
+      },
+      executor,
+    );
   }
 }

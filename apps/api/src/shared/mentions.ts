@@ -1,4 +1,4 @@
-import { db, projectMember, user, aiAgent } from '@repo/db';
+import { db, projectMember, user, aiAgent, type DbExecutor } from '@repo/db';
 import { and, eq, inArray, sql } from 'drizzle-orm';
 
 // Mentions in a comment, an issue description or a markdown custom field. A mention
@@ -57,17 +57,18 @@ export interface MentionedUsers {
 export async function resolveMentionHandles(
   projectId: number,
   handles: string[],
+  executor: DbExecutor = db,
 ): Promise<MentionedUsers> {
   if (handles.length === 0) return { memberIds: [], agentUserIds: [] };
   const [memberRows, agentRows] = await Promise.all([
-    db
+    executor
       .select({ userId: projectMember.userId })
       .from(projectMember)
       .innerJoin(user, eq(user.id, projectMember.userId))
       .where(
         and(eq(projectMember.projectId, projectId), inArray(sql`lower(${user.username})`, handles)),
       ),
-    db
+    executor
       .select({ userId: aiAgent.userId })
       .from(aiAgent)
       .innerJoin(

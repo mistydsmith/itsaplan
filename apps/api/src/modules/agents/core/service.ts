@@ -13,6 +13,7 @@ import {
   agentFieldTrigger,
   customField,
   integrationCredential,
+  type DbExecutor,
 } from '@repo/db';
 import { and, asc, eq, inArray, ne, notInArray, or, sql } from 'drizzle-orm';
 import { auth } from '@repo/auth';
@@ -445,9 +446,10 @@ export async function listMentionTriggerAgents(
   projectId: number,
   userIds: string[],
   actorUserId: string | null,
+  executor: DbExecutor = db,
 ): Promise<{ id: number; userId: string }[]> {
   if (userIds.length === 0) return [];
-  const rows = await db
+  const rows = await executor
     .select({ id: aiAgent.id, userId: aiAgent.userId, ...triggerScopeColumns })
     .from(aiAgent)
     .where(
@@ -545,8 +547,11 @@ export async function isProjectAgent(projectId: number, userId: string): Promise
 }
 
 // The agent a bot user belongs to, or null when the user is a person.
-export async function agentOfUser(userId: string): Promise<{ id: number; teamId: number } | null> {
-  const rows = await db
+export async function agentOfUser(
+  userId: string,
+  executor: DbExecutor = db,
+): Promise<{ id: number; teamId: number } | null> {
+  const rows = await executor
     .select({ id: aiAgent.id, teamId: aiAgent.teamId })
     .from(aiAgent)
     .where(eq(aiAgent.userId, userId))
@@ -556,13 +561,13 @@ export async function agentOfUser(userId: string): Promise<{ id: number; teamId:
 
 // The team of the agent a bot user belongs to, or null when the user is a person.
 // An agent belongs to exactly one team, so this is the team its API key acts in.
-export async function agentTeam(userId: string): Promise<number | null> {
-  return (await agentOfUser(userId))?.teamId ?? null;
+export async function agentTeam(userId: string, executor: DbExecutor = db): Promise<number | null> {
+  return (await agentOfUser(userId, executor))?.teamId ?? null;
 }
 
 // True if the user id is an agent's bot user rather than a person's.
-export async function isAgentUser(userId: string): Promise<boolean> {
-  return (await agentTeam(userId)) !== null;
+export async function isAgentUser(userId: string, executor: DbExecutor = db): Promise<boolean> {
+  return (await agentTeam(userId, executor)) !== null;
 }
 
 // An unknown, foreign, or non-LLM credential id would otherwise be stored and only
