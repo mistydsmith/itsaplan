@@ -1,4 +1,4 @@
-import { db, project, projectMember, team, teamRole } from '@repo/db';
+import { db, project, projectMember, team, teamRole, type DbExecutor } from '@repo/db';
 import { and, eq, inArray, isNull, type SQLWrapper } from 'drizzle-orm';
 import { HttpError } from './lib';
 import {
@@ -274,8 +274,12 @@ export function assertFeatureEnabled(project: ProjectRow, feature: ProjectFeatur
 export async function assertProjectFeature(
   projectId: number,
   feature: ProjectFeature,
+  executor: DbExecutor = db,
 ): Promise<void> {
-  const project = await getProjectById(projectId);
+  // The guard has to read the project on the caller's transaction: a writer that just turned a
+  // section off must be refused in the same breath, and on the pool it would read the older row and
+  // wave the call through. A project that is not there stays a no-op, exactly as before.
+  const project = await getProjectById(projectId, executor);
   if (project) assertFeatureEnabled(project, feature);
 }
 

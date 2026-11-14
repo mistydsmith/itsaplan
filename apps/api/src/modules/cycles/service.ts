@@ -1,4 +1,4 @@
-import { db, cycle, issue, project, projectColumn, team } from '@repo/db';
+import { db, cycle, issue, project, projectColumn, team, type DbExecutor } from '@repo/db';
 import { and, asc, desc, eq, inArray, isNull, ne, sql, type SQL } from 'drizzle-orm';
 import { HttpError, iso } from '#shared/lib';
 import { projectRefSql } from '#modules/teams/ref';
@@ -204,8 +204,11 @@ export async function getCycle(id: number): Promise<CycleRow | null> {
 // does not exist. What the checks on a cycle referenced by its own id read.
 export async function getCycleRef(
   id: number,
+  executor: DbExecutor = db,
 ): Promise<{ projectId: number; status: CycleStatus } | null> {
-  const rows = await db
+  // Same reason as the project guard: a caller that just created the cycle asks about it next, and
+  // on the pool the row is invisible until commit. The status stays derived from the stored dates.
+  const rows = await executor
     .select({
       projectId: cycle.projectId,
       startDate: cycle.startDate,
