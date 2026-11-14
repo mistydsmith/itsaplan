@@ -28,8 +28,8 @@ import { randomBytes } from 'node:crypto';
 // the button, short enough that an intercepted link is not useful later.
 const LINK_CODE_TTL_MINUTES = 15;
 
-export async function hasUsableInstanceBot(): Promise<boolean> {
-  return isInstanceBotUsable(await getInstanceBotConfig());
+export async function hasUsableInstanceBot(executor: DbExecutor = db): Promise<boolean> {
+  return isInstanceBotUsable(await getInstanceBotConfig(executor));
 }
 
 // The config as returned to the client: the token replaced by a boolean telling

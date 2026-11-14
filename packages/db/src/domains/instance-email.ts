@@ -4,6 +4,7 @@ import {
   type ResendConfig,
   type SmtpConfig,
 } from '@repo/mailer';
+import { db, type DbExecutor } from '../client';
 import { readSecret } from '../secrets';
 
 // The instance mail provider, stored encrypted in app_secret under 'auth.email'.
@@ -44,8 +45,10 @@ export function defaultInstanceEmailConfig(): InstanceEmailConfig {
 }
 
 // The stored config, or null when nothing has been saved.
-export async function getInstanceEmailConfig(): Promise<InstanceEmailConfig | null> {
-  const stored = await readSecret<InstanceEmailConfig>(INSTANCE_EMAIL_SECRET_KEY);
+export async function getInstanceEmailConfig(
+  executor: DbExecutor = db,
+): Promise<InstanceEmailConfig | null> {
+  const stored = await readSecret<InstanceEmailConfig>(INSTANCE_EMAIL_SECRET_KEY, executor);
   if (!stored) return null;
   // Merge over the default so a config written before a field was added stays valid.
   return { ...defaultInstanceEmailConfig(), ...stored };
@@ -61,8 +64,10 @@ export async function hasConfiguredEmailProvider(): Promise<boolean> {
 
 // The instance provider a project may send its notifications through, or null when
 // projects are not allowed to use it or it is not configured.
-export async function getProjectEmailConfig(): Promise<InstanceEmailConfig | null> {
-  const config = await getInstanceEmailConfig();
+export async function getProjectEmailConfig(
+  executor: DbExecutor = db,
+): Promise<InstanceEmailConfig | null> {
+  const config = await getInstanceEmailConfig(executor);
   if (!config || !config.allowProjects) return null;
   return hasEmailProvider(config) ? config : null;
 }
