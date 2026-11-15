@@ -79,14 +79,18 @@ export interface LandReport {
   record?: RecordResult;
 }
 
+export interface LandingStorageClient {
+  transaction<T>(fn: (tx: any) => Promise<T>): Promise<T>; // eslint-disable-line @typescript-eslint/no-explicit-any
+}
+
 export interface AdapterOwners {
   nativeRecordStorage: (options: {
     completedColumnId: number;
     closeRepoKey: string;
     closerUserId: string;
-    client?: unknown;
+    client: LandingStorageClient;
   }) => RecordStorage;
-  landingDbClient: unknown;
+  landingDbClient: LandingStorageClient;
   landingSlotDriver: SlotDriver;
   landingProofRunner: ProofRunner;
   // WHY an adapter owner and not a job field: the closer is the trusted native executor's user id, resolved where
