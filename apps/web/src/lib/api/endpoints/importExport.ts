@@ -123,8 +123,19 @@ export interface TrelloImportJobFields extends TrelloConnectionInput {
   memberMap?: Record<string, string>;
 }
 
+// A local bd board: the board directory and the bd executable are privileged
+// SERVER config (BD_IMPORT_BOARD_ROOT / BD_IMPORT_BD_COMMAND, apps/api
+// modules/import-export/bd.ts), so the body carries no path and no command -
+// only the mapping choices made at creation time.
+export interface BdImportJobFields {
+  source: 'bd';
+  // No tree-cap field: every bd import is rig-targeted, so the server reader
+  // derives the depth (uncapped) - the old maxDepth control was a dead knob.
+  sourceName?: string;
+}
+
 export type CreateImportJobInput = ImportJobChoices &
-  (PlaneImportJobFields | LinearImportJobFields | TrelloImportJobFields);
+  (PlaneImportJobFields | LinearImportJobFields | TrelloImportJobFields | BdImportJobFields);
 
 export const testPlaneConnection = (projectKey: string, input: PlaneConnectionInput) =>
   request<{ projects: PlaneProjectOption[] }>(
@@ -169,6 +180,26 @@ export const previewTrelloBoard = (
   request<{ states: PlaneStateOption[]; members: TrelloMemberOption[] }>(
     `/projects/${projectKey}/import-jobs/trello-preview`,
     { method: 'POST', body: JSON.stringify(input) },
+  );
+
+// A bd board has no credential and no per-request board: the server reads the
+// board its operator configured, so the bodies are empty.
+export interface BdStateOption {
+  id: string;
+  name: string;
+  category: StateCategory;
+}
+
+export const testBdConnection = (projectKey: string) =>
+  request<{ board: string; cards: number; states: BdStateOption[] }>(
+    `/projects/${projectKey}/import-jobs/bd-test-connection`,
+    { method: 'POST', body: JSON.stringify({}) },
+  );
+
+export const previewBdBoard = (projectKey: string) =>
+  request<{ cards: number; states: BdStateOption[] }>(
+    `/projects/${projectKey}/import-jobs/bd-preview`,
+    { method: 'POST', body: JSON.stringify({}) },
   );
 
 export const createImportJob = (projectKey: string, input: CreateImportJobInput) =>

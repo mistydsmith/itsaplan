@@ -591,6 +591,13 @@
       "membersHint": "Trello doesn't share members' emails, so match them by hand. A card's first matched member becomes its assignee. The others watch the issue.",
       "memberNotMatched": "Not matched"
     },
+    "bd": {
+      "hint": "No credential and no board address are entered here: this server reads the bd board its operator configured (BD_IMPORT_BOARD_ROOT), read-only with bd.",
+      "notConfigured": "This server has no bd board configured. Ask the operator to set BD_IMPORT_BOARD_ROOT to the board directory, then try again.",
+      "board": "Board cards",
+      "sourceName": "Job name",
+      "sourceNameHint": "What the job card shows. Leave empty to use the board name."
+    },
     "statuses": {
       "pending": "Pending",
       "running": "Running",
