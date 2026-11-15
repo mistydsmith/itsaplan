@@ -12,12 +12,8 @@ import {
   user,
 } from '@repo/db';
 import { eq } from 'drizzle-orm';
-import {
-  createLocalIssueAndRecord,
-  createLocalComment,
-  findImportRecord,
-  upsertImportRecord,
-} from '../../import-store';
+import { createLocalComment, findImportRecord, upsertImportRecord } from '../../import-store';
+import { createLocalIssueAndRecord } from '../../import-store-issue';
 
 // Each test makes its own team, project and user, like import-store.test.ts. Jobs are
 // 'paused' so no other test's claimDueImportJobs picks them up.
