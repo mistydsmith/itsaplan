@@ -1,6 +1,7 @@
 import { getStorageSettings, mimeAllowed, MB } from '@repo/db';
 import { startPollLoop, type WorkerHandle } from './poll-loop';
 import { tickErrorOutcome } from './import-retry';
+import { batchFor } from './import-batch-size';
 import {
   importSourceNames,
   readerForJob,
@@ -78,10 +79,8 @@ export function startImportWorker(): WorkerHandle {
   return startPollLoop('import-worker', tick, (jobs) => jobs.imports.pollIntervalMs);
 }
 
-// How many issues Create/Link process per tick. Each issue costs several
-// additional Plane requests (comments, attachments, relations) against a
-// ~60 requests/minute budget, so this stays well under the discover page size.
-const ISSUES_PER_TICK = 15;
+// The per-tick chunk comes from batchFor(job): 15 for a remote source, 250 for a local bd
+// board (see ./import-batch-size.ts for why).
 
 async function tick(): Promise<void> {
   const [job] = await claimDueImportJobs(importSourceNames());
@@ -143,7 +142,7 @@ export async function runCreate(job: ClaimedImportJob, reader: SourceReader): Pr
 
   const cursor = job.cursor as Partial<RecordCursor>;
   const afterId = cursor.lastRecordId ?? 0;
-  const pending = await listImportRecords(job.id, 'issue', afterId, ISSUES_PER_TICK);
+  const pending = await listImportRecords(job.id, 'issue', afterId, batchFor(job));
   if (pending.length === 0) {
     await recordRetainedRows(job, reader);
     await advanceImportJobPhase(job.id, 'link', {});
@@ -474,7 +473,7 @@ async function createComments(
 export async function runLink(job: ClaimedImportJob, reader: SourceReader): Promise<void> {
   const cursor = job.cursor as Partial<RecordCursor>;
   const afterId = cursor.lastRecordId ?? 0;
-  const pending = await listCreatedImportRecords(job.id, 'issue', afterId, ISSUES_PER_TICK);
+  const pending = await listCreatedImportRecords(job.id, 'issue', afterId, batchFor(job));
   if (pending.length === 0) {
     await advanceImportJobPhase(job.id, 'rewrite', {});
     return;
@@ -539,7 +538,7 @@ export async function runRewrite(job: ClaimedImportJob): Promise<void> {
     return;
   }
   const afterId = cursor.lastRecordId ?? 0;
-  const pending = await listCreatedImportRecords(job.id, 'issue', afterId, ISSUES_PER_TICK);
+  const pending = await listCreatedImportRecords(job.id, 'issue', afterId, batchFor(job));
   if (pending.length === 0) {
     const next: OwnerCursor = { owner: 'initiative', lastRecordId: 0 };
     await saveImportJobCursor(job.id, next);
@@ -570,7 +569,7 @@ export async function runRewrite(job: ClaimedImportJob): Promise<void> {
 }
 
 async function rewriteInitiatives(job: ClaimedImportJob, afterId: number): Promise<void> {
-  const pending = await listCreatedImportRecords(job.id, 'initiative', afterId, ISSUES_PER_TICK);
+  const pending = await listCreatedImportRecords(job.id, 'initiative', afterId, batchFor(job));
   const sourceProjectKey = sourceProjectKeyForJob(job);
   if (pending.length === 0 || !sourceProjectKey) {
     await advanceImportJobPhase(job.id, 'attachments', {});
@@ -602,7 +601,7 @@ export async function runAttachments(job: ClaimedImportJob, reader: SourceReader
   const cursor = job.cursor as Partial<OwnerCursor>;
   const owner = cursor.owner === 'initiative' ? 'initiative' : 'issue';
   const afterId = cursor.lastRecordId ?? 0;
-  const pending = await listCreatedImportRecords(job.id, owner, afterId, ISSUES_PER_TICK);
+  const pending = await listCreatedImportRecords(job.id, owner, afterId, batchFor(job));
   if (pending.length === 0) {
     if (owner === 'issue') {
       const next: OwnerCursor = { owner: 'initiative', lastRecordId: 0 };
