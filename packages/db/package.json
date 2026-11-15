@@ -14,8 +14,8 @@
     "./tracker-close-facts": "./src/tracker-close-facts.ts",
     "./tracker-skill-receipts": "./src/tracker-skill-receipts.ts",
     "./tracker-routing-facts": "./src/tracker-routing-facts.ts",
-    "./bead-import-identity": "./src/bead-import-identity.ts",
-    "./issue-claim": "./src/issue-claim.ts"
+    "./issue-claim": "./src/issue-claim.ts",
+    "./landing-slot-driver": "./src/landing-slot-driver.ts"
   },
   "scripts": {
     "db:generate": "drizzle-kit generate",
