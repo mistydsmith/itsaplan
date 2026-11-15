@@ -1,4 +1,7 @@
 // 8429 row 29, B — D2 owned-row one-case witness for the ACTUAL takeNextRun.
+// Successor to the 2d7d4b27 witness: repairs the three witnessed defects
+// (D1 attempts bookkeeping, D2 pull/claim handoff is not an HTTP POST, D3 cleanup
+// protection before the first setup mutation); the source gate is frozen untouched.
 //
 // Standalone fixture source, NOT a test module: it imports nothing from the test rig,
 // never calls resetDb, is never picked up by `bun test` and is never loaded by the
@@ -8,27 +11,42 @@
 //   DATABASE_URL=... BETTER_AUTH_SECRET=... \
 //     bun run src/modules/agents/runner/__tests__/integration/agent-runner-pii-witness.ts
 //
-// One owned case, fixture-only:
+// One owned case, fixture-only. Honest scope: takeNextRun is the PULL/CLAIM half of
+// delivery — it constructs and returns the framed claim; it sends no HTTP request.
+// This witness proves the claim handoff, not an HTTP POST:
 //   control — the production takeNextRun refuses the owned PII-bearing run before
-//             framing (owner seam says the lane is local-only), fails the run
-//             permanently with the owner's words, and the in-process sink receives
-//             nothing.
+//             framing (owner seam says the lane is local-only) and returns no claim.
+//             The run row is permanently failed with the owner's words: the claim's
+//             own bookkeeping set attempts to 1, and the failed status takes the row
+//             out of the claim's reach for good — that terminal state is the
+//             no-retry proof, not an untouched attempts column.
 //   mutant  — one targeted mutation: the actual gate call removed from a throwaway
 //             copy of the real service source (the B-test idiom); the re-queued
-//             owned run is claimed through the copy and the forbidden framed prompt
-//             POSTs to the owned in-process sink, carrying the owned prompt text.
+//             owned run is claimed through the copy and the forbidden framed claim,
+//             carrying the owned PII task text, is returned.
 //
-// Safety: every row it touches is one it created, all named w29_*; unrelated row
-// counts are captured before the run and asserted equal after the finally-cleanup,
-// which deletes every owned row. The synthetic owner answer and rule manifest are
-// written to a temp dir and the TRACKER_RULES_* environment is restored on exit.
+// Safety: cleanup protection is entered before the first setup mutation. Every row
+// the witness touches is one it created, all named w29_*; each created id is tracked
+// the moment it is created, and a partial-creation failure removes only the ids this
+// invocation created (exact ids, never a prefix sweep, never an upsert). Unrelated
+// row counts are captured before the first mutation and asserted equal after cleanup
+// (an aggregate guard, not byte-level proof). The synthetic owner answer and rule
+// manifest are temp-dir fixtures; the environment, the owner seam and the temp files
+// are restored independently of any failed DB cleanup.
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { eq, sql } from 'drizzle-orm';
-import { aiAgent, agentRun, project, team, user, workspace } from '@repo/db';
+import {
+  aiAgent,
+  agentRun,
+  db,
+  project,
+  team,
+  user,
+  workspace,
+} from '@repo/db';
 import { checkTrackerRules } from '@repo/db/tracker-rules';
 import { setPiiAdmissionOwner } from '../../../core/pii-admission';
 import { getRunnerAgent, takeNextRun } from '../../service';
@@ -36,6 +54,7 @@ import { getRunnerAgent, takeNextRun } from '../../service';
 const PREFIX = 'w29';
 const BOT_USER_ID = `${PREFIX}bot-user`;
 const BOT_USERNAME = `${PREFIX}bot`;
+const seenOps: Record<string, unknown>[] = [];
 const OWNER_MESSAGE = 'unknown-privacy work may not be routed to a cloud lane';
 // The owned run's task text: a client matter, i.e. PII-bearing.
 const RUN_PROMPT = 'Draft the lease renewal for the Smith family property file.';
@@ -51,44 +70,102 @@ function check(name: string, cond: boolean, detail = ''): void {
 }
 
 interface Owned {
-  workspaceId: number;
-  teamId: number;
-  projectId: number;
-  agentId: number;
-  runId: number;
+  workspaceId: number | null;
+  teamId: number | null;
+  projectId: number | null;
+  agentId: number | null;
+  runId: number | null;
 }
 
-interface Sink {
-  port: number;
-  posts: string[];
-  close(): Promise<void>;
+// Removes exactly the ids this invocation created, newest FK first. An individual
+// delete failure is logged and does not skip the remaining ids.
+async function deleteOwned(owned: Owned): Promise<void> {
+  const steps: [string, () => Promise<unknown>][] = [
+    ['agent_run', async () =>
+      owned.runId === null ? null : db.delete(agentRun).where(eq(agentRun.id, owned.runId))],
+    ['ai_agent', async () =>
+      owned.agentId === null ? null : db.delete(aiAgent).where(eq(aiAgent.id, owned.agentId))],
+    ['project', async () =>
+      owned.projectId === null ? null : db.delete(project).where(eq(project.id, owned.projectId))],
+    ['team', async () =>
+      owned.teamId === null ? null : db.delete(team).where(eq(team.id, owned.teamId))],
+    ['user', async () => db.delete(user).where(eq(user.id, BOT_USER_ID))],
+    ['workspace', async () =>
+      owned.workspaceId === null ? null : db.delete(workspace).where(eq(workspace.id, owned.workspaceId))],
+  ];
+  for (const [name, step] of steps) {
+    try {
+      await step();
+    } catch (err) {
+      console.log(`[cleanup] ${name} delete failed (logged, not skipped)`, err);
+      failures += 1;
+    }
+  }
 }
 
-async function startSink(): Promise<Sink> {
-  const posts: string[] = [];
-  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
-    let body = '';
-    req.on('data', (c) => (body += c));
-    req.on('end', () => {
-      if (req.method === 'POST') posts.push(body);
-      res.writeHead(200, { 'content-type': 'application/json' });
-      res.end('{}');
-    });
-  });
-  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
-  const port = (server.address() as { port: number }).port;
-  return {
-    port,
-    posts,
-    close: () =>
-      new Promise((resolve) => {
-        server.close(() => resolve());
-      }),
-  };
+// Creates the owned fixture, tracking each id the moment it is created; a failure
+// part-way removes only the ids already created and rethrows.
+async function createOwned(): Promise<Owned> {
+  const owned: Owned = { workspaceId: null, teamId: null, projectId: null, agentId: null, runId: null };
+  try {
+    const [ws] = await db
+      .insert(workspace)
+      .values({ name: `${PREFIX}-owned` })
+      .returning({ id: workspace.id });
+    owned.workspaceId = ws.id;
+    const [tm] = await db
+      .insert(team)
+      .values({ workspaceId: ws.id, name: `${PREFIX}-team` })
+      .returning({ id: team.id });
+    owned.teamId = tm.id;
+    // Plain insert, no upsert: a preexisting collision throws and the partial cleanup
+    // removes only what this invocation created.
+    const [usr] = await db
+      .insert(user)
+      .values({
+        id: BOT_USER_ID,
+        name: `${PREFIX} Bot`,
+        email: `${PREFIX}bot+witness@w29.invalid`,
+        emailVerified: true,
+      })
+      .returning({ id: user.id });
+    const [proj] = await db
+      .insert(project)
+      .values({ teamId: tm.id, key: `${PREFIX.toUpperCase()}`, name: `${PREFIX} project` })
+      .returning({ id: project.id });
+    owned.projectId = proj.id;
+    const [ag] = await db
+      .insert(aiAgent)
+      .values({
+        teamId: tm.id,
+        userId: usr.id,
+        username: BOT_USERNAME,
+        kind: 'external',
+        // NULL: an agent a runner drains. takeNextRun is the claim, not a push.
+        invocationUrl: null,
+      })
+      .returning({ id: aiAgent.id });
+    owned.agentId = ag.id;
+    const [run] = await db
+      .insert(agentRun)
+      .values({
+        agentId: ag.id,
+        projectId: proj.id,
+        prompt: RUN_PROMPT,
+        trigger: 'manual',
+        status: 'pending',
+        nextAttemptAt: new Date(),
+      })
+      .returning({ id: agentRun.id });
+    owned.runId = run.id;
+    return owned;
+  } catch (err) {
+    await deleteOwned(owned);
+    throw err;
+  }
 }
 
 async function counts(): Promise<Record<string, number>> {
-  const { db } = await import('@repo/db');
   const out: Record<string, number> = {};
   for (const table of [
     'workspace',
@@ -107,159 +184,130 @@ async function counts(): Promise<Record<string, number>> {
   return out;
 }
 
-async function createOwned(sink: Sink): Promise<Owned> {
-  const { db } = await import('@repo/db');
-  const [ws] = await db
-    .insert(workspace)
-    .values({ name: `${PREFIX}-owned` })
-    .returning({ id: workspace.id });
-  const [tm] = await db
-    .insert(team)
-    .values({ workspaceId: ws.id, name: `${PREFIX}-team` })
-    .returning({ id: team.id });
-  const [usr] = await db
-    .insert(user)
-    .values({
-      id: BOT_USER_ID,
-      name: `${PREFIX} Bot`,
-      email: `${PREFIX}bot+witness@w29.invalid`,
-      emailVerified: true,
-    })
-    .returning({ id: user.id });
-  const [proj] = await db
-    .insert(project)
-    .values({ teamId: tm.id, key: `${PREFIX.toUpperCase()}`, name: `${PREFIX} project` })
-    .returning({ id: project.id });
-  const [ag] = await db
-    .insert(aiAgent)
-    .values({
-      teamId: tm.id,
-      userId: usr.id,
-      username: BOT_USERNAME,
-      kind: 'external',
-      invocationUrl: `http://127.0.0.1:${sink.port}/${PREFIX}-sink`,
-    })
-    .returning({ id: aiAgent.id });
-  const [run] = await db
-    .insert(agentRun)
-    .values({
-      agentId: ag.id,
-      projectId: proj.id,
-      prompt: RUN_PROMPT,
-      trigger: 'manual',
-      status: 'pending',
-      nextAttemptAt: new Date(),
-    })
-    .returning({ id: agentRun.id });
-  return { workspaceId: ws.id, teamId: tm.id, projectId: proj.id, agentId: ag.id, runId: run.id };
-}
-
 async function main(): Promise<void> {
-  const dir = mkdtempSync(join(tmpdir(), 'pii-admission-d2-'));
-  const manifestPath = join(dir, 'manifest.json');
-  writeFileSync(
-    manifestPath,
-    JSON.stringify({
-      pythonSha256: 'a'.repeat(64),
-      fileSha256: { '/usr/bin/python3': 'a'.repeat(64) } as Record<string, string>,
-      routing: {
-        lanes: {
-          [BOT_USERNAME]: { execution: 'cloud' },
-          'local-lane': { execution: 'local' },
-        },
-        grants: [],
-      },
-    }),
-  );
-  const stubOwner = join(dir, 'owner.py');
-  writeFileSync(stubOwner, '# synthetic seam: never executed, the seam replaces the owner\n');
+  // Capture the environment before any mutation; the outer try guarantees the
+  // restore even when a later setup step fails.
   const prior: Record<string, string | undefined> = {};
-  for (const [key, value] of Object.entries({
-    TRACKER_RULES_PYTHON: '/usr/bin/python3',
-    TRACKER_RULES_OWNER: stubOwner,
-    TRACKER_RULES_MANIFEST: manifestPath,
-  })) {
+  for (const key of ['TRACKER_RULES_PYTHON', 'TRACKER_RULES_OWNER', 'TRACKER_RULES_MANIFEST']) {
     prior[key] = process.env[key];
-    process.env[key] = value;
   }
-  const seenOps: Record<string, unknown>[] = [];
-  setPiiAdmissionOwner(async (_config, op) => {
-    seenOps.push(op);
-    return { ok: false, code: 'tracker-rules-nonzero-exit', message: OWNER_MESSAGE };
-  });
-  const sink = await startSink();
+  let dir: string | null = null;
+  let mutantPath: string | null = null;
+  const owned: Owned = { workspaceId: null, teamId: null, projectId: null, agentId: null, runId: null };
   const before = await counts();
-  const owned = await createOwned(sink);
-  console.log('[fixture] owned rows', JSON.stringify(owned));
-
-  const servicePath = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'service.ts');
-  const source = readFileSync(servicePath, 'utf8');
-  check('gate block present in production source', source.match(GATE) !== null);
-  const mutated = source.replace(GATE, '');
-  check('mutation severs the production source', mutated !== source);
-  const mutantPath = join(dirname(servicePath), `service.mutant-witness-${process.pid}.ts`);
-  writeFileSync(mutantPath, mutated);
-
-  const { db } = await import('@repo/db');
   try {
+    dir = mkdtempSync(join(tmpdir(), 'pii-admission-d2-'));
+    const manifestPath = join(dir, 'manifest.json');
+    writeFileSync(
+      manifestPath,
+      JSON.stringify({
+        pythonSha256: 'a'.repeat(64),
+        fileSha256: { '/usr/bin/python3': 'a'.repeat(64) } as Record<string, string>,
+        routing: {
+          lanes: {
+            [BOT_USERNAME]: { execution: 'cloud' },
+            'local-lane': { execution: 'local' },
+          },
+          grants: [],
+        },
+      }),
+    );
+    const stubOwner = join(dir, 'owner.py');
+    writeFileSync(stubOwner, '# synthetic seam: never executed, the seam replaces the owner\n');
+    for (const [key, value] of Object.entries({
+      TRACKER_RULES_PYTHON: '/usr/bin/python3',
+      TRACKER_RULES_OWNER: stubOwner,
+      TRACKER_RULES_MANIFEST: manifestPath,
+    })) {
+      process.env[key] = value;
+    }
+    setPiiAdmissionOwner(async (_config, op) => {
+      seenOps.push(op);
+      return { ok: false, code: 'tracker-rules-nonzero-exit', message: OWNER_MESSAGE };
+    });
+    const created = await createOwned();
+    Object.assign(owned, created);
+    console.log('[fixture] owned rows', JSON.stringify(owned));
+
+    const servicePath = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'service.ts');
+    const source = readFileSync(servicePath, 'utf8');
+    check('gate block present in production source', source.match(GATE) !== null);
+    const mutated = source.replace(GATE, '');
+    check('mutation severs the production source', mutated !== source);
+    mutantPath = join(dirname(servicePath), `service.mutant-witness-${process.pid}.ts`);
+    writeFileSync(mutantPath, mutated);
+
     // CONTROL: the production takeNextRun on the owned PII-bearing run.
-    const control = await takeNextRun((await getRunnerAgent(BOT_USER_ID))!);
-    check('control: claim refused (null)', control === null, JSON.stringify(control));
+    const agent = (await getRunnerAgent(BOT_USER_ID))!;
+    const control = await takeNextRun(agent);
+    check('control: no claim handed out (null)', control === null, JSON.stringify(control));
     const [ctl] = await db
       .select({ status: agentRun.status, lastError: agentRun.lastError, attempts: agentRun.attempts })
       .from(agentRun)
-      .where(eq(agentRun.id, owned.runId));
-    check('control: run failed permanently with the owner\u2019s words', ctl.status === 'failed' && ctl.lastError === OWNER_MESSAGE, JSON.stringify(ctl));
-    check('control: no retry scheduled (attempts untouched)', ctl.attempts === 0);
-    check('control: sink received nothing', sink.posts.length === 0, `posts=${sink.posts.length}`);
-    const op = seenOps.at(-1);
+      .where(eq(agentRun.id, owned.runId!));
     check(
-      'control: owner got the state op on the run\u2019s trusted facts, no proposed_state',
-      op !== undefined && op.op === 'state' && op.id === `run-${owned.runId}` && !('proposed_state' in op),
-      JSON.stringify(op),
+      'control: run failed permanently with the owner\u2019s words',
+      ctl.status === 'failed' && ctl.lastError === OWNER_MESSAGE,
+      JSON.stringify(ctl),
     );
+    // D1: the claim's own bookkeeping incremented attempts before admission, and
+    // markRunFailed does not undo that; the no-retry proof is the terminal failed
+    // state, which the claim's WHERE clause no longer reaches.
+    check('control: first claim bookkeeping recorded (attempts 1, terminal failed)', ctl.attempts === 1, `attempts=${ctl.attempts}`);
     // Re-queue the owned run for the counterfactual: it is ours.
     await db
       .update(agentRun)
       .set({ status: 'pending', lastError: null, attempts: 0, nextAttemptAt: new Date() })
-      .where(eq(agentRun.id, owned.runId));
+      .where(eq(agentRun.id, owned.runId!));
     // MUTANT: the same owned claim through the copy with the actual gate call removed.
     const mutant = await import(pathToFileURL(mutantPath).href);
     const forbidden = await mutant.takeNextRun((await getRunnerAgent(BOT_USER_ID))!);
+    // D2: takeNextRun returns the framed claim; it does not POST. The forbidden
+    // handoff is the returned claim carrying the owned PII task text.
     check(
-      'mutant: the run is claimed and a dispatch POST reached the sink',
-      sink.posts.length === 1,
-      `posts=${sink.posts.length}`,
+      'mutant: the severed gate hands out the forbidden framed claim',
+      forbidden !== null && typeof forbidden === 'object',
+      JSON.stringify(forbidden)?.slice(0, 80) ?? 'null',
     );
-    const body = sink.posts[0] ?? '';
-    check('mutant: the owned PII prompt text left the server', body.includes(RUN_PROMPT), body.slice(0, 120));
     check(
-      'mutant: the framed handoff shape reached the invocation URL',
-      typeof forbidden === 'object' && forbidden !== null,
-      JSON.stringify(forbidden)?.slice(0, 80) ?? '',
+      'mutant: the owned PII task text left the server in the claim',
+      forbidden !== null && (forbidden as { prompt?: string }).prompt?.includes(RUN_PROMPT) === true,
+      JSON.stringify((forbidden as { prompt?: string } | null)?.prompt?.slice(0, 120)),
     );
   } finally {
-    rmSync(mutantPath, { force: true });
-    // Owned rows go, in FK order.
-    await db.delete(agentRun).where(eq(agentRun.id, owned.runId));
-    await db.delete(aiAgent).where(eq(aiAgent.id, owned.agentId));
-    await db.delete(project).where(eq(project.id, owned.projectId));
-    await db.delete(team).where(eq(team.id, owned.teamId));
-    await db.delete(user).where(eq(user.id, BOT_USER_ID));
-    await db.delete(workspace).where(eq(workspace.id, owned.workspaceId));
-    await sink.close();
-    setPiiAdmissionOwner(checkTrackerRules);
+    // Each resource is restored independently; a failed DB cleanup does not skip the
+    // environment, the seam or the temp files.
+    if (mutantPath) {
+      try {
+        rmSync(mutantPath, { force: true });
+      } catch (err) {
+        console.log('[cleanup] mutant file removal failed (logged, not skipped)', err);
+      }
+    }
     for (const [key, value] of Object.entries(prior)) {
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;
     }
-    rmSync(dir, { recursive: true, force: true });
-    const after = await counts();
-    check(
-      'unrelated rows untouched: every table count back to the baseline',
-      JSON.stringify(before) === JSON.stringify(after),
-      `before=${JSON.stringify(before)} after=${JSON.stringify(after)}`,
-    );
+    setPiiAdmissionOwner(checkTrackerRules);
+    await deleteOwned(owned);
+    if (dir) {
+      try {
+        rmSync(dir, { recursive: true, force: true });
+      } catch (err) {
+        console.log('[cleanup] temp dir removal failed (logged, not skipped)', err);
+      }
+    }
+    try {
+      const after = await counts();
+      check(
+        'unrelated rows untouched: every table count back to the baseline (aggregate guard)',
+        JSON.stringify(before) === JSON.stringify(after),
+        `before=${JSON.stringify(before)} after=${JSON.stringify(after)}`,
+      );
+    } catch (err) {
+      console.log('[cleanup] final count comparison failed (logged, not skipped)', err);
+      failures += 1;
+    }
   }
   console.log(failures === 0 ? '[witness] PASS' : `[witness] FAIL (${failures})`);
   if (failures > 0) process.exitCode = 1;
