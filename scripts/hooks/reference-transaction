@@ -1,0 +1,150 @@
+#!/bin/sh
+# sentinel-prod-8429 inventory row 8 R5: the hook git actually runs, for the forward-only shared-ref guard.
+#
+# WHY a raw script and not a lefthook command (measured 2026-11-15, lefthook 2.2.2, receipt
+# /Users/misty/Output/reports/8429_qwen2_plan_cli_R2_RETURN/lefthook_reference_transaction_probe.log): lefthook installs
+# a reference-transaction hook, but its command receives only the {1} state template and its stdin is empty. git sends
+# the transaction as `<old> <new> <ref>` lines on stdin, so the guard has to read stdin itself. This file is that
+# reader; every decision lives in the guard module so the rule stays provable with no hook installed.
+#
+# WHY it is not wired into lefthook.yml: a reference-transaction group there would make lefthook rewrite the installed
+# copy of this file at its next sync, and scripts/git-reference-guard.test.ts asserts the group stays absent.
+#
+# ROOT'S RETURN (msg_e43371ea4d27), which is why this file changed once already. The R1 copy ran `bun run
+# scripts/git-reference-guard.ts`, a path resolved against the CHECKOUT GIT IS INVOKED FROM. Once installed in the common
+# .git/hooks this hook runs for every linked worktree, including older trees and foreign checkouts that do not carry that
+# file at all: there it would either jam an ordinary ref move with a module-not-found error or run whatever stale copy the
+# tree happened to hold. So the helper is resolved beside the installed hook, outside every checkout.
+#
+# CLAUDE TODAY'S J1 AND ROOT'S R3 GO (msg_9bb7fb7a3b07), which is why it changed again. R2 looked for its helper and for
+# bun before it looked at what git was asking, and it found bun with `command -v`. A lane whose PATH is short - launchd's
+# default PATH, a cron shell, a GUI-launched git - therefore failed at every ref move in every tree, tags and
+# remote-tracking refs and the three states that cannot abort a transaction included. That is the jam this guard is not
+# allowed to cause. R3 asks the cheap questions first: any state other than `prepared` exits 0, because only `prepared`
+# can still abort; a transaction with no `refs/heads/` line exits 0, because this rule guards no ref in it. Only a
+# guarded branch move resolves anything.
+#
+# NO PATH DEPENDENCE IN THE INSTALLED PAIR. The runner is a pinned absolute path Root writes into
+# reference-transaction.runner beside the hook at install time, and it is never looked up on PATH and never searched for
+# inside a checkout. If the pinned runner or the pinned helper is not there, a guarded branch move is a named refusal -
+# not a fallback, not a search, and not an allow.
+#
+# ROOT'S R5 GO (msg_fb17e8bf7cd7), which is the only thing that changed in this file since R3. The guard module imports
+# one leaf beside itself - `import { ... } from './git-reference-rule'` - so an install that carried the guard but not the
+# rule leaf left every guarded command aborting with a runner's module-not-found message instead of a Row8 refusal. The
+# behaviour was safe (nothing was let through) but it was not nameable, and an operator reading git's output could not
+# tell a broken install from a broken rule. So the hook now asks, right after it asks for the guard, whether the rule leaf
+# sits beside the guard it is about to run. One file, one name, no search: the check is against the directory of the helper
+# this hook has already resolved, because that is the directory the import resolves against. It stays behind the same two
+# short circuits - a state that cannot abort, and a transaction with no branch ref in it - so a tag, a remote-tracking
+# ref, a fetch or a checkout is never asked this question and never jams over a partial install.
+#
+# INSTALL IS STILL NOT THIS FILE'S JOB. This is source. Root installs the pinned pair (this file as
+# .git/hooks/reference-transaction, the guard as .git/hooks/git-reference-guard.ts, and the runner path beside them) as
+# one operation, preserves the other hooks, and never sets a global core.hooksPath. Nothing here installs, touches
+# .git/hooks, or runs lefthook.
+#
+# NO BYPASS IS INVENTED HERE. git can skip hooks per invocation for an operator authorised to move a ref; that is
+# Misty's call to make and this guard does not implement, advertise or automate it. The alternative paths below are
+# deliberate source probes named by arguments git never passes, and each says out loud that it is a probe.
+#
+# Exit codes are git's: 0 lets the transaction proceed, non-zero aborts it while it is still prepared.
+
+state="${1:-}"
+probe_helper="${2:-}"
+probe_runner="${3:-}"
+
+if [ "$state" = "capability" ]; then
+  printf '%s\n' 'itsaplan-reference-transaction-forward-only-v1'
+  exit 0
+fi
+
+# The no-jam short circuit: only `prepared` can abort a transaction, so nothing else needs a helper, a runner or bun.
+if [ "$state" != "prepared" ]; then
+  exit 0
+fi
+
+# Read git's transaction once, with shell builtins only, and hand it to the guard on the guard's own stdin.
+transaction=''
+guarded_ref=0
+while IFS= read -r line || [ -n "$line" ]; do
+  transaction="$transaction$line
+"
+  if [ -n "$line" ]; then
+    case " $line " in *" refs/heads/"*) guarded_ref=1 ;; esac
+  fi
+done
+if [ "$guarded_ref" = "0" ]; then
+  exit 0
+fi
+
+# Where this hook file itself lives. Installed, that is the common hooks directory shared by every worktree. Found with
+# shell parameter expansion, because `dirname` is an external command and a short PATH may not carry it.
+case "$0" in
+  */*) hook_parent="${0%/*}" ;;
+  *) hook_parent="." ;;
+esac
+hook_dir=$(CDPATH= cd -- "$hook_parent" 2>/dev/null && pwd)
+if [ -z "$hook_dir" ]; then
+  printf '%s\n' 'BLOCKED (reference-transaction-forward-only): the hook could not find its own directory.' >&2
+  printf '%s\n' '  Code: HOOK_LOCATION_UNKNOWN' >&2
+  exit 1
+fi
+
+if [ -n "$probe_helper" ]; then
+  # Deliberate source probe only: an explicit helper path, named by whoever ran this (git passes one argument, never two).
+  helper="$probe_helper"
+  printf '%s\n' 'SOURCE PROBE: running the guard from an explicit path, not from a pinned install.' >&2
+else
+  helper="$hook_dir/git-reference-guard.ts"
+fi
+if [ ! -f "$helper" ]; then
+  printf '%s\n' 'BLOCKED (reference-transaction-forward-only): no guard module beside the installed hook.' >&2
+  printf '%s\n' '  Code: PINNED_HELPER_MISSING' >&2
+  printf '%s\n' "  Expected: $hook_dir/git-reference-guard.ts, installed together with this hook." >&2
+  printf '%s\n' '  Compliant form: install the pinned pair together, or do not install this hook. The guard never reaches' >&2
+  printf '%s\n' '  into the checkout it is guarding, because that tree may be older, dirty, or not carry the file.' >&2
+  exit 1
+fi
+
+# The guard module resolves its rule leaf beside itself, so this is checked against the helper's own directory: the
+# installed pair shares the common hooks directory, and a source probe keeps its own directory too.
+case "$helper" in
+  */*) helper_parent="${helper%/*}" ;;
+  *) helper_parent="." ;;
+esac
+if [ ! -f "$helper_parent/git-reference-rule.ts" ]; then
+  printf '%s\n' 'BLOCKED (reference-transaction-forward-only): the guard beside the installed hook imports a rule leaf' >&2
+  printf '%s\n' '  that is not there, so it cannot run and no guarded ref move is allowed on an install this incomplete.' >&2
+  printf '%s\n' '  Code: PINNED_RULE_MISSING' >&2
+  printf '%s\n' "  Expected: $helper_parent/git-reference-rule.ts, installed beside $helper." >&2
+  printf '%s\n' '  Compliant form: install the pinned trio together - this hook, the guard, and the rule leaf the guard' >&2
+  printf '%s\n' '  imports. Nothing here searches a checkout for a substitute: the tree a hook guards may be older, dirty,' >&2
+  printf '%s\n' '  or not carry the file at all, and a guard that found some other copy would apply a rule nobody installed.' >&2
+  exit 1
+fi
+
+if [ -n "$probe_runner" ]; then
+  runner="$probe_runner"
+elif [ -f "$hook_dir/reference-transaction.runner" ]; then
+  IFS= read -r runner < "$hook_dir/reference-transaction.runner"
+else
+  runner=''
+fi
+if [ -z "$runner" ]; then
+  printf '%s\n' 'BLOCKED (reference-transaction-forward-only): no pinned runner beside the installed hook.' >&2
+  printf '%s\n' '  Code: PINNED_RUNNER_MISSING' >&2
+  printf '%s\n' "  Expected: $hook_dir/reference-transaction.runner holding the absolute path of the runner, written at install." >&2
+  printf '%s\n' '  Compliant form: install the pinned pair together. This hook does not look a runner up on PATH, because' >&2
+  printf '%s\n' '  a short PATH is ordinary for a lane and must not jam a repository.' >&2
+  exit 1
+fi
+if [ ! -x "$runner" ]; then
+  printf '%s\n' 'BLOCKED (reference-transaction-forward-only): the pinned runner is not executable.' >&2
+  printf '%s\n' '  Code: PINNED_RUNNER_NOT_EXECUTABLE' >&2
+  printf '%s\n' "  Expected: an executable runner at the path named in $hook_dir/reference-transaction.runner, got $runner." >&2
+  exit 1
+fi
+
+# The pinned runner is the bun binary Root installed beside the hook: `bun run <helper> <state>`.
+printf '%s' "$transaction" | exec "$runner" run "$helper" "$state"
