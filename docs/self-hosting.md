@@ -270,5 +270,23 @@ docker compose up -d --build
 That builds every service from this checkout and runs those images. Nothing else changes, and
 the same command picks up local edits.
 
+## Running the api outside a container
+
+The api binds every interface unless `API_HOST` names one address. The compose files depend
+on that default: Docker publishes the container's port only while the api listens on every
+interface inside it, so leave `API_HOST` unset there.
+
+An api started straight on a host, for example with `bun run apps/api/src/index.ts` under a
+service manager, is reachable from every network that host is on, a VPN or an office LAN
+included. Set `API_HOST=127.0.0.1` so only the reverse proxy on the same machine reaches it:
+
+```bash
+API_PORT=3000
+API_HOST=127.0.0.1
+```
+
+A set but blank `API_HOST` stops the api at startup. It does not fall back to every
+interface.
+
 For a Coolify instance, see [coolify.md](coolify.md). For Kubernetes, see [helm.md](helm.md).
 For a hosted deploy without a server of your own, see [railway.md](railway.md).
