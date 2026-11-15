@@ -49,6 +49,35 @@ export interface SourceProject {
   url: string | null;
 }
 
+// A source row the import deliberately keeps as a non-ticket: the target gives
+// it a tombstone identity (no issue) and the row's content is retained here so
+// reconciliation can say where every source value ended up.
+export interface CanonicalRetainedRow {
+  sourceId: string;
+  title: string;
+  // Where the row is preserved in the target ('tombstone_identity' for bd's
+  // non-ticket rows; 'ticket_metadata' for a real ticket's source-metadata
+  // row, which never stamps a tombstone - Studio 2026-11-15: ticket unmapped
+  // values and the exact original title must reach the durable artifact, not
+  // only the snapshot arrays).
+  retention: string;
+  reason: string;
+  // Source fields the target cannot hold, carried verbatim.
+  unmapped: { field: string; value: string; note: string }[];
+  // F2 (Root GO 2026-11-15): the row's source comments, complete (author,
+  // order, body, timestamps) - a source without commentable rows omits them.
+  comments?: CanonicalComment[];
+  // The ticket's EXACT original title, before any importer prefix (a
+  // ticket_metadata row's `title` carries it); omitted for non-ticket rows
+  // whose title is already the source text.
+  originalTitle?: string;
+  // True when the source title already carried the exact token prefix and was
+  // kept as-is - then the original title is NOT reconstructible from the
+  // native title (source-prefixed vs importer-prefixed give identical native
+  // titles), which is why the flag rides the row (Studio 2026-11-15).
+  alreadyPrefixed?: boolean;
+}
+
 // The port a source-specific adapter implements (plane-adapter.ts,
 // linear-adapter.ts, trello-adapter.ts). Shaped from what import-worker.ts
 // actually needs to drive the Discover/Create/Link phases, not speculatively:
@@ -82,6 +111,12 @@ export interface SourceReader {
   listIssueChecklists(issueSourceId: string): Promise<CanonicalChecklist[]>;
   listIssueWorklogs?(issueSourceId: string): Promise<CanonicalWorklog[]>;
   listInitiativeAttachments?(initiativeSourceId: string): Promise<CanonicalAttachment[]>;
+  // The source's non-ticket rows, retained by the import: a bd memory/note row
+  // becomes a tombstone bead identity, not an issue, and its unmapped content is
+  // carried along for reconciliation (Root, 8363.1). Sources without non-ticket
+  // rows omit the method; the Create phase visits it once, when the last issue
+  // chunk finishes.
+  listRetainedRows?(): Promise<CanonicalRetainedRow[]>;
   // Resolves how to download one attachment, fresh each call: the source's own
   // resolved URL is a presigned link that expires (Plane's lasts exactly an
   // hour), so this is called at the moment of download, never cached or
