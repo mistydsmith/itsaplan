@@ -16,7 +16,10 @@ import {
   type TrackerGateRefusal,
 } from '../tracker-gate';
 
-const PYTHON = '/Users/misty/sentinel/sentinel-env/bin/python';
+// WHY 3.14 and an override: the synthetic owner needs only an interpreter, and the old
+// sentinel-env path resolves to python3.13. The production interpreter is configured elsewhere.
+const PYTHON =
+  process.env.TRACKER_GATE_TEST_PYTHON ?? '/Users/misty/sentinel/sentinel-env-314/bin/python';
 const HEX = '0'.repeat(64);
 const J = JSON.stringify;
 

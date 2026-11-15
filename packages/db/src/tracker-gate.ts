@@ -14,6 +14,12 @@ import {
   type TrackerRulesRefusalCode,
   type TrackerRulesViolation,
 } from './tracker-rules';
+import {
+  parseRoutingPolicy,
+  routingPolicyProblem,
+  type TrackerRoutingPolicy,
+} from './tracker-routing-facts';
+import { skillPinsProblem, type TrackerSkillPins } from './tracker-skill-receipts';
 
 // Trusted server config only: the sanctioned interpreter, the reviewed owner script, and the
 // manifest that pins the interpreter bytes and every file the owner imports.
@@ -71,12 +77,68 @@ export function isTrackerGateRefusal(value: unknown): value is TrackerGateRefusa
 export type TrackerGateConfigState =
   | { state: 'unset' }
   | { state: 'refusal'; code: TrackerGateRefusalCode; message: string }
-  | { state: 'configured'; config: TrackerRulesConfig };
+  // `routing` is the manifest's optional routing section. The transport never sees it: the writer
+  // reads it to build routing_facts, so it stays beside the transport config, not inside it.
+  // `skills` is the manifest's optional skills section: the path and sha256 of each skill text the
+  // server may deliver and take a receipt for. The transport never sees it either.
+  | {
+      state: 'configured';
+      config: TrackerRulesConfig;
+      routing?: TrackerRoutingPolicy;
+      skills?: TrackerSkillPins;
+      close?: TrackerClosePolicy;
+    };
+
+// The manifest's optional close section: per rig prefix, the repositories a code close may be
+// observed in, each with its one branch, and the roots a report or cancel artifact must sit in.
+// WHY it is in the pinned manifest (sentinel-prod-8429 G2): the rule owner compares the observed
+// repo and branch with the configured ones, so a request names a key of `repos` and never a path
+// or a ref.
+export interface TrackerCloseRepo {
+  repoRoot: string;
+  targetRef: string;
+}
+export interface TrackerCloseTarget {
+  repos: Record<string, TrackerCloseRepo>;
+  artifactRoots: string[];
+}
+export interface TrackerClosePolicy {
+  rigs: Record<string, TrackerCloseTarget>;
+}
+
+function closePolicyProblem(close: unknown): string | null {
+  const rigs = (close as { rigs?: unknown } | null)?.rigs;
+  if (typeof rigs !== 'object' || rigs === null || Array.isArray(rigs)) {
+    return 'the manifest close section needs a rigs mapping';
+  }
+  for (const [prefix, target] of Object.entries(rigs as Record<string, unknown>)) {
+    const { repos, artifactRoots } = (target ?? {}) as Record<string, unknown>;
+    if (typeof repos !== 'object' || repos === null || Array.isArray(repos)) {
+      return `close.rigs.${prefix}.repos must be a mapping`;
+    }
+    for (const [key, repo] of Object.entries(repos as Record<string, unknown>)) {
+      const { repoRoot, targetRef } = (repo ?? {}) as Record<string, unknown>;
+      if (!isAbsolute(repoRoot)) {
+        return `close.rigs.${prefix}.repos.${key}.repoRoot must be an absolute path`;
+      }
+      if (typeof targetRef !== 'string' || targetRef.trim() === '') {
+        return `close.rigs.${prefix}.repos.${key}.targetRef must be a nonempty ref name`;
+      }
+    }
+    if (!Array.isArray(artifactRoots) || artifactRoots.some((root) => !isAbsolute(root))) {
+      return `close.rigs.${prefix}.artifactRoots must be a list of absolute paths`;
+    }
+  }
+  return null;
+}
 
 interface ManifestFile {
   pythonSha256?: unknown;
   fileSha256?: unknown;
   limits?: unknown;
+  routing?: unknown;
+  skills?: unknown;
+  close?: unknown;
 }
 
 const HEX64 = /^[0-9a-f]{64}$/;
@@ -99,7 +161,19 @@ function manifestProblem(manifest: unknown): string | null {
   if (typeof manifest !== 'object' || manifest === null || Array.isArray(manifest)) {
     return 'the manifest must be a json object';
   }
-  const { pythonSha256, fileSha256, limits } = manifest as ManifestFile;
+  const { pythonSha256, fileSha256, limits, routing, skills, close } = manifest as ManifestFile;
+  if (close !== undefined) {
+    const problem = closePolicyProblem(close);
+    if (problem !== null) return problem;
+  }
+  if (skills !== undefined) {
+    const problem = skillPinsProblem(skills);
+    if (problem !== null) return problem;
+  }
+  if (routing !== undefined) {
+    const problem = routingPolicyProblem(routing);
+    if (problem !== null) return problem;
+  }
   if (typeof pythonSha256 !== 'string' || !HEX64.test(pythonSha256)) {
     return 'the manifest needs a 64 character hex pythonSha256';
   }
@@ -209,6 +283,9 @@ export async function loadTrackerRulesConfig(): Promise<TrackerGateConfigState> 
     };
     if (pinned.limits !== undefined) config.limits = pinned.limits as TrackerRulesLimits;
     state = { state: 'configured', config };
+    if (pinned.routing !== undefined) state.routing = parseRoutingPolicy(pinned.routing);
+    if (pinned.skills !== undefined) state.skills = pinned.skills as TrackerSkillPins;
+    if (pinned.close !== undefined) state.close = pinned.close as TrackerClosePolicy;
   }
   configStates.set(key, state);
   return state;
