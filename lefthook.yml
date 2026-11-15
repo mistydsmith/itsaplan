@@ -17,3 +17,18 @@ pre-commit:
       glob: '*.{js,jsx,ts,tsx,mjs,cjs,json,jsonc,css,scss,md,mdx,yml,yaml,html}'
       run: bunx prettier --ignore-unknown --write {staged_files}
       stage_fixed: true
+
+# Anchor-map landing restamp (sentinel-prod-8428): after a merge lands in this
+# checkout — including a merge that carries a drizzle migration — re-stamp the
+# unfinished issues whose exact anchored files changed in the landed range, so
+# their cards carry fresh anchors and DRIFT lines. The runner is the shipped CLI
+# and it is told it is a post-merge hook: its range is the recorded boundary to
+# HEAD, or, in a checkout that has never stamped yet, git's own ORIG_HEAD (the
+# pre-merge tip git writes before this hook runs) — never a guessed range. It
+# always exits 0 and it advances its checkpoint only on a sweep that finished,
+# so a stamp failure can neither fail the merge nor silently drop a range.
+post-merge:
+  commands:
+    anchor-restamp:
+      priority: 1
+      run: bun run scripts/anchor_map_restamp.ts --post-merge

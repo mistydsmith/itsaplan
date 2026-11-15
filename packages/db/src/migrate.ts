@@ -100,3 +100,28 @@ const removed = await pruneBackups();
 if (removed > 0) console.log(`🧹 Removed ${removed} backup(s) past the retention window`);
 await migrationClient.end();
 console.log('✅ Migrations applied');
+
+// Anchor-map refresh after a migration lands (sentinel-prod-8428): the sweep is
+// the same shipped CLI the post-merge hook runs (anchor-restamp.ts owns the
+// rules; the ItsPlan auto lander, 8429, coordinates on the same entry).
+// Opt-in, and honest about what that means: with
+// ITSAPLAN_ANCHOR_RESTAMP_AFTER_MIGRATION unset NOTHING here runs - a container
+// boot is not a git landing and this module claims no activation it does not
+// have. Set it to 1 in a checkout that maintains the boundary file; the runner
+// still refuses a guessed range. cwd is the checkout root (packages/db/src ->
+// up three), which is where scripts/anchor_map_restamp.ts and the git paths are.
+// Fire-and-forget: a failed refresh never fails the migration.
+if (process.env.ITSAPLAN_ANCHOR_RESTAMP_AFTER_MIGRATION === '1') {
+  try {
+    const proc = Bun.spawn(['bun', 'run', 'scripts/anchor_map_restamp.ts'], {
+      cwd: new URL('../../..', import.meta.url).pathname,
+      stdout: 'inherit',
+      stderr: 'inherit',
+    });
+    await proc.exited;
+  } catch (error) {
+    console.log(
+      `anchor restamp after migration skipped: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}

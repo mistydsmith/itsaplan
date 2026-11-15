@@ -78,6 +78,7 @@ import {
   type ActivityInput,
   type IssueSnapshot,
 } from './activity';
+import { stampIssueAnchors } from './anchor-stamp';
 import { autoWatchIssue } from './watchers';
 import { attachLoggedMinutes } from './worklogs';
 import { recordCycleChange } from './cycle-history';
@@ -1730,14 +1731,21 @@ export async function createIssue(
 
   // Gated returns the row its transaction finished; an ordinary project keeps its existing shape and
   // runs the same sequence after the commit, on the default client.
-  if (finished !== null) return finished;
-  return await finishCreate(db, {
-    projectId: project.id,
-    issueId,
-    createdAt,
-    input,
-    actorUserId: actorUserId ?? null,
-  });
+  const row: IssueRow =
+    finished !== null
+      ? finished
+      : await finishCreate(db, {
+          projectId: project.id,
+          issueId,
+          createdAt,
+          input,
+          actorUserId: actorUserId ?? null,
+        });
+  // Anchor-map stamp (sentinel-prod-8428): an issue whose body names code anchors gets its
+  // symbol + line-anchor map stamped as a system-actor activity entry, off the write path and
+  // after the issue has committed — a stamp failure never blocks or rolls back the issue.
+  void stampIssueAnchors(issueId, row.description).catch(() => {});
+  return row;
 }
 
 // The creation side effects, in the order they have always run. A gated create passes its transaction
