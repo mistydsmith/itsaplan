@@ -1,6 +1,7 @@
 import { db, issue, issueLink, project as projectTable } from '@repo/db';
 import { and, eq, isNull, or, sql } from 'drizzle-orm';
 import { alias } from 'drizzle-orm/pg-core';
+import { gateLinkChange, gateUnlink, type LinkEpochs } from '#modules/tracker-claims/gated-link';
 import { HttpError } from '#shared/lib';
 import { recordActivityEntries, rowSide, textSide, type ActivityInput } from './activity';
 import { emitIssueEvents } from './webhook-payload';
@@ -224,16 +225,27 @@ interface EndRow {
 // projects, or no inserted id, which with the preconditions met can only be the
 // duplicate. The activity entries join it in one transaction; the webhooks fire
 // after it commits, so a rolled-back relation is never announced.
+//
+// In a project with a rig the rule owner judges the relation first, on this transaction (see
+// gated-link.ts). epochs are the claim epochs a worker read for the two issues.
 export async function addIssueLink(
   issueId: number,
   targetIssueId: number,
   kind: IssueLinkInputKind,
   actorUserId?: string | null,
+  epochs: LinkEpochs = {},
 ): Promise<IssueLinkRow> {
   if (issueId === targetIssueId) throw new HttpError(400, 'An issue cannot be linked to itself');
   const stored = storedLink(issueId, targetIssueId, kind);
 
   const { target, linkId } = await db.transaction(async (tx) => {
+    await gateLinkChange(tx, {
+      op: 'link',
+      issueId,
+      otherIssueId: targetIssueId,
+      userId: actorUserId,
+      ...epochs,
+    });
     const rows = (await tx.execute(sql`
       with ends as (
         select i.id,
@@ -324,8 +336,11 @@ export async function removeIssueLink(
   issueId: number,
   linkId: number,
   actorUserId?: string | null,
+  epochs: LinkEpochs = {},
 ): Promise<boolean> {
   const removed = await db.transaction(async (tx) => {
+    const known = await gateUnlink(tx, { issueId, linkId, userId: actorUserId, ...epochs });
+    if (!known) return null;
     const rows = (await tx.execute(sql`
       with removed as (
         delete from ${issueLink}

@@ -34,7 +34,6 @@ import {
   getIssue,
   getIssueBySequence,
   getIssueProjectId,
-  updateIssue,
   deleteIssue,
   archiveIssue,
   restoreIssue,
@@ -42,7 +41,6 @@ import {
   bulkAddLabels,
   bulkArchiveIssues,
   bulkDeleteIssues,
-  setIssueLabels,
   setIssueFieldValue,
   getIssueFieldValues,
 } from './service';
@@ -82,6 +80,7 @@ import {
 } from './worklogs';
 import { listIssueCycles } from './cycle-history';
 import { moveIssue } from './move';
+import { patchIssue } from './issue-patch';
 import {
   createAndLinkPullRequest,
   linkExistingPullRequest,
@@ -161,6 +160,7 @@ import {
   issueFieldParams,
   addIssueLinkBody,
   issueLinkParams,
+  removeIssueLinkQuery,
   checklistTitleBody,
   createChecklistItemBody,
   createChecklistItemsBody,
@@ -756,12 +756,8 @@ export const issueRoutes = new Elysia({ name: 'issues', detail: { tags: ['Issues
       const actorUserId = requireUser(user).id;
       const issueId = params.issueId;
       const { labelIds, ...patch } = body;
-      const issue = await updateIssue(issueId, patch, actorUserId);
+      const issue = await patchIssue({ projectId, issueId, patch, labelIds, actorUserId });
       if (!issue) throw new HttpError(404, 'Issue not found');
-      if (labelIds) {
-        await setIssueLabels(projectId, issueId, labelIds, actorUserId);
-        issue.labelIds = labelIds;
-      }
       return issue;
     },
     {
@@ -1084,7 +1080,8 @@ export const issueRoutes = new Elysia({ name: 'issues', detail: { tags: ['Issues
     '/issues/:issueId/links',
     async ({ params, body, user, set }) => {
       set.status = 201;
-      return addIssueLink(params.issueId, body.targetIssueId, body.kind, requireUser(user).id);
+      const { targetIssueId, kind, ...epochs } = body;
+      return addIssueLink(params.issueId, targetIssueId, kind, requireUser(user).id, epochs);
     },
     {
       body: addIssueLinkBody,
@@ -1104,15 +1101,21 @@ export const issueRoutes = new Elysia({ name: 'issues', detail: { tags: ['Issues
   // between two other issues cannot be removed through it.
   .delete(
     '/issues/:issueId/links/:linkId',
-    async ({ params, user }) => {
-      const removed = await removeIssueLink(params.issueId, params.linkId, requireUser(user).id);
+    async ({ params, query, user }) => {
+      const removed = await removeIssueLink(
+        params.issueId,
+        params.linkId,
+        requireUser(user).id,
+        query,
+      );
       if (!removed) throw new HttpError(404, 'Link not found');
       return noContent();
     },
     {
       params: issueLinkParams,
+      query: removeIssueLinkQuery,
       workItem: 'edit',
-      response: { 204: t.Void(), ...commonErrors },
+      response: { 204: t.Void(), ...commonErrors, ...errors(409) },
       detail: {
         summary: 'Unlink two issues',
         description: "Remove one of an issue's relations by the link id.",
