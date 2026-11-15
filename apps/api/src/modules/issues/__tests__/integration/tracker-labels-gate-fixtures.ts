@@ -6,7 +6,9 @@
 const { randomUUID } = await import('node:crypto');
 const { readFileSync } = await import('node:fs');
 export const GRANT = 'ITSAPLAN_8364_U4_LABEL_GATE_PROOF';
-export const OWNER_CONFIG = '/Users/misty/Output/reports/8364_root_policy_owner_R3/CONFIG.json';
+// Root's composed owner pin (Sentinel 07a7bde25b). It has no routing section.
+export const OWNER_CONFIG =
+  '/Users/misty/Output/reports/itsaplan_cutover_20261114_ROOT_R1/8364_owner_composition/CONFIG.json';
 const REQUIRED_DB = 'itsaplan_8364_d2_test';
 const LOOPBACK = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
 export const RIG_PREFIX = `q3u4${randomUUID().replace(/-/g, '')}`;
@@ -307,6 +309,13 @@ export async function storeLabel(issueId: number, labelId: number): Promise<void
 export async function assign(issueId: number, actorId: string): Promise<void> {
   await db.execute(sql`UPDATE issue SET assignee_user_id = ${actorId} WHERE id = ${issueId}`);
 }
+// Makes the fixture's actor an agent of the project's team under the given username, so a card it holds is routed as that lane. The row goes with the user.
+export async function asAgent(projectId: number, actorId: string, username: string): Promise<void> {
+  await db.execute(
+    sql`INSERT INTO ai_agent (team_id, user_id, username, kind)
+        VALUES ((SELECT team_id FROM project WHERE id = ${projectId}), ${actorId}, ${username}, 'external')`,
+  );
+}
 export type Race = { waiting: number; blockedByOther: number; saved: boolean; refusal?: Refusal };
 // The activation race: one connection holds an uncommitted UPDATE of the project row - the only way apps/api activates a rig - and the label save starts
 // against it. The run observes a real wait (backends waiting on a lock, and how many wait on another backend's uncommitted row) before releasing the
@@ -397,4 +406,21 @@ export async function residue(): Promise<Record<string, number>> {
            (SELECT count(*) FROM issue WHERE id = ANY(${ids(ever.issue)}::int[]))::int AS issue,
            (SELECT count(*) FROM rig WHERE prefix = ${RIG_PREFIX})::int AS rig,
            (SELECT count(*) FROM "user" WHERE id = ANY(${users}::text[]))::int AS "user"`);
+}
+// A second user who is a member of the project and an agent under the given username, so a card
+// whose text names that username resolves to a lane while nobody holds the card.
+export async function laneAgent(f: GateFacts, lane: string): Promise<string> {
+  const id = `u4-${lane}-${f.projectId}`;
+  await db.execute(sql`INSERT INTO "user" (id, name, username, email, email_verified)
+    VALUES (${id}, ${lane}, ${`${lane}lane${f.projectId}`}, ${`${id}@example.com`}, true)`);
+  pendingUsers.push(id);
+  everUsers.push(id);
+  await db.execute(
+    sql`INSERT INTO project_member (project_id, user_id, role) VALUES (${f.projectId}, ${id}, 'member')`,
+  );
+  await asAgent(f.projectId, id, lane);
+  return id;
+}
+export async function storeDescription(issueId: number, description: string): Promise<void> {
+  await db.execute(sql`UPDATE issue SET description = ${description} WHERE id = ${issueId}`);
 }

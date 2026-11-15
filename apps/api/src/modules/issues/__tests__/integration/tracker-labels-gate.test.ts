@@ -1,5 +1,5 @@
 // The gate on the direct label writer (8364 U4): a gated project's labels may change only through the gate, the ordinary branch is held by the project
-// row, and a routed card stays refused until an authenticated routing seam exists. Source only for now: every call is internal, there is no HTTP endpoint
+// row, and a card a lane holds is judged on routing facts built from stored identities and the manifest. Source only for now: every call is internal, there is no HTTP endpoint
 // or browser test, and nothing here runs until Root's serial DB GO sets the grant. A4 owns the whole create path, so the cards below come from createIssue
 // on a gated project and from plain SQL on an ordinary one; nothing simulates a card by bypassing a gate it is testing.
 // A write case always asks for a change the owner allows: the stored size-small out and size-large in. A request that drops the only size or adds a second
@@ -202,18 +202,31 @@ describe('8364 U4 gated label writer', () => {
     await untouched(f, [card], plusPlain(f), mid);
     expect(await F.deliveriesOf(f.projectId)).toEqual([]);
   });
-  it('refuses a routed card and keeps its stored size label', async () => {
+  it('allows a label change on a card a person holds', async () => {
+    const f = await F.fixture(true, 'person-held');
+    const card = await F.gatedCard(f, 'Held by a person');
+    await F.assign(card.issueId, f.actorId);
+    const before = await F.board(f);
+    // A person is not a lane: the routing facts carry no target, so only the label rules answer.
+    await F.withOwner(() =>
+      F.setIssueLabels(f.projectId, card.issueId, [f.large], f.actorId, true),
+    );
+    await swappedIn(f, card.issueId, before, true);
+  });
+  it('refuses a card held by a lane the manifest does not list and keeps its stored size label', async () => {
     const f = await F.fixture(true, 'routed');
     const cards = await gatedPair(f, 'Assigned work');
+    // The owner config under test has no routing section, so no lane has an execution entry.
+    await F.asAgent(f.projectId, f.actorId, 'qwen2');
     const before = await F.board(f);
     for (const card of cards) {
       await F.assign(card.issueId, f.actorId);
       const refusal = await F.refusalOf(() =>
         F.withOwner(() => F.setIssueLabels(f.projectId, card.issueId, [f.large], f.actorId, true)),
       );
-      expect(refusal.status).toBe(409);
+      expect([refusal.status, refusal.code]).toEqual([409, 'lane-unrouted']);
       expect(refusal.message).toStartWith('lane-routing:');
-      expect(refusal.message).toContain('routing_facts');
+      expect(refusal.message).toContain('lane qwen2 has no execution entry');
     }
     await untouched(f, cards, stored(f), before);
   });
@@ -306,6 +319,7 @@ describe('8364 U4 gated label writer', () => {
     const f = await F.fixture(true, 'executor');
     const size = await F.gatedCard(f, 'Injected size refusal');
     const routed = await F.gatedCard(f, 'Injected routing refusal');
+    await F.asAgent(f.projectId, f.actorId, 'qwen2');
     await F.assign(routed.issueId, f.actorId);
     const before = await F.board(f);
     const calls: [F.Card, number[], string][] = [
