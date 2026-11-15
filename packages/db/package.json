@@ -9,7 +9,8 @@
     "./issue-identity": "./src/issue-identity.ts",
     "./tracker-rules": "./src/tracker-rules.ts",
     "./tracker-gate": "./src/tracker-gate.ts",
-    "./tracker-issue-facts": "./src/tracker-issue-facts.ts"
+    "./tracker-issue-facts": "./src/tracker-issue-facts.ts",
+    "./tracker-close-facts": "./src/tracker-close-facts.ts"
   },
   "scripts": {
     "db:generate": "drizzle-kit generate",
