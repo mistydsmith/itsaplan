@@ -4,10 +4,10 @@ import { db, workspace, team, project, projectColumn, issue, importJob, user } f
 import { eq } from 'drizzle-orm';
 import {
   createLocalInitiativeAndRecord,
-  createLocalIssueAndRecord,
   getInitiativeDescription,
   type ClaimedImportJob,
 } from '../../import-store';
+import { createLocalIssueAndRecord } from '../../import-store-issue';
 import { runAttachments, runRewrite } from '../../import-worker';
 import type { SourceReader } from '../../reader';
 

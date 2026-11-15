@@ -29,7 +29,6 @@ import {
   claimDueImportJobs,
   decryptImportCredential,
   createLocalStateAndRecord,
-  createLocalIssueAndRecord,
   createLocalAttachmentAndRecord,
   importedAttachmentPaths,
   createIssueLink,
@@ -40,6 +39,7 @@ import {
   setIssueParentIfUnset,
   type NewLocalIssue,
 } from '../../import-store';
+import { createLocalIssueAndRecord } from '../../import-store-issue';
 
 // Nothing here calls resetDb (the worker has no api to reset for), so every
 // helper below makes its own isolated team/project/user with a random key,
