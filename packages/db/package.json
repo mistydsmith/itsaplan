@@ -12,7 +12,8 @@
     "./tracker-issue-facts": "./src/tracker-issue-facts.ts",
     "./tracker-close-facts": "./src/tracker-close-facts.ts",
     "./tracker-skill-receipts": "./src/tracker-skill-receipts.ts",
-    "./tracker-routing-facts": "./src/tracker-routing-facts.ts"
+    "./tracker-routing-facts": "./src/tracker-routing-facts.ts",
+    "./bead-import-identity": "./src/bead-import-identity.ts"
   },
   "scripts": {
     "db:generate": "drizzle-kit generate",

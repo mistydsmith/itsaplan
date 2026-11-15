@@ -1,4 +1,4 @@
-import { sql } from 'drizzle-orm';
+import { sql, type SQL } from 'drizzle-orm';
 import type { DbExecutor } from './client';
 
 // The transaction half of DbExecutor. Allocation must join the caller's create
@@ -57,8 +57,8 @@ export interface AllocateInput {
   mode?: AllocationMode;
 }
 
-// The SQLSTATE of a driver error, whether it arrives bare or wrapped in a cause.
-function sqlState(error: unknown): string | undefined {
+// SQLSTATE of a driver error, whether it arrives bare or wrapped in a cause.
+export function sqlState(error: unknown): string | undefined {
   const direct = (error as { code?: string }).code;
   if (direct) return direct;
   const cause = (error as { cause?: { code?: string } }).cause;
@@ -101,15 +101,22 @@ function token(root: number, child: number): string {
 // its number in local_token with root left NULL, which C1 permits, so the text component
 // is read too. A hash or multidot-only token contributes nothing, because its first
 // component is not all digits.
-const HIGHEST_MINTABLE_ROOT = sql`
-  GREATEST(
-    COALESCE((SELECT MAX(root) FROM bead_identity
-               WHERE rig_id = $1 AND root IS NOT NULL), 0),
-    COALESCE((SELECT MAX(split_part(local_token, '.', 1)::int) FROM bead_identity
-               WHERE rig_id = $1
-                 AND root IS NULL
-                 AND split_part(local_token, '.', 1) ~ '^[0-9]+$'), 0)
-  )`;
+//
+// Parameterized on purpose: the old unparameterized const spelled its rig_id as the
+// literal $1 and only worked while a sibling interpolation in the same statement bound
+// that position. A standalone SELECT of the const left $1 unbound (Root, 8363.1 review,
+// 2026-11-15). The helper takes the rig id so every caller binds it itself.
+export function highestMintableRoot(rigId: number): SQL {
+  return sql`
+    GREATEST(
+      COALESCE((SELECT MAX(root) FROM bead_identity
+                 WHERE rig_id = ${rigId} AND root IS NOT NULL), 0),
+      COALESCE((SELECT MAX(split_part(local_token, '.', 1)::int) FROM bead_identity
+                 WHERE rig_id = ${rigId}
+                   AND root IS NULL
+                   AND split_part(local_token, '.', 1) ~ '^[0-9]+$'), 0)
+    )`;
+}
 
 // The highest child under one root, including tombstones and imported descendants that
 // stored no numeric child or no root at all. An imported '1.9' arrives with root and child
@@ -167,7 +174,7 @@ export async function allocateBeadToken(
 
   if (parentId === null) {
     const [highest] = (await tx.execute(
-      sql`SELECT ${HIGHEST_MINTABLE_ROOT} AS highest, (SELECT next_root FROM rig WHERE id = ${rigId}) AS next_root`,
+      sql`SELECT ${highestMintableRoot(rigId)} AS highest, (SELECT next_root FROM rig WHERE id = ${rigId}) AS next_root`,
     )) as unknown as { highest: number | string; next_root: number | string }[];
     root = Math.max(Number(highest.highest) + 1, Number(highest.next_root), 1);
   } else {
@@ -214,7 +221,7 @@ export async function allocateBeadToken(
       // new issue takes its own root and keeps the real parent link. No two-part token is
       // ever invented beyond a child of a root.
       const [highest] = (await tx.execute(
-        sql`SELECT ${HIGHEST_MINTABLE_ROOT} AS highest, (SELECT next_root FROM rig WHERE id = ${rigId}) AS next_root`,
+        sql`SELECT ${highestMintableRoot(rigId)} AS highest, (SELECT next_root FROM rig WHERE id = ${rigId}) AS next_root`,
       )) as unknown as { highest: number | string; next_root: number | string }[];
       root = Math.max(Number(highest.highest) + 1, Number(highest.next_root), 1);
     } else {
