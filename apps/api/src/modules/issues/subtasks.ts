@@ -1,4 +1,11 @@
-import { ancestorIds, db, issue, project as projectTable, subtreeIds } from '@repo/db';
+import {
+  ancestorIds,
+  db,
+  issue,
+  project as projectTable,
+  subtreeIds,
+  type DbExecutor,
+} from '@repo/db';
 import { and, eq, inArray, sql, type SQL } from 'drizzle-orm';
 import { alias } from 'drizzle-orm/pg-core';
 import { HttpError } from '#shared/lib';
@@ -21,8 +28,11 @@ export interface IssueRef {
   archived: boolean;
 }
 
-function refRowsWhere(condition: SQL) {
-  return db
+// WHY the executor parameter (sentinel-prod-8429 L2): a caller inside a transaction must see its own
+// uncommitted subtask rows, or the automation it drives judges a stale board. The default keeps every existing
+// caller on the geometry it had.
+function refRowsWhere(condition: SQL, executor: DbExecutor = db) {
+  return executor
     .select({
       id: issue.id,
       sequenceNumber: issue.sequenceNumber,
@@ -51,14 +61,17 @@ function toRef(row: Awaited<ReturnType<typeof refRowsWhere>>[number]): IssueRef 
   };
 }
 
-async function refsWhere(condition: SQL): Promise<IssueRef[]> {
-  return (await refRowsWhere(condition)).map(toRef);
+async function refsWhere(condition: SQL, executor: DbExecutor = db): Promise<IssueRef[]> {
+  return (await refRowsWhere(condition, executor)).map(toRef);
 }
 
 // The issue's subtasks, by issue number. Archived ones are included: they stay
 // attached to their parent and are restored as its subtasks.
-export async function listSubtasks(issueId: number): Promise<IssueRef[]> {
-  return refsWhere(eq(issue.parentId, issueId));
+export async function listSubtasks(
+  issueId: number,
+  executor: DbExecutor = db,
+): Promise<IssueRef[]> {
+  return refsWhere(eq(issue.parentId, issueId), executor);
 }
 
 // The subtasks a delete, an archive or a restore acts on: the ones in the issue's

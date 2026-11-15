@@ -1,9 +1,17 @@
 import { describe, it, expect, beforeEach } from 'bun:test';
-import { db, issue } from '@repo/db';
+import {
+  db,
+  issue,
+  project as projectTable,
+  projectColumn,
+  team as teamTable,
+  workspace,
+} from '@repo/db';
 import { eq } from 'drizzle-orm';
 import { authedApi, type Api, createProject } from '#tests/helpers/app';
 import { signUpTestUser } from '#tests/helpers/auth';
 import { resetDb } from '#tests/helpers/db';
+import { listSubtasks } from '../../subtasks';
 
 // Subtasks: an issue carries the id of the issue it hangs under (parentId), set on
 // create or through an update. Subtasks nest up to 8 levels and stay inside one
@@ -707,5 +715,111 @@ describe('subtasks', () => {
       expect((await read(asOwner, parent.id)).columnId).toBe(doneColumnId);
       expect((await read(asOwner, subtask.id)).columnId).toBe(doneColumnId);
     });
+  });
+});
+
+// sentinel-prod-8429 prerequisite L2: the subtask reader must be able to run on a caller's transaction.
+// WHY here and not in a new file: this suite already owns the subtask fixtures, and a second fixture set would
+// be a second source of truth for what a subtask row is.
+// PREPARED: runs only with ITSAPLAN_LANDING_D2=1 (Root's serial D2 slot); otherwise it skips.
+//
+// The exact-target / NODE_ENV / no-worker guard runs before any D2 test can start, following the neighbouring
+// transaction-* suites (CT's review, 8429): a real transaction proof must never run against the wrong
+// database. This file's main suite imports the db handle statically by design, so the guard is the first
+// thing the D2 path executes: with the flag set it throws at module load, before any describe body or
+// fixture runs; without the flag the D2 path is skipped and the guard never fires.
+const EXPECTED_D2_DB = 'itsaplan_8364_d2_test';
+
+function assertD2TargetGuard(): void {
+  const envUrl = process.env.DATABASE_URL ?? '';
+  let u: URL;
+  try {
+    u = new URL(envUrl);
+  } catch {
+    throw new Error(
+      `target guard: DATABASE_URL is not a parseable URL, got ${JSON.stringify(envUrl)}`,
+    );
+  }
+  if (u.hostname !== '127.0.0.1' && u.hostname !== '::1')
+    throw new Error(`target guard: host must be loopback (127.0.0.1 or ::1), got '${u.hostname}'`);
+  if (u.port !== '5433') throw new Error(`target guard: port must be 5433, got '${u.port}'`);
+  if (u.pathname !== `/${EXPECTED_D2_DB}`)
+    throw new Error(`target guard: path must be /${EXPECTED_D2_DB}, got '${u.pathname}'`);
+  if (process.env.NODE_ENV !== 'test') throw new Error('target guard: NODE_ENV must be test');
+  if (process.env.BUN_TEST_WORKER_ID)
+    throw new Error('target guard: BUN_TEST_WORKER_ID must be unset (single process)');
+}
+
+const LANDING_D2 = (process.env.ITSAPLAN_LANDING_D2 ?? '').trim() === '1';
+
+if (LANDING_D2) assertD2TargetGuard();
+
+const d2Subtasks = LANDING_D2 ? describe : describe.skip;
+
+const d2RunId = (): string => `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`;
+
+d2Subtasks('listSubtasks on a caller executor (8429 L2)', () => {
+  it('sees a subtask created in the same transaction, and the pool sees it only after commit', async () => {
+    const id = d2RunId();
+    let ownedWorkspace = 0;
+    let parentId = 0;
+    try {
+      // Owned workspace / team / project / column (the same fixture shape as the neighbouring
+      // transaction-* suites); deleting the workspace cascades through the team, the project and
+      // its issues, so the case cannot leave a stray row or delete anything it did not create.
+      const [ws] = await db
+        .insert(workspace)
+        .values({ name: `d2 subtasks ws ${id}` })
+        .returning({ id: workspace.id });
+      ownedWorkspace = ws.id;
+      const [tm] = await db
+        .insert(teamTable)
+        .values({ workspaceId: ws.id, name: `d2 subtasks ${id}`, slug: `d2-${id}` })
+        .returning({ id: teamTable.id });
+      const [proj] = await db
+        .insert(projectTable)
+        .values({
+          teamId: tm.id,
+          name: `d2 subtasks ${id}`,
+          key: `D2${id.slice(0, 5).toUpperCase()}`,
+        })
+        .returning({ id: projectTable.id });
+      const [col] = await db
+        .insert(projectColumn)
+        .values({ projectId: proj.id, name: `d2 subtasks col ${id}`, position: 1 })
+        .returning({ id: projectColumn.id });
+
+      let inTx = -1;
+      let onPoolDuringTx = -1;
+      await db.transaction(async (tx) => {
+        const [parent] = await tx
+          .insert(issue)
+          .values({ projectId: proj.id, sequenceNumber: 1, columnId: col.id, title: 'parent' })
+          .returning({ id: issue.id });
+        parentId = parent.id;
+        const [child] = await tx
+          .insert(issue)
+          .values({
+            projectId: proj.id,
+            sequenceNumber: 2,
+            columnId: col.id,
+            title: 'child',
+            parentId: parent.id,
+          })
+          .returning({ id: issue.id });
+        expect(child.id).toBeGreaterThan(0);
+        // Same executor: the child this transaction just wrote must be visible here.
+        inTx = (await listSubtasks(parent.id, tx)).length;
+        // The pool cannot see an uncommitted row; a pool read inside a landing would have judged a stale board.
+        onPoolDuringTx = (await listSubtasks(parent.id)).length;
+      });
+      // Committed: the pool read now sees the subtask the transaction wrote.
+      const afterCommit = (await listSubtasks(parentId)).length;
+      expect(inTx).toBe(1);
+      expect(onPoolDuringTx).toBe(0);
+      expect(afterCommit).toBe(1);
+    } finally {
+      if (ownedWorkspace) await db.delete(workspace).where(eq(workspace.id, ownedWorkspace));
+    }
   });
 });
