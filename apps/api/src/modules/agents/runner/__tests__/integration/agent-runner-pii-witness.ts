@@ -362,6 +362,10 @@ async function main(): Promise<void> {
       await db.$client.end({ timeout: 10 });
     } catch (err) {
       console.log('[cleanup] db pool close failed (logged, not skipped)', err);
+      // D1 (Office STATIC-RETURN-R1): a rejected pool close is a failed lifecycle
+      // cleanup, so it must count as a failure or the success tail would print
+      // PASS with default exit 0 after the checks had all passed.
+      failures += 1;
     }
   }
   console.log(failures === 0 ? '[witness] PASS' : `[witness] FAIL (${failures})`);
