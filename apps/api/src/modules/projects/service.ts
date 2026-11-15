@@ -776,12 +776,17 @@ export interface SubtaskAutomationSettings {
   closeSubtasks: boolean;
 }
 
+// WHY the executor parameter (sentinel-prod-8429): the landing path calls this inside its own transaction, and
+// a pool read there would judge a setting the caller's uncommitted write has not reached. The default keeps
+// every existing caller - including the project route - on the geometry it already had.
 export async function getSubtaskAutomationSettings(
   projectId: number,
+  executor: DbExecutor = db,
 ): Promise<SubtaskAutomationSettings> {
   const stored = await getProjectSetting<Partial<SubtaskAutomationSettings>>(
     projectId,
     SUBTASK_AUTOMATION_KEY,
+    executor,
   );
   return {
     completeParent: stored?.completeParent === true,
