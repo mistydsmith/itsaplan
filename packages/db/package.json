@@ -10,7 +10,8 @@
     "./tracker-rules": "./src/tracker-rules.ts",
     "./tracker-gate": "./src/tracker-gate.ts",
     "./tracker-issue-facts": "./src/tracker-issue-facts.ts",
-    "./tracker-close-facts": "./src/tracker-close-facts.ts"
+    "./tracker-close-facts": "./src/tracker-close-facts.ts",
+    "./tracker-skill-receipts": "./src/tracker-skill-receipts.ts"
   },
   "scripts": {
     "db:generate": "drizzle-kit generate",
