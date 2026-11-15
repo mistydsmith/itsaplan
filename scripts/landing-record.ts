@@ -321,7 +321,9 @@ export async function recordLanding(input: RecordInput): Promise<RecordResult> {
       // WHY the replay lookup lives under the lock: an identical second call must SEE the first record, and
       // it can only see it if it is serialised behind the same item lock.
       const prior = await tx.readActivities(input.item.itemKey);
-      const mine = prior.filter((entry) => entry.payload?.candidateSha === candidateSha);
+      const mine = prior.filter(
+        (entry) => entry.kind !== 'landing_cleanup' && entry.payload?.candidateSha === candidateSha,
+      );
       if (mine.length > 0) {
         if (mine.length === 1 && sameRecord(mine[0], row)) {
           return {
