@@ -10,10 +10,12 @@ import type { ImportSourceEntry } from '../../types/importSource';
 import SettingsImportExportPlane from './SettingsImportExportPlane';
 import SettingsImportExportLinear from './SettingsImportExportLinear';
 import SettingsImportExportTrello from './SettingsImportExportTrello';
+import SettingsImportExportBd from './SettingsImportExportBd';
 import SettingsImportExportJobList from './SettingsImportExportJobList';
 import SettingsImportExportPlaneLogo from './SettingsImportExportPlaneLogo';
 import SettingsImportExportLinearLogo from './SettingsImportExportLinearLogo';
 import SettingsImportExportTrelloLogo from './SettingsImportExportTrelloLogo';
+import SettingsImportExportBdLogo from './SettingsImportExportBdLogo';
 
 const CORE_SOURCES: ImportSourceEntry[] = [
   {
@@ -36,6 +38,13 @@ const CORE_SOURCES: ImportSourceEntry[] = [
     label: 'Trello',
     Logo: SettingsImportExportTrelloLogo,
     Component: SettingsImportExportTrello,
+  },
+  {
+    kind: 'source',
+    key: 'bd',
+    label: 'Beads',
+    Logo: SettingsImportExportBdLogo,
+    Component: SettingsImportExportBd,
   },
 ];
 
