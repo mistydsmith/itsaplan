@@ -129,6 +129,7 @@ async function fixtures(executor: Executor, tag: string) {
     projectId: project.id,
     sequenceNumber,
     identifier: `${projectKey}-${sequenceNumber}`,
+    beadId: null,
     typeId: type.id,
     initiative: null,
     cycle: null,
