@@ -19,7 +19,8 @@ import { HttpError, iso } from '#shared/lib';
 import { emitCommentEvent } from './webhook-payload';
 import { isAgentUser } from '#modules/agents/core/service';
 import {
-  commentOp,
+  buildCommentOp,
+  commentDeleteOp,
   gateCommentOp,
   insertVersion,
   liveCommentRows,
@@ -448,6 +449,7 @@ async function gatedCreateComment(input: {
         rigId: lockedRigId,
         body: input.params.body,
         reachedUserIds: actorIsAgent ? [] : agents.map((agent) => agent.userId),
+        actorUserId: input.actorUserId,
       });
       // The owner judges BEFORE the INSERT; a refusal rolls the whole write back.
       await gateIssueWrite({ rigId: lockedRigId, op });
@@ -582,33 +584,6 @@ async function assertReplyParent(
     throw new HttpError(400, 'replyToId must be a comment on this issue');
 }
 
-// The comment_create op the owner judges: the full post-write state built from the
-// locked rows — the card's labels and identity as stored, the retained comments in id
-// order, the incoming body last, with the routing facts routedCommentOp adds.
-async function buildCommentOp(
-  tx: DbExecutor,
-  input: {
-    issueId: number;
-    projectId: number;
-    rigId: number;
-    body: string;
-    reachedUserIds: string[];
-  },
-): Promise<Record<string, unknown>> {
-  // One builder for all three comment doors: this private shape stays what createComment calls, and the
-  // op itself comes from comment-history, so a create judges the same retained version bodies an edit
-  // does instead of only the live ones.
-  const facts = await ownerCardFacts(tx, input.issueId, input.rigId);
-  return routedCommentOp(tx, input.projectId, input.reachedUserIds, {
-    opName: 'comment_create',
-    facts,
-    versions: await storedVersionBodies(tx, input.issueId),
-    liveBefore: await liveCommentRows(tx, input.issueId),
-    superseded: [],
-    editBody: input.body,
-  });
-}
-
 // The comment a route guard resolves: the issue it hangs on, the project behind
 // that issue, and its author, which decides whether the caller may touch it. Only
 // comment rows count — an activity entry is a change log, not something to edit or
@@ -701,6 +676,7 @@ export async function updateComment(
           superseded: [locked.body],
           targetId: locked.commentId,
           editBody: body,
+          actorUserId,
         },
       );
       try {
@@ -796,7 +772,7 @@ export async function deleteComment(
     const cascade = await lockCommentCascade(tx, root);
     if (root.rigId !== null) {
       const facts = await ownerCardFacts(tx, root.issueId, root.rigId);
-      const op = commentOp({
+      const op = await commentDeleteOp(tx, {
         opName: 'comment_delete',
         facts,
         versions: await storedVersionBodies(tx, root.issueId),
@@ -805,6 +781,7 @@ export async function deleteComment(
         superseded: cascade.map((row) => row.body),
         // The whole locked cascade leaves the post-write list, not just the root.
         omitIds: cascade.map((row) => row.commentId),
+        actorUserId,
       });
       try {
         await gateCommentOp(root.rigId, op);

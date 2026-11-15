@@ -3,6 +3,12 @@ import { gateIssueWrite } from '@repo/db/tracker-gate';
 import { eq, sql } from 'drizzle-orm';
 import { HttpError } from '#shared/lib';
 import { routingFactsForText } from './lane-routing';
+import { commentOp, ownerCardFacts } from './comment-op-facts';
+import { actorKindOf } from './skill-facts';
+
+// commentOp and ownerCardFacts now live in comment-op-facts.ts (sentinel-prod-8429, the module-size ceiling); both stay importable
+// from here so every comment door and suite keeps the address it already uses.
+export { commentOp, ownerCardFacts } from './comment-op-facts';
 
 // The lock, history and owner-op facts the gated comment writers need, in one place.
 //
@@ -197,115 +203,18 @@ export async function insertVersion(
   return { revision };
 }
 
-// The card facts and identity the owner op is built from, read on the caller's transaction under its
-// locks. The bead id comes from the ledger scoped to the locked rig, never from a title.
-export async function ownerCardFacts(
-  executor: DbExecutor,
-  issueId: number,
-  rigId: number,
-): Promise<{
-  beadId: string;
-  rigPrefix: string;
-  title: string;
-  description: string;
-  labels: string[];
-}> {
-  const identity = (await executor.execute(sql`
-    SELECT b.local_token AS bead_id, r.prefix AS rig_prefix
-    FROM bead_identity b JOIN rig r ON r.id = b.rig_id
-    WHERE b.issue_id = ${issueId} AND b.rig_id = ${rigId}`)) as unknown as {
-    bead_id: string;
-    rig_prefix: string;
-  }[];
-  if (identity.length !== 1) {
-    throw new HttpError(
-      409,
-      'This issue holds no bead identity in its rig, so its comment cannot be judged',
-      'issue-without-identity',
-    );
-  }
-  const card = (await executor.execute(sql`
-    SELECT title, description FROM issue WHERE id = ${issueId}`)) as unknown as {
-    title: string;
-    description: string;
-  }[];
-  const labels = (await executor.execute(sql`
-    SELECT l.name FROM issue_label il JOIN label l ON l.id = il.label_id
-    WHERE il.issue_id = ${issueId} ORDER BY l.name`)) as unknown as { name: string }[];
-  return {
-    // The owner names a card by rig prefix plus ledger token, the same composed id W1 hands it.
-    beadId: `${identity[0].rig_prefix}-${identity[0].bead_id}`,
-    rigPrefix: identity[0].rig_prefix,
-    title: card[0]?.title ?? '',
-    description: card[0]?.description ?? '',
-    labels: labels.map((row) => row.name),
-  };
-}
-
-// The op the owner judges: the retained comments on both sides, the new body on the edit, and the live
-// list after the write. Built only from the facts read on this transaction.
-export function commentOp(input: {
-  opName: 'comment_create' | 'comment_edit' | 'comment_delete';
-  facts: Awaited<ReturnType<typeof ownerCardFacts>>;
-  // Stored version bodies only, oldest first.
-  versions: string[];
-  // The live comments in record order, including the one this write touches.
-  liveBefore: { id: number; body: string }[];
-  // The bodies this write supersedes, taken from the locked rows: the edited comment's old body, or
-  // every body a delete removes. Never a body the request supplied.
-  superseded: string[];
-  targetId?: number;
-  // The rows this write removes outright: a delete drops the root and every locked descendant, so the
-  // proposed live list is the remainder and the cascade is never appended back.
-  omitIds?: number[];
-  editBody?: string;
-}): Record<string, unknown> {
-  // An edit substitutes its body where it stands; a delete drops the whole omitted set; a create appends.
-  const liveAfter: string[] = [];
-  for (const row of input.liveBefore) {
-    if (input.omitIds?.includes(row.id)) continue;
-    if (input.targetId != null && row.id === input.targetId) {
-      if (input.opName === 'comment_edit') liveAfter.push(input.editBody ?? row.body);
-      continue;
-    }
-    liveAfter.push(row.body);
-  }
-  if (input.opName === 'comment_create') liveAfter.push(input.editBody ?? '');
-  const base = {
-    title: input.facts.title,
-    description: input.facts.description,
-    labels: input.facts.labels,
-    bead_id: input.facts.beadId,
-  };
-  const op: Record<string, unknown> = {
-    op: input.opName,
-    id: input.facts.beadId,
-    rig_prefix: input.facts.rigPrefix,
-    title: input.facts.title,
-    labels: input.facts.labels,
-    ...(input.editBody === undefined ? {} : { comment: input.editBody }),
-    // Retained history is the stored versions plus every live body as it stood before the write.
-    previous_state: {
-      ...base,
-      comments: [...input.versions, ...input.liveBefore.map((r) => r.body)],
-    },
-    // The post-write state keeps those, adds the bodies this write supersedes, and carries the live list
-    // as it will read afterwards - each unchanged body exactly once.
-    proposed_state: {
-      ...base,
-      comments: [...input.versions, ...input.superseded, ...liveAfter],
-    },
-  };
-  return op;
-}
-
-// The comment_create or comment_edit op with its routing facts.
+// The comment_create or comment_edit op with its actor kind and its routing facts.
 //
 // WHY every create and edit carries facts, reached agent or not (sentinel-prod-8364, Root
 // msg_9c74bb90114a): an op with no routing_facts goes to the owner's legacy rule, which reads no
 // mention, so a comment naming a fleet lane that has no agent here would pass. With facts the owner
 // refuses a mention that has no target. The texts are every body the owner is given, because it
-// reads mentions in all of them. A delete routes nobody and keeps calling commentOp.
+// reads mentions in all of them. A delete routes nobody and keeps calling commentOp without routing facts.
+//
+// WHY the actor kind rides with it (sentinel-prod-8429, Misty 2026-11-15: "i guarantee you EVERY block will block me too"): a
+// person commenting on her own card was judged as if she were a system write, so a lane the manifest cannot route refused her
+// before the owner ever spoke. The kind is read from her database rows on this transaction, and the routing seam is given the
+// same user id, so the router and the op cannot disagree about who wrote it. An agent's or a system comment keeps every refusal.
 export async function routedCommentOp(
   tx: DbExecutor,
   projectId: number,
@@ -313,6 +222,7 @@ export async function routedCommentOp(
   input: Parameters<typeof commentOp>[0],
 ): Promise<Record<string, unknown>> {
   const op = commentOp(input);
+  op.actor_kind = await actorKindOf(tx, input.actorUserId);
   const routed = await routingFactsForText(tx, {
     projectId,
     beadId: input.facts.beadId,
@@ -326,9 +236,54 @@ export async function routedCommentOp(
       input.editBody ?? '',
     ],
     userIds: reachedUserIds,
+    actorUserId: input.actorUserId,
   });
   op.routing_facts = routed.facts;
   return op;
+}
+
+// The comment_delete op with its actor kind and, exactly as before, no routing facts.
+//
+// WHY (sentinel-prod-8429): the owner is given the same database-derived actor kind a create or an edit carries, so a person
+// deleting a thread is not judged as a system write, while a delete still routes nobody and reaches no lane decision it never reached.
+export async function commentDeleteOp(
+  tx: DbExecutor,
+  input: Parameters<typeof commentOp>[0],
+): Promise<Record<string, unknown>> {
+  const op = commentOp(input);
+  op.actor_kind = await actorKindOf(tx, input.actorUserId);
+  return op;
+}
+
+// The comment_create op the owner judges: the full post-write state built from the locked rows - the card's labels and identity
+// as stored, the retained comments in id order, the incoming body last, with the routing facts routedCommentOp adds.
+//
+// WHY it stands here and not in activity.ts (sentinel-prod-8429): it is one of the three comment doors' op builders, its actor kind
+// is read on the transaction it builds on, and activity.ts already stands over the module-size ceiling, so the builder moved to the
+// file whose stated job is the owner-op facts the gated comment writers need. Same doors, same order, same refusal.
+export async function buildCommentOp(
+  tx: DbExecutor,
+  input: {
+    issueId: number;
+    projectId: number;
+    rigId: number;
+    body: string;
+    reachedUserIds: string[];
+    actorUserId: string | null;
+  },
+): Promise<Record<string, unknown>> {
+  // One builder for all three comment doors: this shape stays what createComment calls, and the op itself comes from commentOp, so
+  // a create judges the same retained version bodies an edit does instead of only the live ones.
+  const facts = await ownerCardFacts(tx, input.issueId, input.rigId);
+  return routedCommentOp(tx, input.projectId, input.reachedUserIds, {
+    opName: 'comment_create',
+    facts,
+    versions: await storedVersionBodies(tx, input.issueId),
+    liveBefore: await liveCommentRows(tx, input.issueId),
+    superseded: [],
+    editBody: input.body,
+    actorUserId: input.actorUserId,
+  });
 }
 
 // The root and every comment reply under it, locked to a fixed point.

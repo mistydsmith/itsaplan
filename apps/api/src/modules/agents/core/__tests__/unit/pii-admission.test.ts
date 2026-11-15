@@ -11,6 +11,7 @@ import {
 } from '@repo/db/tracker-rules';
 import * as admission from '../../pii-admission';
 import { routingFactsForUsers } from '../../../../issues/lane-routing';
+import { commentDeleteOp, routedCommentOp } from '../../../../issues/comment-history';
 
 // 8429 row 29, A: one focused mutation pair against the ACTUAL production helper.
 //
@@ -172,14 +173,20 @@ const LANE_ROWS = [
 ];
 
 function routerTx(actorRows: unknown[]): DbExecutor {
-  let reads = 0;
   const chain = (rows: unknown[]) => {
     const result = Promise.resolve(rows) as Promise<unknown> & { limit: () => Promise<unknown> };
     result.limit = () => Promise.resolve(rows.slice(0, 1));
     return result;
   };
+  // WHY the read is answered by what was asked for and not by its order: the comment doors read the actor kind before they route,
+  // the outbound delivery reads it inside the router, and a seam that answered by order would decide the actor kind by accident.
+  // A select of the lane rows asks for a username; actorKindOf asks for an id.
+  const read = (shape: unknown) =>
+    chain(
+      shape != null && typeof shape === 'object' && 'username' in shape ? LANE_ROWS : actorRows,
+    );
   return {
-    select: () => ({ from: () => ({ where: () => chain(++reads === 1 ? LANE_ROWS : actorRows) }) }),
+    select: (shape: unknown) => ({ from: () => ({ where: () => read(shape) }) }),
   } as unknown as DbExecutor;
 }
 
@@ -232,5 +239,57 @@ describe('8429: the routing seam judged on the actor behind the write', () => {
       }
     }
     expect(codes).toEqual(['lane-unrouted', 'lane-unrouted']);
+  });
+
+  // The comment doors carry the same database-derived actor kind the issue write carries (sentinel-prod-8429).
+  const commentFacts = {
+    beadId: 'MKT-42',
+    rigPrefix: 'MKT',
+    title: 'a card whose named lane the manifest cannot route',
+    description: 'this text names no handle',
+    labels: [] as string[],
+  };
+  const commentInput = (actorUserId: string | null) => ({
+    opName: 'comment_create' as const,
+    facts: commentFacts,
+    versions: [],
+    liveBefore: [],
+    superseded: [],
+    editBody: 'progress: the card moved',
+    actorUserId,
+  });
+
+  it('a person commenting on that card is judged a person and reaches the owner unrouted', async () => {
+    const op = await routedCommentOp(routerTx([]), 7, ['bot-user-2'], commentInput('person-1'));
+    expect(op.actor_kind).toBe('human');
+    expect(op.routing_facts).toBeNull();
+  });
+
+  it('an agent comment and a comment with no user keep the lane-unrouted refusal unchanged', async () => {
+    const codes: (string | undefined)[] = [];
+    for (const actorUserId of ['bot-user-1', null]) {
+      try {
+        await routedCommentOp(routerTx([{ id: 1 }]), 7, ['bot-user-2'], commentInput(actorUserId));
+        codes.push(undefined);
+      } catch (error) {
+        codes.push((error as { code?: string }).code);
+      }
+    }
+    expect(codes).toEqual(['lane-unrouted', 'lane-unrouted']);
+  });
+
+  it('a delete carries the actor kind of the user who deleted it and still routes nobody', async () => {
+    const kinds: unknown[] = [];
+    for (const actorUserId of ['person-1', 'bot-user-1', null]) {
+      const op = await commentDeleteOp(routerTx(actorUserId === 'bot-user-1' ? [{ id: 1 }] : []), {
+        ...commentInput(actorUserId),
+        opName: 'comment_delete',
+        omitIds: [41],
+      });
+      kinds.push(op.actor_kind);
+      // A delete has never carried routing facts, and it still carries none, whatever the actor is.
+      expect(op.routing_facts).toBeUndefined();
+    }
+    expect(kinds).toEqual(['human', 'agent', 'system']);
   });
 });
