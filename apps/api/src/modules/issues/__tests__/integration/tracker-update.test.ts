@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from 'bun:test';
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
+import { tempManifest } from '#tests/helpers/temp-manifest';
 // The gated update: what the shared @repo/db gate refuses on a rig-gated project, and what it
 // leaves untouched — the same reviewed Python owner the create suites use, no mock, no stub.
 // DATABASE HELD: without the grant flag this file refuses before any client exists; it never
@@ -11,7 +12,8 @@ import { readFileSync } from 'node:fs';
 const REQUIRED_DB = 'itsaplan_8364_d2_test';
 const LOOPBACK = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
 const GRANT = 'ITSAPLAN_8364_D3_UPDATE_PROOF';
-const OWNER_CONFIG = '/Users/misty/Output/reports/8364_root_policy_owner_R3/CONFIG.json';
+const OWNER_CONFIG =
+  '/Users/misty/Output/reports/itsaplan_cutover_20261114_ROOT_R1/8364_owner_composition/CONFIG.json';
 const MARK = 'zz_qwen3_d3uw';
 const RIG_PREFIX = `q3uw${randomUUID().replace(/-/g, '')}`;
 type Fixture = {
@@ -149,6 +151,38 @@ async function user(suffix: string): Promise<string> {
   );
   return id;
 }
+// The owner config plus a routing section, written to a test-owned temp file. The pins are the
+// reviewed ones; only the routing section is added.
+// The copy is removed at process exit.
+const ROUTING_MANIFEST = tempManifest('tracker-routing-', {
+  ...OWNER,
+  routing: { lanes: { qwen2: { execution: 'local' }, codex_prime: { execution: 'cloud' } } },
+}).path;
+const withRouting = <T>(run: () => Promise<T>) =>
+  withGateEnv([OWNER.python, OWNER.owner, ROUTING_MANIFEST], run);
+// An agent of the project's team that works in the project: a bot user, its ai_agent row and
+// its membership. Deleting the user removes all three.
+async function agent(projectId: number, username: string): Promise<string> {
+  const userId = await user(`agent-${username.toLowerCase()}`);
+  await db.execute(
+    sql`INSERT INTO ai_agent (team_id, user_id, username, kind)
+        VALUES ((SELECT team_id FROM project WHERE id = ${projectId}), ${userId}, ${username}, 'external')`,
+  );
+  await db.execute(
+    sql`INSERT INTO project_member (project_id, user_id) VALUES (${projectId}, ${userId})`,
+  );
+  return userId;
+}
+// A label the gated create would refuse today, attached directly so the update is what is judged.
+async function attachLabel(projectId: number, issueId: number, name: string): Promise<void> {
+  const labelId = await makeRow(
+    'label',
+    sql`INSERT INTO label (project_id, name) VALUES (${projectId}, ${name}) RETURNING id`,
+  );
+  await db.execute(
+    sql`INSERT INTO issue_label (issue_id, label_id) VALUES (${issueId}, ${labelId})`,
+  );
+}
 async function gatedIssue(p: Fixture, title: string, description: string, columnId?: number) {
   const projectRow = await getProjectById(p.id);
   if (!projectRow) throw new Error('project missing');
@@ -247,41 +281,113 @@ describe('the gated update boundary', () => {
     expect(after?.columnId).toBe(p.secondColumnId);
     expect(await board(p.id)).toMatchObject({ issues: 1, activity: before.activity + 1 });
   }, 90_000);
-  it('refuses the auto-assignment a move into an open column carries, with no routing facts to judge it', async () => {
+  // A person is not a lane: the routing facts carry no target and the owner allows the write.
+  it('allows the auto-assignment of a person that a move into an open column carries', async () => {
     const auto = await user('auto');
     const p = await fixture(true, { stateType: 'started', autoAssign: auto });
     const card = await gatedIssue(p, 'Auto assignee', 'Moved into a column that assigns.');
-    const before = await board(p.id);
-    const refusal = await withOwner(() =>
-      refusalOf(() => updateIssue(card.id, { columnId: p.secondColumnId })),
-    );
-    expect([refusal.status, refusal.code]).toEqual([409, 'tracker-rules-violation']);
-    expect(refusal.message).toInclude('routing_facts');
+    await withOwner(() => updateIssue(card.id, { columnId: p.secondColumnId }));
     const row = await one<{ column_id: number; assignee_user_id: string | null }>(
       sql`SELECT column_id, assignee_user_id FROM issue WHERE id = ${card.id}`,
     );
-    expect([row.column_id, row.assignee_user_id]).toEqual([p.columnId, null]);
-    expect(await board(p.id)).toEqual(before);
+    expect([row.column_id, row.assignee_user_id]).toEqual([p.secondColumnId, auto]);
   }, 90_000);
-  it('refuses a gated assignee change on its own, with no routing facts to judge it', async () => {
+  it('allows a gated assignee change to a person', async () => {
     const member = await user('member');
     const p = await fixture(true, { stateType: 'started' });
     await db.execute(
       sql`INSERT INTO project_member (project_id, user_id) VALUES (${p.id}, ${member})`,
     );
     const card = await gatedIssue(p, 'Assign someone', 'The card the assignee would take.');
-    const before = await board(p.id);
-    const refusal = await withOwner(() =>
-      refusalOf(() => updateIssue(card.id, { assigneeUserId: member })),
-    );
-    expect([refusal.status, refusal.code]).toEqual([409, 'tracker-rules-violation']);
-    expect(refusal.message).toInclude('routing_facts');
+    await withOwner(() => updateIssue(card.id, { assigneeUserId: member }));
     const row = await one<{ assignee_user_id: string | null }>(
       sql`SELECT assignee_user_id FROM issue WHERE id = ${card.id}`,
     );
-    expect(row.assignee_user_id).toBeNull();
-    expect(await board(p.id)).toEqual(before);
+    expect(row.assignee_user_id).toBe(member);
   }, 90_000);
+  it('judges a gated create by the agent its description names', async () => {
+    const p = await fixture(true, { stateType: 'started' });
+    const projectRow = await getProjectById(p.id);
+    if (!projectRow) throw new Error('project missing');
+    const named = (title: string) =>
+      withRouting(() =>
+        createIssue(projectRow, {
+          columnId: p.columnId,
+          title,
+          description: 'Ordinary work for @qwen2.',
+          labelIds: p.labelIds,
+          parentId: null,
+        }),
+      );
+    // No agent in the project stands behind the name, so the facts hold no target.
+    const before = await board(p.id);
+    const refused = await refusalOf(() => named('Named with no agent'));
+    expect([refused.status, refused.code]).toEqual([409, 'tracker-rules-violation']);
+    expect(refused.message).toInclude('routing_facts.targets is empty');
+    expect(await board(p.id)).toEqual(before);
+    // With the agent in the project and the lane listed as local, the same create is allowed.
+    await agent(p.id, 'qwen2');
+    const created = await named('Named with an agent');
+    made.issue.push(created.id);
+    const row = await one<{ bead_id: string | null }>(
+      sql`SELECT bead_id FROM issue WHERE id = ${created.id}`,
+    );
+    if (row.bead_id) minted.push(row.bead_id);
+    expect(row.bead_id).not.toBeNull();
+  }, 90_000);
+  it('routes a delegated agent by its stored username and the manifest, never by the request', async () => {
+    const p = await fixture(true, { stateType: 'started' });
+    const qwen = await agent(p.id, 'qwen2');
+    const codex = await agent(p.id, 'Codex_Prime');
+    const ornith = await agent(p.id, 'ornith');
+    const delegateOf = async (issueId: number) =>
+      (
+        await one<{ delegate_user_id: string | null }>(
+          sql`SELECT delegate_user_id FROM issue WHERE id = ${issueId}`,
+        )
+      ).delegate_user_id;
+
+    // A local Qwen lane takes an ordinary card.
+    const plain = await gatedIssue(p, 'Plain card', 'Ordinary work for a local lane.');
+    await withRouting(() => updateIssue(plain.id, { delegateUserId: qwen }));
+    expect(await delegateOf(plain.id)).toBe(qwen);
+
+    // A cloud lane is refused while the card has no pii class, and allowed once it is pii_free.
+    const cloud = await gatedIssue(p, 'Cloud card', 'Ordinary work for a cloud lane.');
+    const noClass = await withRouting(() =>
+      refusalOf(() => updateIssue(cloud.id, { delegateUserId: codex })),
+    );
+    expect([noClass.status, noClass.code]).toEqual([409, 'tracker-rules-violation']);
+    expect(noClass.message).toInclude('cloud execution target');
+    expect(await delegateOf(cloud.id)).toBeNull();
+    await attachLabel(p.id, cloud.id, 'pii:pii_free');
+    await withRouting(() => updateIssue(cloud.id, { delegateUserId: codex }));
+    expect(await delegateOf(cloud.id)).toBe(codex);
+
+    // A lane the manifest does not list refuses before the owner runs.
+    const unlisted = await withRouting(() =>
+      refusalOf(() => updateIssue(plain.id, { delegateUserId: ornith })),
+    );
+    expect([unlisted.status, unlisted.code]).toEqual([409, 'lane-unrouted']);
+    expect(await delegateOf(plain.id)).toBe(qwen);
+
+    // The same manifest with no routing section refuses every lane and still allows a person.
+    const bare = await gatedIssue(p, 'Bare manifest', 'No routing section is configured.');
+    const noSection = await withOwner(() =>
+      refusalOf(() => updateIssue(bare.id, { delegateUserId: qwen })),
+    );
+    expect([noSection.status, noSection.code]).toEqual([409, 'lane-unrouted']);
+
+    // A Qwen lane on a legal-template card is refused with no write. The owner answers the
+    // templates-skill rule first, so the lane wording is proven in tracker_routing_facts.test.ts.
+    const legal = await gatedIssue(p, 'Template card', 'Work that will touch a template.');
+    await attachLabel(p.id, legal.id, 'legal-template');
+    const refused = await withRouting(() =>
+      refusalOf(() => updateIssue(legal.id, { delegateUserId: qwen })),
+    );
+    expect([refused.status, refused.code]).toEqual([409, 'tracker-rules-violation']);
+    expect(await delegateOf(legal.id)).toBeNull();
+  }, 240_000);
   it('judges the locked row, not the stale pool read, when a writer holds the card', async () => {
     const p = await fixture(true, { stateType: 'started' });
     const card = await gatedIssue(p, 'Stale pool', 'The description the pool saw.');

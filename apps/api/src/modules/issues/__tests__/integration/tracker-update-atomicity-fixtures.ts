@@ -7,8 +7,10 @@ import { sql } from 'drizzle-orm';
 const REQUIRED_DB = 'itsaplan_8364_d2_test';
 const LOOPBACK = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
 const GRANT = 'ITSAPLAN_8364_D4_UPDATE_ATOMICITY';
-// Root's immutable R3 pin (the safe-forms map fix); the R2 config stays untouched for its own runs.
-const OWNER_CONFIG = '/Users/misty/Output/reports/8364_root_policy_owner_R3/CONFIG.json';
+// Root's immutable owner composition pin (close/routing/skills in one manifest); the older R2 and R3 configs stay
+// untouched for their own runs.
+const OWNER_CONFIG =
+  '/Users/misty/Output/reports/itsaplan_cutover_20261114_ROOT_R1/8364_owner_composition/CONFIG.json';
 export const MARK = 'zz_a4_d4_update';
 
 function grantAndTarget(): void {
