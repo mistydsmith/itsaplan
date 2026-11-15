@@ -1,22 +1,39 @@
 # Git hooks manager. Commands run sequentially in the order below.
-# eslint --fix runs first, then prettier --write, so formatting always wins.
+# module-size runs first, then eslint --fix, then prettier --write, so formatting always wins.
 # stage_fixed re-stages files the tools modified, so fixes land in the commit.
 #
 # eslint runs from the repo root, and a flat config is resolved from the working
 # directory, so without v10_config_lookup_from_file every staged file would be
 # linted with the root config instead of the one in its own app or package.
+# module-size runs first and changes no file, so a commit that is already too long is refused before eslint and
+# prettier rewrite anything. module-size-final runs the same guard after prettier, because a formatter can reflow
+# a 400 line file to 401 and the committed bytes are the ones that must meet the limit. Neither has a glob, because
+# the guard asks git for the staged files itself.
+# WHY prettier stages its own files: measured against lefthook 2.2.2, stage_fixed re-stages only after every command
+# in the hook has finished, so module-size-final read the index before the reflowed file reached it and passed a
+# 401 line file. prettier's glob covers every eslint glob, so this one git add also stages the eslint fixes before
+# the final guard. It names only the staged files prettier was given, never the whole tree, and lefthook has already
+# hidden the unstaged part of a partly staged file, so no unstaged work is pulled into the commit. Do not replace it
+# with stage_fixed alone. scripts/module-size-guard.test.ts runs lefthook against this file to hold the order.
+# The rule and its reasons are in scripts/module-size-guard.ts (sentinel-prod-8429 inventory row 2).
 pre-commit:
   commands:
-    eslint:
+    module-size:
       priority: 1
+      run: bun run scripts/module-size-guard.ts
+    eslint:
+      priority: 2
       glob: '*.{js,jsx,ts,tsx,mjs,cjs}'
       run: bunx eslint --flag v10_config_lookup_from_file --fix --no-warn-ignored {staged_files}
       stage_fixed: true
     prettier:
-      priority: 2
+      priority: 3
       glob: '*.{js,jsx,ts,tsx,mjs,cjs,json,jsonc,css,scss,md,mdx,yml,yaml,html}'
-      run: bunx prettier --ignore-unknown --write {staged_files}
+      run: bunx prettier --ignore-unknown --write {staged_files} && git add -- {staged_files}
       stage_fixed: true
+    module-size-final:
+      priority: 4
+      run: bun run scripts/module-size-guard.ts
 
 # Bead-id commit-msg guard (sentinel-prod-8429 inventory row 1, carried from sentinel-prod/.beads/hooks/commit-msg,
 # bead sentinel-prod-ky5e): every commit subject must name the bead, because isolation says WHERE code landed and
