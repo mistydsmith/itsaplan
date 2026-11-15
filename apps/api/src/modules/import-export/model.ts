@@ -88,10 +88,22 @@ const trelloImportJobBody = t.Object({
   ...importJobChoices,
 });
 
+// A local bd board: the board directory and the bd executable are privileged server
+// config (BD_IMPORT_BOARD_ROOT / BD_IMPORT_BD_COMMAND, see bd.ts), so the body carries
+// no path and no command - and no tree cap either: every bd import requires a rig
+// target, so the server reader derives the (uncapped) depth; the old maxDepth
+// knob was removed as a dead control (Studio 2026-11-15 GO).
+const bdImportJobBody = t.Object({
+  source: t.Literal('bd'),
+  sourceName: t.Optional(t.String({ minLength: 1, description: 'The name the job card shows.' })),
+  ...importJobChoices,
+});
+
 export const createImportJobBody = t.Union([
   planeImportJobBody,
   linearImportJobBody,
   trelloImportJobBody,
+  bdImportJobBody,
 ]);
 
 export const testConnectionBody = t.Object({
@@ -155,6 +167,23 @@ export const trelloPreviewBody = t.Object({
 export const TrelloPreviewResponse = t.Object({
   states: PlanePreviewResponse.properties.states,
   members: t.Array(t.Object({ id: t.String(), fullName: t.String(), username: t.String() })),
+});
+
+// The board itself is server config, so the connection and preview bodies are empty;
+// the handler refuses with a clear message when the server has no bd board configured.
+export const bdConnectionBody = t.Object({});
+
+export const BdTestConnectionResponse = t.Object({
+  board: t.String(),
+  cards: t.Numeric(),
+  states: t.Array(t.Object({ id: t.String(), name: t.String(), category: stateCategory })),
+});
+
+export const bdPreviewBody = bdConnectionBody;
+
+export const BdPreviewResponse = t.Object({
+  cards: t.Numeric(),
+  states: t.Array(t.Object({ id: t.String(), name: t.String(), category: stateCategory })),
 });
 
 // Mirrors import_record_source_entity_type_check in packages/db/src/schema/app.ts.
