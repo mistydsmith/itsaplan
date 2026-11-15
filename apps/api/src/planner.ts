@@ -51,6 +51,8 @@ import { userPreferenceRoutes } from './modules/user-preferences';
 import { connectedAppRoutes } from './modules/connected-apps';
 import { telegramRoutes } from './modules/telegram';
 import { syncRoutes } from './modules/sync';
+import { trackerClaimRoutes } from './modules/tracker-claims';
+import { trackerSkillRoutes } from './modules/tracker-skills';
 import { linkPreviewRoutes } from './modules/link-previews';
 
 // The planner API: projects and their columns, issue types, labels, AI agents,
@@ -120,6 +122,8 @@ export const planner = new Elysia({ name: 'planner' })
   .use(connectedAppRoutes)
   .use(telegramRoutes)
   .use(syncRoutes)
+  .use(trackerClaimRoutes)
+  .use(trackerSkillRoutes)
   .use(linkPreviewRoutes)
   .use(settingsRoutes)
   .use(godRoutes);
