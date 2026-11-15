@@ -1,4 +1,13 @@
 import { describe, it, expect, beforeEach } from 'bun:test';
+import { readFileSync, rmSync, writeFileSync, mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { db, agentRun } from '@repo/db';
+import { checkTrackerRules, type TrackerRulesAnswer, type TrackerRulesConfig } from '@repo/db/tracker-rules';
+import { and, eq } from 'drizzle-orm';
+import * as piiAdmission from '../../../core/pii-admission';
+import * as runnerService from '../../service';
 import { apiKeyApi, authedApi, type Api, createProject } from '#tests/helpers/app';
 import { signUpTestUser } from '#tests/helpers/auth';
 import { resetDb } from '#tests/helpers/db';
@@ -37,6 +46,9 @@ async function queueRun(asOwner: Api, columnId: number, username: string) {
   await asOwner.issues({ issueId: issue.id }).comments.post({ body: `please review @${username}` });
   return issue;
 }
+
+// The ops the synthetic owner was given, across both halves of the mutation pair.
+const seenOps: Record<string, unknown>[] = [];
 
 describe('agent runner queue', () => {
   beforeEach(async () => {
@@ -236,5 +248,111 @@ describe('agent runner queue', () => {
     const run = (await asRunner['agent-runs'].claim.post()).data!.run!;
     expect(run).toMatchObject({ trigger: 'manual', issueId: null, issueIdentifier: null });
     expect(run.prompt).toContain('Triage the new issues.');
+  });
+
+  // Outbound PII admission (8429 row 29, B): the gate inside takeNextRun runs before the
+  // framed prompt leaves the server. The control drives the ACTUAL production claim: a
+  // run the (synthetic) rule owner refuses must fail permanently with the owner's named
+  // reason, and no framed prompt is handed out. The one targeted mutation removes the
+  // actual admitRunnerDelivery call from a throwaway copy of the real service source;
+  // the same claim through the mutated copy must observe the forbidden framed prompt.
+  // Synthetic data and transport only: the owner answer and the rule manifest; the
+  // production seam is the imported service, not a re-implementation of it.
+  it('refuses the run before the framed prompt leaves; the severed call hands it out', async () => {
+    const { asOwner, agent, columnId } = await setup();
+    await queueRun(asOwner, columnId, agent.username);
+    await queueRun(asOwner, columnId, agent.username);
+
+    const dir = mkdtempSync(join(tmpdir(), 'pii-admission-b-'));
+    const manifestPath = join(dir, 'manifest.json');
+    writeFileSync(
+      manifestPath,
+      JSON.stringify({
+        pythonSha256: 'a'.repeat(64),
+        fileSha256: { '/usr/bin/python3': 'a'.repeat(64) },
+        routing: {
+          lanes: {
+            [agent.username.toLowerCase()]: { execution: 'cloud' },
+            'local-lane': { execution: 'local' },
+          },
+          grants: [],
+        },
+      }),
+    );
+    const prior: Record<string, string | undefined> = {};
+    for (const [key, value] of Object.entries({
+      TRACKER_RULES_PYTHON: '/usr/bin/python3',
+      TRACKER_RULES_OWNER: join(dir, 'owner.py'),
+      TRACKER_RULES_MANIFEST: manifestPath,
+    })) {
+      prior[key] = process.env[key];
+      process.env[key] = value;
+    }
+    const ownerMessage = 'unknown-privacy work may not be routed to a cloud lane';
+    const owner = async (
+      _config: TrackerRulesConfig,
+      op: Record<string, unknown>,
+    ): Promise<TrackerRulesAnswer> => {
+      seenOps.push(op);
+      return { ok: false, code: 'tracker-rules-nonzero-exit', message: ownerMessage };
+    };
+    piiAdmission.setPiiAdmissionOwner(owner);
+    const agentRow = (await runnerService.getRunnerAgent(agent.userId))!;
+    try {
+      const control = await runnerService.takeNextRun(agentRow);
+      console.log('[control] claim:', JSON.stringify(control), '(refused before framing)');
+      expect(control).toBeNull();
+      // Permanent, named, no retry: the run row holds the owner's words, not a retry.
+      const [failed] = await db
+        .select()
+        .from(agentRun)
+        .where(and(eq(agentRun.agentId, agentRow.id), eq(agentRun.status, 'failed')))
+        .limit(1);
+      expect(failed).toMatchObject({ status: 'failed', lastError: ownerMessage });
+      // The op the owner was given: the routing-decision state shape on the run's
+      // trusted native facts, with the dispatch context id for a bead-less issue.
+      const op = seenOps.at(-1)!;
+      expect(op.op).toBe('state');
+      expect(op.id).toBe(`run-${failed.id}`);
+      expect(op).not.toHaveProperty('proposed_state');
+      expect(op.routing_facts).toMatchObject({
+        targets: [{ lane: agent.username.toLowerCase(), execution: 'cloud' }],
+      });
+
+      // The one targeted mutation: remove the actual gate call from a throwaway copy
+      // of the real service source and run the same claim through the mutated copy.
+      const servicePath = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'service.ts');
+      const source = readFileSync(servicePath, 'utf8');
+      const GATE =
+        /[ ]{2}\/\/ Outbound PII admission \(8429 row 29, B\):[\s\S]*?[ ]{2}if \(!admission\.ok\) \{\n[ ]{4}await markRunFailed\(row\.id, admission\.message\);\n[ ]{4}return null;\n[ ]{2}\}\n/;
+      expect(source).toMatch(GATE);
+      const mutated = source.replace(GATE, '');
+      expect(mutated).not.toBe(source);
+      const mutantPath = join(dirname(servicePath), `service.mutant-${process.pid}.ts`);
+      writeFileSync(mutantPath, mutated);
+      try {
+        const mutant = await import(pathToFileURL(mutantPath).href);
+        // The mutated copy imports the same landed helper module, so the synthetic
+        // owner is already its seam; the copy only lacks the actual gate call.
+        const forbidden = await mutant.takeNextRun(agentRow);
+        console.log(
+          '[mutant]  claim prompt handed out:',
+          JSON.stringify(forbidden?.prompt?.slice(0, 60)),
+          '(actual gate call severed -> forbidden dispatch observed)',
+        );
+        expect(forbidden).not.toBeNull();
+        expect(forbidden!.prompt).toContain('You were mentioned');
+        expect(forbidden!.prompt).toContain('please review');
+      } finally {
+        rmSync(mutantPath, { force: true });
+      }
+    } finally {
+      piiAdmission.setPiiAdmissionOwner(checkTrackerRules);
+      for (const [key, value] of Object.entries(prior)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

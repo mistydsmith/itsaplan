@@ -7,12 +7,14 @@ import {
   runTurn,
   loadRunThread,
   markRunExecuting,
+  markRunFailed,
   runRetryDelayMs,
   scheduleRunRetry,
 } from '../core/run-queue';
 import { agentRunStarted, recordAgentRunFinished } from '../core/run-activity';
 import { emitRunsFinished } from '../core/run-finished';
 import { runAdmissionDelay } from '../core/run-admission';
+import { admitRunnerDelivery } from '../core/pii-admission';
 import type { AgentKind } from '../core/service';
 import type { AgentRunTrigger } from '../model';
 import {
@@ -109,6 +111,14 @@ type ClaimedRow = Omit<RunnerRun, 'systemPrompt' | 'traceEvents'> & {
   projectName: string;
   projectDescription: string;
   issueTitle: string | null;
+  // The run's trusted native facts for the outbound PII admission: the stored bead
+  // id, the retained description, the column state, the stored labels, and the
+  // project's rig prefix. Null for a run with no issue, or a deleted one.
+  issueBeadId: string | null;
+  issueDescription: string | null;
+  issueColumnState: string | null;
+  issueLabels: string[] | null;
+  rigPrefix: string | null;
   assigneeName: string | null;
   assigneeUsername: string | null;
   requesterName: string | null;
@@ -201,6 +211,14 @@ export async function takeNextRun(agent: RunnerAgent): Promise<RunnerRun | null>
       (SELECT p.key || '-' || i.sequence_number
          FROM issue i JOIN project p ON p.id = i.project_id
          WHERE i.id = r.issue_id) AS "issueIdentifier",
+      (SELECT i.bead_id FROM issue i WHERE i.id = r.issue_id) AS "issueBeadId",
+      (SELECT i.description FROM issue i WHERE i.id = r.issue_id) AS "issueDescription",
+      (SELECT c.state_type FROM project_column c
+         WHERE c.id = (SELECT column_id FROM issue i WHERE i.id = r.issue_id)) AS "issueColumnState",
+      (SELECT g.prefix FROM bead_identity b JOIN rig g ON g.id = b.rig_id
+         WHERE b.issue_id = r.issue_id) AS "rigPrefix",
+      (ARRAY(SELECT l.name FROM issue_label il JOIN label l ON l.id = il.label_id
+             WHERE il.issue_id = r.issue_id ORDER BY l.name)) AS "issueLabels",
       (SELECT title FROM issue i WHERE i.id = r.issue_id) AS "issueTitle",
       (SELECT u.name FROM issue i JOIN "user" u ON u.id = i.assignee_user_id
          WHERE i.id = r.issue_id) AS "assigneeName",
@@ -222,6 +240,24 @@ export async function takeNextRun(agent: RunnerAgent): Promise<RunnerRun | null>
   const wait = await runAdmissionDelay({ ...row, agentId });
   if (wait > 0) {
     await deferRun(row.id, wait);
+    return null;
+  }
+  // Outbound PII admission (8429 row 29, B): the framed prompt is about to leave the
+  // server for an external agent, so the pinned rule owner judges the run's trusted
+  // native facts first. Both delivery modes share this takeNextRun path, so the gate
+  // covers the pull claim and the invocation push alike. Refused before anything is
+  // recorded on the issue, and not retried: the attempt would be refused the same way.
+  const admission = await admitRunnerDelivery(db, {
+    contextId: row.issueBeadId ?? `run-${row.id}`,
+    rigPrefix: row.rigPrefix ?? '',
+    title: row.issueTitle ?? '',
+    description: row.issueDescription ?? '',
+    labels: row.issueLabels ?? [],
+    columnState: row.issueColumnState ?? '',
+    agentUserId: agent.userId,
+  });
+  if (!admission.ok) {
+    await markRunFailed(row.id, admission.message);
     return null;
   }
   const forPrompt = {
