@@ -24,6 +24,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { recordActivity } from './activity';
+import { chainStampedAnchors } from './anchor-chain';
 
 // Same anchor grammar the shared tool matches: a repo path with a code
 // extension, optionally a :line or :line-range, plus path::Symbol@hash12 refs.
@@ -155,6 +156,31 @@ export function fileRefs(body: string): string[] {
   return [...out].sort();
 }
 
+// The line ranges a body's anchors name, per file, lowest start first: what the same-file
+// blocks chain needs to order two issues holding the same file (8427 item 7). The file set is
+// fileRefs itself - one grammar, no second matcher - and a file named with no line (a
+// path::Symbol@hash anchor) is listed with no starts, which is the shared rule's creation/id
+// fallback case rather than a guessed line.
+export interface AnchorRange {
+  file: string;
+  starts: number[];
+}
+
+export function anchorRanges(body: string): AnchorRange[] {
+  const starts = new Map<string, number[]>();
+  for (const match of body.match(LINE_ANCHOR) ?? []) {
+    const at = match.lastIndexOf(':');
+    const file = match.slice(0, at).replace(/^(\.\/)+/, '');
+    const start = Number(match.slice(at + 1).split('-')[0]);
+    if (!starts.has(file)) starts.set(file, []);
+    if (Number.isFinite(start)) starts.get(file)!.push(start);
+  }
+  return fileRefs(body).map((file) => ({
+    file,
+    starts: (starts.get(file) ?? []).slice().sort((a, b) => a - b),
+  }));
+}
+
 // Outcome of one stamp attempt, told apart by kind so a stamp that could not
 // run is never counted as a noop (A4 R2 item 4).
 export type StampOutcome =
@@ -202,6 +228,13 @@ export async function stampIssueAnchors(
     await recordActivity(issueId, [{ action: 'anchor_map_stamped', subject: { value: text } }], {
       system: 'AnchorMap',
     });
+    // Tail integration (8427 items 7 and 10): the same-file blocks chain runs after this
+    // issue's own map is in the store, because the chain is about the ORDER anchors land in.
+    // It is the sanctioned auto hook: it names the internal system actor itself, so it needs no
+    // configuration step, and it cannot write anything the shared rule did not plan. It never turns
+    // a good stamp into a failure: every outcome, including a planner that could not run, comes back
+    // as an outcome and records its own report entry.
+    await chainStampedAnchors(issueId, anchorRanges(body));
     return { status: 'stamped', text };
   } catch (error) {
     // The map itself could not be stored or recorded: a failure, not a noop.
