@@ -72,6 +72,10 @@ function check(name: string, cond: boolean, detail = ''): void {
 interface Owned {
   workspaceId: number | null;
   teamId: number | null;
+  // The bot user's id, held only once THIS invocation's insert returned it: cleanup
+  // deletes the user only then, so a preexisting collision or an earlier setup failure
+  // never issues a foreign fixed-ID delete. Cleared after the cleanup that used it.
+  userId: string | null;
   projectId: number | null;
   agentId: number | null;
   runId: number | null;
@@ -89,7 +93,8 @@ async function deleteOwned(owned: Owned): Promise<void> {
       owned.projectId === null ? null : db.delete(project).where(eq(project.id, owned.projectId))],
     ['team', async () =>
       owned.teamId === null ? null : db.delete(team).where(eq(team.id, owned.teamId))],
-    ['user', async () => db.delete(user).where(eq(user.id, BOT_USER_ID))],
+    ['user', async () =>
+      owned.userId === null ? null : db.delete(user).where(eq(user.id, owned.userId))],
     ['workspace', async () =>
       owned.workspaceId === null ? null : db.delete(workspace).where(eq(workspace.id, owned.workspaceId))],
   ];
@@ -106,7 +111,7 @@ async function deleteOwned(owned: Owned): Promise<void> {
 // Creates the owned fixture, tracking each id the moment it is created; a failure
 // part-way removes only the ids already created and rethrows.
 async function createOwned(): Promise<Owned> {
-  const owned: Owned = { workspaceId: null, teamId: null, projectId: null, agentId: null, runId: null };
+  const owned: Owned = { workspaceId: null, teamId: null, userId: null, projectId: null, agentId: null, runId: null };
   try {
     const [ws] = await db
       .insert(workspace)
@@ -129,6 +134,10 @@ async function createOwned(): Promise<Owned> {
         emailVerified: true,
       })
       .returning({ id: user.id });
+    // Ownership of the fixed id is recorded only now that the insert returned it:
+    // before this line the id may be a preexisting foreign row, and cleanup must not
+    // touch it.
+    owned.userId = usr.id;
     const [proj] = await db
       .insert(project)
       .values({ teamId: tm.id, key: `${PREFIX.toUpperCase()}`, name: `${PREFIX} project` })
@@ -193,7 +202,7 @@ async function main(): Promise<void> {
   }
   let dir: string | null = null;
   let mutantPath: string | null = null;
-  const owned: Owned = { workspaceId: null, teamId: null, projectId: null, agentId: null, runId: null };
+  const owned: Owned = { workspaceId: null, teamId: null, userId: null, projectId: null, agentId: null, runId: null };
   const before = await counts();
   try {
     dir = mkdtempSync(join(tmpdir(), 'pii-admission-d2-'));
@@ -290,6 +299,7 @@ async function main(): Promise<void> {
     }
     setPiiAdmissionOwner(checkTrackerRules);
     await deleteOwned(owned);
+    owned.userId = null;
     if (dir) {
       try {
         rmSync(dir, { recursive: true, force: true });
