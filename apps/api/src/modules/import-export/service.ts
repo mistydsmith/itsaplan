@@ -3,8 +3,6 @@ import { desc, eq, sql } from 'drizzle-orm';
 import { encryptSecret } from '@repo/crypto';
 import { HttpError, iso } from '#shared/lib';
 import { pinnedFetch } from '#shared/net';
-import { linearJobFields, type CreateLinearImportJobInput } from './linear';
-import { trelloJobFields, type CreateTrelloImportJobInput } from './trello';
 
 // Data access and the Plane connection check for import jobs (Linear's is in
 // linear.ts, Trello's in trello.ts). Creating a job only encrypts and stores the
@@ -127,7 +125,7 @@ export async function listImportJobs(projectId: number): Promise<ImportJobDto[]>
 // Normalizes and validates a base URL without resolving it — the worker's own
 // pinnedFetch call (apps/worker/src/plane-adapter.ts) is what enforces the SSRF
 // guards against the address actually used, on every request it makes.
-function normalizePlaneBaseUrl(raw: string): string {
+export function normalizePlaneBaseUrl(raw: string): string {
   let url: URL;
   try {
     url = new URL(raw.trim());
@@ -153,46 +151,6 @@ export interface CreatePlaneImportJobInput {
   apiToken: string;
   planeProjectId: string;
   planeProjectKey: string;
-}
-
-export type CreateImportJobInput = ImportJobChoices &
-  (CreatePlaneImportJobInput | CreateLinearImportJobInput | CreateTrelloImportJobInput);
-
-function planeJobFields(input: CreatePlaneImportJobInput) {
-  const baseUrl = normalizePlaneBaseUrl(input.baseUrl);
-  const workspaceSlug = input.workspaceSlug.trim();
-  const apiToken = input.apiToken.trim();
-  const planeProjectId = input.planeProjectId.trim();
-  const planeProjectKey = input.planeProjectKey.trim();
-  if (!workspaceSlug) throw new HttpError(400, 'workspaceSlug is required');
-  if (!apiToken) throw new HttpError(400, 'apiToken is required');
-  if (!planeProjectId) throw new HttpError(400, 'planeProjectId is required');
-  if (!planeProjectKey) throw new HttpError(400, 'planeProjectKey is required');
-  return {
-    source: 'plane' as const,
-    credential: { baseUrl, workspaceSlug, apiKey: apiToken },
-    config: { planeProjectId, planeProjectKey },
-  };
-}
-
-export async function createImportJob(
-  projectId: number,
-  actorUserId: string,
-  input: CreateImportJobInput,
-): Promise<ImportJobDto> {
-  switch (input.source) {
-    case 'linear':
-      return insertImportJob(projectId, actorUserId, linearJobFields(input), input);
-    case 'trello':
-      return insertImportJob(
-        projectId,
-        actorUserId,
-        await trelloJobFields(projectId, input),
-        input,
-      );
-    default:
-      return insertImportJob(projectId, actorUserId, planeJobFields(input), input);
-  }
 }
 
 // Stores the credential encrypted and leaves the job 'pending' — the worker picks it up

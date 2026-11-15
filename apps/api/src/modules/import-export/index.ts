@@ -12,6 +12,8 @@ import {
   LinearPreviewResponse,
   TrelloTestConnectionResponse,
   TrelloPreviewResponse,
+  BdTestConnectionResponse,
+  BdPreviewResponse,
   ProjectExportResponse,
   createImportJobBody,
   importJobParams,
@@ -21,10 +23,12 @@ import {
   linearPreviewBody,
   trelloConnectionBody,
   trelloPreviewBody,
+  bdConnectionBody,
+  bdPreviewBody,
 } from './model';
+import { createImportJob } from './job-creation';
 import {
   cancelImportJob,
-  createImportJob,
   getImportJobDto,
   getImportJobProjectId,
   listImportJobs,
@@ -36,6 +40,13 @@ import {
 import { exportProject } from './export';
 import { previewLinearStates, testLinearConnection } from './linear';
 import { previewTrelloBoard, testTrelloConnection } from './trello';
+import {
+  previewBdBoard,
+  redactBdJobError,
+  requireBdOperator,
+  requireBdResumeOperator,
+  testBdConnection,
+} from './bd';
 
 // Import jobs bring issues from an external tracker into a project. Creating one
 // stores an encrypted credential and leaves it 'pending' for the worker
@@ -152,6 +163,48 @@ export const importExportRoutes = new Elysia({
     },
   )
 
+  // The bd board is server-global (D2 R2): the instance operator ('god') is
+  // required IN ADDITION TO the project permission.
+  .post(
+    '/projects/:projectKey/import-jobs/bd-test-connection',
+    ({ user }) => {
+      requireBdOperator(user);
+      return testBdConnection();
+    },
+    {
+      permission: ['import_export', 'create'],
+      body: bdConnectionBody,
+      response: { 200: BdTestConnectionResponse, ...commonErrors, ...errors(502) },
+      detail: {
+        summary: 'Test the server-configured bd board',
+        description:
+          'Read the board the operator configured (BD_IMPORT_BOARD_ROOT) read-only with bd ' +
+          '(the same command the worker adapter runs) without storing anything. Returns its ' +
+          'card count and the states the import would create. The body carries no path and ' +
+          'no command: the board is privileged server config.',
+      },
+    },
+  )
+
+  .post(
+    '/projects/:projectKey/import-jobs/bd-preview',
+    ({ user }) => {
+      requireBdOperator(user);
+      return previewBdBoard();
+    },
+    {
+      permission: ['import_export', 'create'],
+      body: bdPreviewBody,
+      response: { 200: BdPreviewResponse, ...commonErrors, ...errors(502) },
+      detail: {
+        summary: 'Preview the server-configured bd board before importing it',
+        description:
+          "Read the board's cards with bd and return its states, each with the category " +
+          'the import would map it to, for review before a job is created.',
+      },
+    },
+  )
+
   .get('/projects/:projectKey/import-jobs/export', ({ project }) => exportProject(project.id), {
     permission: ['import_export', 'create'],
     response: { 200: ProjectExportResponse, ...accessErrors },
@@ -167,6 +220,10 @@ export const importExportRoutes = new Elysia({
   .post(
     '/projects/:projectKey/import-jobs',
     ({ project, body, user, set }) => {
+      // A bd job reads the server-global board: the operator guard applies to
+      // the bd source ONLY (D2 R2); the project permission still applies to
+      // every source.
+      if (body.source === 'bd') requireBdOperator(user);
       set.status = 201;
       return createImportJob(project.id, requireUser(user).id, body);
     },
@@ -177,18 +234,26 @@ export const importExportRoutes = new Elysia({
       detail: {
         summary: 'Create an import job',
         description:
-          "Create a Plane job, a Linear one with source 'linear', or a Trello one with source " +
-          "'trello'. Encrypt and store the submitted credential and leave the job 'pending' " +
+          "Create a Plane job, a Linear one with source 'linear', a Trello one with source " +
+          "'trello', or a local bd one with source 'bd'. Encrypt and store the submitted " +
+          "credential (a bd job carries none) and leave the job 'pending' " +
           'for the worker.',
       },
     },
   )
 
-  .get('/projects/:projectKey/import-jobs', ({ project }) => listImportJobs(project.id), {
-    permission: ['import_export', 'read'],
-    response: { 200: t.Array(ImportJobResponse), ...accessErrors },
-    detail: { summary: "List a project's import jobs" },
-  })
+  .get(
+    '/projects/:projectKey/import-jobs',
+    async ({ project, user }) => {
+      const jobs = await listImportJobs(project.id);
+      return jobs.map((job) => redactBdJobError(job, user));
+    },
+    {
+      permission: ['import_export', 'read'],
+      response: { 200: t.Array(ImportJobResponse), ...accessErrors },
+      detail: { summary: "List a project's import jobs" },
+    },
+  )
 
   // Fetches the row itself and asserts on it, like GET /issues/:issueId — the entity
   // guard would resolve the project id with a second query this handler doesn't need.
@@ -199,7 +264,7 @@ export const importExportRoutes = new Elysia({
       if (!job) throw new HttpError(404, 'Import job not found');
       await assertPermission(job.projectId, user, 'import_export', 'read');
       await assertMcpAllowed(job.projectId, request.headers);
-      return job;
+      return redactBdJobError(job, user);
     },
     {
       params: importJobParams,
@@ -212,23 +277,52 @@ export const importExportRoutes = new Elysia({
     },
   )
 
-  .post('/import-jobs/:id/pause', ({ params }) => pauseImportJob(params.id), {
-    params: importJobParams,
-    importJobEntity: 'edit',
-    response: { 200: ImportJobResponse, ...accessErrors, ...errors(409) },
-    detail: { summary: 'Pause an import job' },
-  })
+  // CT review 2026-11-15 (Root msg_d1d642d0af0a): pause and cancel return the
+  // fresh DTO, which can carry a stored bd lastError from the previous step -
+  // the same leak the list/get readers already redact for non-operators.
+  // Wrap BOTH responses with redactBdJobError(job, user); the error paths
+  // (404/409) and the other sources are untouched.
+  .post(
+    '/import-jobs/:id/pause',
+    async ({ params, user }) => {
+      const job = await pauseImportJob(params.id);
+      return redactBdJobError(job, user);
+    },
+    {
+      params: importJobParams,
+      importJobEntity: 'edit',
+      response: { 200: ImportJobResponse, ...accessErrors, ...errors(409) },
+      detail: { summary: 'Pause an import job' },
+    },
+  )
 
-  .post('/import-jobs/:id/resume', ({ params }) => resumeImportJob(params.id), {
-    params: importJobParams,
-    importJobEntity: 'edit',
-    response: { 200: ImportJobResponse, ...accessErrors, ...errors(409) },
-    detail: { summary: 'Resume a paused import job' },
-  })
+  // Resume restarts the bd export for a stored bd job: the STORED source, not
+  // any body claim, triggers the operator guard (Root 2026-11-15).
+  .post(
+    '/import-jobs/:id/resume',
+    async ({ params, user }) => {
+      const job = await getImportJobDto(params.id);
+      if (job) requireBdResumeOperator(user, job.source);
+      return resumeImportJob(params.id);
+    },
+    {
+      params: importJobParams,
+      importJobEntity: 'edit',
+      response: { 200: ImportJobResponse, ...accessErrors, ...errors(409) },
+      detail: { summary: 'Resume a paused import job' },
+    },
+  )
 
-  .post('/import-jobs/:id/cancel', ({ params }) => cancelImportJob(params.id), {
-    params: importJobParams,
-    importJobEntity: 'edit',
-    response: { 200: ImportJobResponse, ...accessErrors, ...errors(409) },
-    detail: { summary: 'Cancel an import job' },
-  });
+  .post(
+    '/import-jobs/:id/cancel',
+    async ({ params, user }) => {
+      const job = await cancelImportJob(params.id);
+      return redactBdJobError(job, user);
+    },
+    {
+      params: importJobParams,
+      importJobEntity: 'edit',
+      response: { 200: ImportJobResponse, ...accessErrors, ...errors(409) },
+      detail: { summary: 'Cancel an import job' },
+    },
+  );
