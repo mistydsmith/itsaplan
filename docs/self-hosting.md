@@ -227,6 +227,63 @@ push, and anyone who signs in through OIDC while their identity provider puts a 
 claim on the token — set that up as a claim mapping on the OIDC client if the provider
 supports one. Either way, map the group the same way once it shows up.
 
+## Landings
+
+An instance can land a work item onto its own repository: run the item's named proofs, publish the
+candidate and record the landing. It is off unless configured, and it is configured **only** on the
+api.
+
+Set `ITSAPLAN_LANDING_CONFIG` to one line of JSON mapping a repository key to that repository's
+publication and to the argv of each named proof. [`.env.example`](../.env.example) carries a full
+commented example; the shape is:
+
+```json
+{
+  "repos": {
+    "my-repo": {
+      "actorName": "my-host",
+      "publication": {
+        "repo": "/srv/itsaplan",
+        "targetRef": "refs/heads/main",
+        "excludedPathPatterns": ["Legal/"],
+        "repoIdentity": "my-repo",
+        "remote": "origin",
+        "expectedPushURL": "git@github.com:example/itsaplan.git",
+        "projectId": 123,
+        "columnId": 456,
+        "completedColumnId": 789,
+        "closeRepoKey": "my-repo-main",
+        "manifestPath": "/srv/tracker-rules/manifest.json"
+      },
+      "proofs": {
+        "unit:issues": ["bun", "test", "apps/api/src/modules/issues/example.test.ts"]
+      }
+    }
+  }
+}
+```
+
+Every value above is a placeholder. Replace the checkout path, the ref, the remote and its exact URL,
+the project and column ids, the close repo key, the manifest path and the proofs with your own. The
+manifest must be the one the server itself runs with (`TRACKER_RULES_MANIFEST`): a publication bound
+to a different manifest refuses before any git or storage work, because it would prove one graph and
+close against another. The completion column is explicit and never inferred.
+
+Three rules make this safe to hand to a client:
+
+- **Unset means absent, not broken.** With no `ITSAPLAN_LANDING_CONFIG` the api registers no landing
+  route and starts normally.
+- **Set but invalid means it refuses to start.** Bad JSON, or a repository entry with a short ref, a
+  relative checkout, no proofs or a bad key, stops the api at import and names the entry.
+- **The host owns the blast radius.** A request to `POST /tracker/landings/:repoKey/:itemKey` carries
+  only item evidence (`receipts`, `verdicts`, `columns`, `status`, `archived`) and a `mode`. It cannot
+  name a checkout, a ref, a remote, a manifest, a closer or a command; those come from this variable,
+  are read once at startup and are never re-read per request.
+
+Responses: `200` when the landing succeeded, `409` with the landing's own report when it refused, `404`
+when the repo key is not configured on this host, `401` without a session. A named proof runs with no
+shell, so a `;` or `$` inside an argument is data rather than a command.
+
 ## Updating
 
 ```bash
