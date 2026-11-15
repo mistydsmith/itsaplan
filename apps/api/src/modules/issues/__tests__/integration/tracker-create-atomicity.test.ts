@@ -103,7 +103,7 @@ describe('the gated create transaction', () => {
   it('allows a compliant create and queues each side effect exactly once', async () => {
     const f = await createFixture(true);
     const before = await board(f.projectId, f.rigId);
-    const created = await withOwner(() => create(f, 'Atomic allow path'));
+    const created = await withOwner(f, () => create(f, 'Atomic allow path'));
     const after = await board(f.projectId, f.rigId);
     const row = await facts(created, f.projectId);
     if (row.bead_id) minted.push(row.bead_id);
@@ -149,7 +149,7 @@ describe('the gated create transaction', () => {
     const late = `u3c4 late create failure ${Date.now()}`;
     let failure: unknown = null;
     await withLateFailure(f.projectId, { early, late }, async () => {
-      await withOwner(() => create(f, 'Atomic late failure')).catch((error: unknown) => {
+      await withOwner(f, () => create(f, 'Atomic late failure')).catch((error: unknown) => {
         failure = error;
       });
     });

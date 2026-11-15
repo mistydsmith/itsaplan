@@ -18,7 +18,8 @@ import { readFileSync } from 'node:fs';
 const REQUIRED_DB = 'itsaplan_8364_d2_test';
 const LOOPBACK = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
 const GRANT = 'ITSAPLAN_8364_D3_CREATE_PROOF';
-const OWNER_CONFIG = '/Users/misty/Output/reports/8364_root_policy_owner_R2/CONFIG.json';
+const OWNER_CONFIG =
+  '/Users/misty/Output/reports/itsaplan_cutover_20261114_ROOT_R1/8364_owner_composition/CONFIG.json';
 const MARK = 'zz_qwen3_d3u3';
 // ONE shared synthetic rig for the whole proof run, shared by isolated owned projects, so the retained
 // fixture stays as small as the schema allows. No real board is seeded or reused.

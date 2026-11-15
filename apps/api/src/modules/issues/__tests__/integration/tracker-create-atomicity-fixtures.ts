@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { sql } from 'drizzle-orm';
+import { tempManifest } from '#tests/helpers/temp-manifest';
 
 // Synthetic fixtures for the gated create atomicity proof, and nothing else. The proof owns no app mock
 // and no exported testing seam: it writes real rows, calls the real public writer with the real pinned
@@ -9,7 +10,9 @@ import { sql } from 'drizzle-orm';
 const REQUIRED_DB = 'itsaplan_8364_d2_test';
 const LOOPBACK = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
 const GRANT = 'ITSAPLAN_8364_D3_CREATE_ATOMICITY';
-const OWNER_CONFIG = '/Users/misty/Output/reports/8364_root_policy_owner_R2/CONFIG.json';
+// Root's composed owner pin (Sentinel 07a7bde25b).
+const OWNER_CONFIG =
+  '/Users/misty/Output/reports/itsaplan_cutover_20261114_ROOT_R1/8364_owner_composition/CONFIG.json';
 export const MARK = 'zz_a4_d3_atomicity';
 
 function grantAndTarget(): void {
@@ -43,10 +46,17 @@ const OWNER = JSON.parse(readFileSync(OWNER_CONFIG, 'utf8')) as { python: string
 const GATE_NAMES = [TRACKER_GATE_ENV.python, TRACKER_GATE_ENV.owner, TRACKER_GATE_ENV.manifest];
 
 // Every variable a case sets comes back exactly as it was, so no case erases a config the process
-// genuinely had and no case leaks its own onward.
-export async function withOwner<T>(run: () => Promise<T>): Promise<T> {
+// genuinely had and no case leaks its own onward. The create delegates to the fixture's agent, whose
+// username carries the project id, so the manifest is a test-owned temp copy of the pins that lists
+// that username as a synthetic local lane. The shared CONFIG is never written.
+export async function withOwner<T>(f: CreateFixture, run: () => Promise<T>): Promise<T> {
+  const temp = tempManifest('tracker-create-atomicity-', {
+    ...JSON.parse(readFileSync(OWNER_CONFIG, 'utf8')),
+    routing: { lanes: { [`agent${f.projectId}`]: { execution: 'local' } } },
+  });
+  const manifest = temp.path;
   const prior = GATE_NAMES.map((name) => process.env[name]);
-  [OWNER.python, OWNER.owner, OWNER_CONFIG].forEach((value, i) => {
+  [OWNER.python, OWNER.owner, manifest].forEach((value, i) => {
     process.env[GATE_NAMES[i]] = value;
   });
   try {
@@ -56,6 +66,8 @@ export async function withOwner<T>(run: () => Promise<T>): Promise<T> {
       if (prior[i] === undefined) delete process.env[name];
       else process.env[name] = prior[i];
     });
+    // The per-call copy goes when the case settles, also when it throws.
+    temp.remove();
   }
 }
 
