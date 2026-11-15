@@ -38,15 +38,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { eq, sql } from 'drizzle-orm';
-import {
-  aiAgent,
-  agentRun,
-  db,
-  project,
-  team,
-  user,
-  workspace,
-} from '@repo/db';
+import { aiAgent, agentRun, db, project, team, user, workspace } from '@repo/db';
 import { checkTrackerRules } from '@repo/db/tracker-rules';
 import { setPiiAdmissionOwner } from '../../../core/pii-admission';
 import { getRunnerAgent, takeNextRun } from '../../service';
@@ -85,18 +77,36 @@ interface Owned {
 // delete failure is logged and does not skip the remaining ids.
 async function deleteOwned(owned: Owned): Promise<void> {
   const steps: [string, () => Promise<unknown>][] = [
-    ['agent_run', async () =>
-      owned.runId === null ? null : db.delete(agentRun).where(eq(agentRun.id, owned.runId))],
-    ['ai_agent', async () =>
-      owned.agentId === null ? null : db.delete(aiAgent).where(eq(aiAgent.id, owned.agentId))],
-    ['project', async () =>
-      owned.projectId === null ? null : db.delete(project).where(eq(project.id, owned.projectId))],
-    ['team', async () =>
-      owned.teamId === null ? null : db.delete(team).where(eq(team.id, owned.teamId))],
-    ['user', async () =>
-      owned.userId === null ? null : db.delete(user).where(eq(user.id, owned.userId))],
-    ['workspace', async () =>
-      owned.workspaceId === null ? null : db.delete(workspace).where(eq(workspace.id, owned.workspaceId))],
+    [
+      'agent_run',
+      async () =>
+        owned.runId === null ? null : db.delete(agentRun).where(eq(agentRun.id, owned.runId)),
+    ],
+    [
+      'ai_agent',
+      async () =>
+        owned.agentId === null ? null : db.delete(aiAgent).where(eq(aiAgent.id, owned.agentId)),
+    ],
+    [
+      'project',
+      async () =>
+        owned.projectId === null ? null : db.delete(project).where(eq(project.id, owned.projectId)),
+    ],
+    [
+      'team',
+      async () => (owned.teamId === null ? null : db.delete(team).where(eq(team.id, owned.teamId))),
+    ],
+    [
+      'user',
+      async () => (owned.userId === null ? null : db.delete(user).where(eq(user.id, owned.userId))),
+    ],
+    [
+      'workspace',
+      async () =>
+        owned.workspaceId === null
+          ? null
+          : db.delete(workspace).where(eq(workspace.id, owned.workspaceId)),
+    ],
   ];
   for (const [name, step] of steps) {
     try {
@@ -111,7 +121,14 @@ async function deleteOwned(owned: Owned): Promise<void> {
 // Creates the owned fixture, tracking each id the moment it is created; a failure
 // part-way removes only the ids already created and rethrows.
 async function createOwned(): Promise<Owned> {
-  const owned: Owned = { workspaceId: null, teamId: null, userId: null, projectId: null, agentId: null, runId: null };
+  const owned: Owned = {
+    workspaceId: null,
+    teamId: null,
+    userId: null,
+    projectId: null,
+    agentId: null,
+    runId: null,
+  };
   try {
     const [ws] = await db
       .insert(workspace)
@@ -202,7 +219,14 @@ async function main(): Promise<void> {
   }
   let dir: string | null = null;
   let mutantPath: string | null = null;
-  const owned: Owned = { workspaceId: null, teamId: null, userId: null, projectId: null, agentId: null, runId: null };
+  const owned: Owned = {
+    workspaceId: null,
+    teamId: null,
+    userId: null,
+    projectId: null,
+    agentId: null,
+    runId: null,
+  };
   const before = await counts();
   try {
     dir = mkdtempSync(join(tmpdir(), 'pii-admission-d2-'));
@@ -251,7 +275,11 @@ async function main(): Promise<void> {
     const control = await takeNextRun(agent);
     check('control: no claim handed out (null)', control === null, JSON.stringify(control));
     const [ctl] = await db
-      .select({ status: agentRun.status, lastError: agentRun.lastError, attempts: agentRun.attempts })
+      .select({
+        status: agentRun.status,
+        lastError: agentRun.lastError,
+        attempts: agentRun.attempts,
+      })
       .from(agentRun)
       .where(eq(agentRun.id, owned.runId!));
     check(
@@ -262,7 +290,11 @@ async function main(): Promise<void> {
     // D1: the claim's own bookkeeping incremented attempts before admission, and
     // markRunFailed does not undo that; the no-retry proof is the terminal failed
     // state, which the claim's WHERE clause no longer reaches.
-    check('control: first claim bookkeeping recorded (attempts 1, terminal failed)', ctl.attempts === 1, `attempts=${ctl.attempts}`);
+    check(
+      'control: first claim bookkeeping recorded (attempts 1, terminal failed)',
+      ctl.attempts === 1,
+      `attempts=${ctl.attempts}`,
+    );
     // Re-queue the owned run for the counterfactual: it is ours.
     await db
       .update(agentRun)
@@ -280,7 +312,8 @@ async function main(): Promise<void> {
     );
     check(
       'mutant: the owned PII task text left the server in the claim',
-      forbidden !== null && (forbidden as { prompt?: string }).prompt?.includes(RUN_PROMPT) === true,
+      forbidden !== null &&
+        (forbidden as { prompt?: string }).prompt?.includes(RUN_PROMPT) === true,
       JSON.stringify((forbidden as { prompt?: string } | null)?.prompt?.slice(0, 120)),
     );
   } finally {
@@ -317,6 +350,18 @@ async function main(): Promise<void> {
     } catch (err) {
       console.log('[cleanup] final count comparison failed (logged, not skipped)', err);
       failures += 1;
+    }
+    // Terminal lifecycle (repair authorized by Root after run 1): the postgres-js
+    // pool the shared db client keeps open otherwise holds the event loop after the
+    // last assertion, so an error path exits only under an external SIGTERM (run 1
+    // WITNESS_PIPELINE_EXIT=143). This finally already runs on both the success and
+    // error paths; closing the pool last - after every DB assertion above - lets the
+    // process exit with its own exitCode. House convention: end with a timeout so a
+    // wedged pool rejects into this log instead of hanging (landing-slot-driver).
+    try {
+      await db.$client.end({ timeout: 10 });
+    } catch (err) {
+      console.log('[cleanup] db pool close failed (logged, not skipped)', err);
     }
   }
   console.log(failures === 0 ? '[witness] PASS' : `[witness] FAIL (${failures})`);
