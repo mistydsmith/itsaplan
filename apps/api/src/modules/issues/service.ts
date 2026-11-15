@@ -35,6 +35,7 @@ import {
   isTrackerGateRefusal,
   type TrackerGateRefusal,
 } from '@repo/db/tracker-gate';
+import type { TrackerRoutingFacts } from '@repo/db/tracker-routing-facts';
 import { isIdFactsRefusal, snapshotIdFacts } from '@repo/db/tracker-issue-facts';
 import { alias } from 'drizzle-orm/pg-core';
 import {
@@ -79,6 +80,18 @@ import {
   type IssueSnapshot,
 } from './activity';
 import { stampIssueAnchors } from './anchor-stamp';
+import { skillFactsFor } from './skill-facts';
+import {
+  closeIsProven,
+  closeOpFields,
+  closerOf,
+  isBareClose,
+  readClaimFacts,
+  releaseClosedClaim,
+  type Closer,
+  type CloseRequest,
+} from './close-facts';
+import { routingFactsForText } from './lane-routing';
 import { autoWatchIssue } from './watchers';
 import { attachLoggedMinutes } from './worklogs';
 import { recordCycleChange } from './cycle-history';
@@ -121,6 +134,9 @@ export interface IssueRow {
   // issue by its human number in URLs (/acme/issue/MKT-42).
   sequenceNumber: number;
   identifier: string;
+  // The bead id stored on the issue in a project with a rig, or null. It is read from the row
+  // and never parsed from the title.
+  beadId: string | null;
   typeId: number | null;
   // The initiative this issue is linked to, expanded to id + title for rendering
   // and status for ordering the lanes of a board grouped by initiative, or null.
@@ -183,6 +199,7 @@ function mapIssue(row: typeof issue.$inferSelect, projectKey: string): IssueRow 
     projectId: row.projectId,
     sequenceNumber: row.sequenceNumber,
     identifier: `${projectKey}-${row.sequenceNumber}`,
+    beadId: row.beadId,
     typeId: row.typeId,
     initiative: null,
     cycle: null,
@@ -1039,13 +1056,14 @@ export interface NewIssueInput {
 async function assertAssignments(
   projectId: number,
   patch: { assigneeUserId?: string | null; delegateUserId?: string | null },
+  executor: DbExecutor = db,
 ): Promise<void> {
   if (patch.assigneeUserId) {
-    const role = await getMembership(projectId, patch.assigneeUserId);
+    const role = await getMembership(projectId, patch.assigneeUserId, executor);
     if (!role) throw new HttpError(400, 'Assignee must be a project member');
   }
   if (patch.delegateUserId) {
-    if (!(await isProjectAgent(projectId, patch.delegateUserId)))
+    if (!(await isProjectAgent(projectId, patch.delegateUserId, executor)))
       throw new HttpError(400, 'Delegate must be an agent of this project');
   }
 }
@@ -1056,10 +1074,11 @@ async function assertAssignments(
 async function assertInitiative(
   projectId: number,
   initiativeId: number | null | undefined,
+  executor: DbExecutor = db,
 ): Promise<void> {
   if (initiativeId == null) return;
-  await assertProjectFeature(projectId, 'initiatives');
-  if ((await getInitiativeProjectId(initiativeId)) !== projectId)
+  await assertProjectFeature(projectId, 'initiatives', executor);
+  if ((await getInitiativeProjectId(initiativeId, executor)) !== projectId)
     throw new HttpError(400, 'Initiative must belong to this project');
 }
 
@@ -1072,10 +1091,11 @@ async function assertCycle(
   projectId: number,
   cycleId: number | null | undefined,
   currentCycleId: number | null = null,
+  executor: DbExecutor = db,
 ): Promise<void> {
   if (cycleId == null || cycleId === currentCycleId) return;
-  await assertProjectFeature(projectId, 'cycles');
-  const ref = await getCycleRef(cycleId);
+  await assertProjectFeature(projectId, 'cycles', executor);
+  const ref = await getCycleRef(cycleId, executor);
   if (!ref || ref.projectId !== projectId)
     throw new HttpError(400, 'Cycle must belong to this project');
   if (ref.status === 'completed') throw new HttpError(400, 'A completed cycle takes no new issues');
@@ -1084,9 +1104,13 @@ async function assertCycle(
 // Enforces that a column belongs to the issue's project — issue.column_id only
 // requires the column to exist somewhere, so an issue could otherwise sit on
 // another project's board. Throws 400 otherwise.
-async function assertColumn(projectId: number, columnId: number | undefined): Promise<void> {
+async function assertColumn(
+  projectId: number,
+  columnId: number | undefined,
+  executor: DbExecutor = db,
+): Promise<void> {
   if (columnId === undefined) return;
-  const rows = await db
+  const rows = await executor
     .select({ id: projectColumn.id })
     .from(projectColumn)
     .where(and(eq(projectColumn.id, columnId), eq(projectColumn.projectId, projectId)));
@@ -1095,12 +1119,16 @@ async function assertColumn(projectId: number, columnId: number | undefined): Pr
 
 // Enforces that an issue type belongs to the issue's project. Only checks when set
 // to a non-null value (clearing the type is always allowed). Throws 400 otherwise.
+// WHY the trailing executor (sentinel-prod-8429): a type created inside the caller's transaction is invisible to
+// the pool, so without it a legal move onto a just-created type is refused. Default keeps create and every other
+// caller exactly as they were.
 async function assertIssueType(
   projectId: number,
   typeId: number | null | undefined,
+  executor: DbExecutor = db,
 ): Promise<void> {
   if (typeId == null) return;
-  const rows = await db
+  const rows = await executor
     .select({ id: issueType.id })
     .from(issueType)
     .where(and(eq(issueType.id, typeId), eq(issueType.projectId, projectId)));
@@ -1114,11 +1142,14 @@ async function assertParent(
   projectId: number,
   issueId: number | null,
   parentId: number | null | undefined,
+  executor: DbExecutor = db,
 ): Promise<void> {
   if (parentId == null) return;
-  await assertProjectFeature(projectId, 'subtasks');
+  // assertProjectFeature already took an executor (shared/access.ts), so the feature check rides the same session
+  // as the parent read below.
+  await assertProjectFeature(projectId, 'subtasks', executor);
   if (parentId === issueId) throw new HttpError(400, 'An issue cannot be its own parent');
-  const rows = await db
+  const rows = await executor
     .select({ projectId: issue.projectId })
     .from(issue)
     .where(eq(issue.id, parentId));
@@ -1254,10 +1285,14 @@ async function gateUpdateWrite(
     set: Partial<typeof issue.$inferInsert>;
     skipIfColumnFull: boolean;
     onlyIfColumnId?: number;
+    actorUserId: string | null;
+    closeRequest?: CloseRequest;
   },
 ): Promise<{
   writeSet: Partial<typeof issue.$inferInsert>;
   lockedBefore: IssueSnapshot & { projectId: number; parentId: number | null };
+  // The closer whose claim the owner judged, when this write is an allowed close.
+  closer: Closer | null;
 } | null> {
   const { id, before, patch, set, skipIfColumnFull } = input;
   const rigRows = (await tx.execute(
@@ -1326,41 +1361,62 @@ async function gateUpdateWrite(
     // The pool saw a move the locked row does not: its auto-assignee must not ride along.
     delete writeSet.assigneeUserId;
   }
-  const op = await buildUpdateOp(tx, {
+  const ops = await buildUpdateOp(tx, {
     id,
     rigId,
     lockedBefore,
     patch,
     movedToColumnId,
     set: writeSet,
+    closeRequest: input.closeRequest,
+    actorUserId: input.actorUserId,
   });
-  await gateIssueWrite({ rigId, op });
-  // The writer-side close backstop, after the gate: even a future owner config that relaxed
-  // the close rule must not let this seam commit a close, because it has no verified close
-  // facts. The gate's own refusal covers the current rule; this is the second wall.
-  if (op.op === 'close') {
+  const closeOp = ops.find((op) => op.op === 'close');
+  if (input.closeRequest !== undefined && closeOp === undefined) {
+    throw new HttpError(
+      409,
+      'A close request applies only to a move from an open column into a completed or canceled one',
+      'close-request-without-close',
+    );
+  }
+  // Every op is judged before the one write. A close op carries no state for the legal-template
+  // rule to judge, so it takes no skill facts.
+  for (const op of ops) {
+    if (op.op !== 'close') Object.assign(op, await skillFactsFor(tx, input.actorUserId));
+    await gateIssueWrite({ rigId, op });
+  }
+  // The writer-side close backstop, after the gate: a close commits only on close facts this
+  // server observed and a claim row it read. A close with no close request has neither, and a
+  // rule config that relaxed the close rule must not let it through.
+  if (closeOp !== undefined && !closeIsProven(closeOp)) {
     throw new HttpError(
       409,
       'This issue cannot be closed until verified close facts exist',
       'close-facts-missing',
     );
   }
-  return { writeSet, lockedBefore };
+  const closer =
+    closeOp !== undefined && input.closeRequest !== undefined
+      ? closerOf(input.actorUserId, input.closeRequest)
+      : null;
+  return { writeSet, lockedBefore, closer };
 }
 
-// The operation the rule owner judges a gated update on, built only from facts this
+// The operations the rule owner judges a gated update on, in judging order, built only from facts this
 // transaction read under its own locks. The bead id is the ledger's immutable fact, never
 // something the title or the caller suggested; the previous and proposed states carry the
 // stored labels and the column states, because the owner's size and description decisions
 // judge the complete post-write state, not the delta. The description is top-level only when
 // the patch carries one, so the owner's carry-forward rule compares it with the stored text;
 // the states always carry it, stored or proposed. An effective assignee or delegate change
-// carries routing_facts null, because this seam has no authenticated routing facts yet and the
-// owner refuses the missing facts with its own wording; a move from a non-terminal state
-// into a completed or canceled column is op 'close' with close_facts null for the same
-// reason, while an edit of a card already in a terminal column stays op 'update'. A
-// body-supplied override or routing or close fact is never attached: nothing the caller
-// sent can open the gate.
+// carries the routing_facts routingFactsFor builds from stored identities and the pinned
+// manifest; a move from a non-terminal state into a completed or canceled column is op 'close'.
+// Its close_facts are the ones close-facts.ts observed for the server caller's close request,
+// and its claim_facts are the locked claim row. With no request close_facts is null and the
+// owner refuses the missing facts with its own wording. A closing move that also sets another
+// field is followed by a full op 'update' for the same write. An edit of a card already in a
+// terminal column stays op 'update'. A body-supplied override or routing or close fact is never
+// attached: nothing the caller sent can open the gate.
 async function buildUpdateOp(
   tx: DbExecutor,
   input: {
@@ -1370,8 +1426,10 @@ async function buildUpdateOp(
     patch: IssuePatch;
     movedToColumnId: number | null;
     set: Partial<typeof issue.$inferInsert>;
+    closeRequest?: CloseRequest;
+    actorUserId: string | null;
   },
-): Promise<Record<string, unknown>> {
+): Promise<Record<string, unknown>[]> {
   const { id, rigId, lockedBefore, patch, movedToColumnId, set } = input;
   const columnIds = [lockedBefore.columnId, ...(movedToColumnId !== null ? [movedToColumnId] : [])];
   const stateRows = (await tx.execute(
@@ -1443,20 +1501,43 @@ async function buildUpdateOp(
     delegate_user_id: proposedDelegate,
     parent_id: set.parentId === undefined ? lockedBefore.parentId : set.parentId,
   };
+  const ops: Record<string, unknown>[] = [];
+  if (isClose) {
+    const closeOp: Record<string, unknown> = {
+      op: 'close',
+      id: beadId,
+      rig_prefix: identityRows[0].prefix,
+    };
+    // The close op carries no states, because the identity rule owns a whole proposed state
+    // only for the mutating ops and a close with one refuses before the close rule answers.
+    // WHY the facts are read here (sentinel-prod-8429 G2): the commit or artifact and the claim
+    // row are observed on the transaction that holds the card's lock, so the owner judges the
+    // row this write changes. With no close request the facts are null and the owner refuses.
+    // The closer is the authenticated user of this update, refused before any proof is read.
+    const closer =
+      input.closeRequest === undefined ? null : closerOf(input.actorUserId, input.closeRequest);
+    Object.assign(
+      closeOp,
+      await closeOpFields({
+        rigPrefix: identityRows[0].prefix,
+        beadId,
+        request: input.closeRequest,
+      }),
+    );
+    if (closer !== null) closeOp.claim_facts = await readClaimFacts(tx, id, closer);
+    ops.push(closeOp);
+    // WHY a second op (Root msg_b6d390a40af4): a closing write that also sets a title, a
+    // description, an assignee or a column auto-assignee is a full write, and the close op
+    // cannot carry its states. The update op below is the one every other gated update is
+    // judged on, so no rule is copied and nothing is dropped from the write.
+    if (isBareClose(set)) return ops;
+  }
   const op: Record<string, unknown> = {
-    op: isClose ? 'close' : 'update',
+    op: 'update',
     id: beadId,
     rig_prefix: identityRows[0].prefix,
   };
-  if (isClose) {
-    // A non-terminal -> terminal move is op 'close' with close_facts null: this seam has no
-    // verified close facts yet, and the owner's close rule refuses the missing facts with its
-    // own wording. The close op carries no states, because the identity rule owns a whole
-    // proposed state only for the mutating ops and a close with one refuses before the close
-    // rule ever answers; nothing the caller sent can open the close.
-    op.close_facts = null;
-    return op;
-  }
+  ops.push(op);
   op.labels = labels;
   op.previous_state = previous;
   op.proposed_state = proposed;
@@ -1465,15 +1546,61 @@ async function buildUpdateOp(
   // stored text in place, and the owner's trap rule needs the bytes the write would leave to
   // judge them against the stored text it read on the same transaction.
   if (patch.description !== undefined) op.description = patch.description;
-  if (routingChanged) {
-    // This seam has no authenticated routing facts yet: the change is declared with the facts
-    // set to null, and the owner's routing rule refuses the missing facts with its own wording
-    // until the authenticated seam lands. The write never pretends the routing was judged.
+  // WHY a text change is routed too (sentinel-prod-8364, Root msg_9c74bb90114a): the owner reads a
+  // lane mention in the title and the description of both states, and an op with no routing facts
+  // goes to its legacy rule, which reads none. So a title or description change carries facts for
+  // the agents that text names. The holders are targets only when this write changes them.
+  const textChanged =
+    proposed.title !== previous.title || proposed.description !== previous.description;
+  if (routingChanged || textChanged) {
     if (proposedAssignee !== previousAssignee && proposedAssignee !== null)
       op.assignee = proposedAssignee;
-    op.routing_facts = null;
+    const routed = await routingFactsFor(tx, {
+      beadId,
+      projectId: lockedBefore.projectId,
+      texts: [previous.title, previous.description, proposed.title, proposed.description],
+      assigneeUserId: routingChanged ? proposedAssignee : null,
+      delegateUserId: routingChanged ? proposedDelegate : null,
+      labels,
+    });
+    if (routed.assigneeLane !== null) op.proposed_assignee = routed.assigneeLane;
+    if (routed.delegateLane !== null) op.delegate = routed.delegateLane;
+    op.routing_facts = routed.facts;
   }
-  return op;
+  return ops;
+}
+
+// The routing facts for whoever the write leaves holding a gated card and for the agents its
+// title and description name. The policy is in lane-routing.ts, shared with the comment writers.
+async function routingFactsFor(
+  tx: DbExecutor,
+  input: {
+    beadId: string;
+    projectId: number;
+    texts: string[];
+    assigneeUserId: string | null;
+    delegateUserId: string | null;
+    labels: string[];
+  },
+): Promise<{
+  facts: TrackerRoutingFacts | null;
+  assigneeLane: string | null;
+  delegateLane: string | null;
+}> {
+  const { facts, laneOf } = await routingFactsForText(tx, {
+    beadId: input.beadId,
+    projectId: input.projectId,
+    texts: input.texts,
+    userIds: [input.assigneeUserId, input.delegateUserId].filter(
+      (userId): userId is string => userId !== null,
+    ),
+    labels: input.labels,
+  });
+  return {
+    facts,
+    assigneeLane: laneOf(input.assigneeUserId),
+    delegateLane: laneOf(input.delegateUserId),
+  };
 }
 
 // The bead identity for a new gated issue, allocated inside the caller's transaction. A
@@ -1590,6 +1717,13 @@ export async function createIssue(
       // included. An ordinary project keeps its title and its default description untouched.
       const title = allocation === null ? input.title : `${allocation.localToken}: ${input.title}`;
       const description = input.description ?? '';
+      // The assignee is a write value, so a gated create rereads it under the locks it already
+      // holds rather than trusting the answer the pool gave before this transaction started. It
+      // is read before the gate because the owner routes the holder the create will write.
+      const assigneeUserId =
+        rigId === null
+          ? poolAssignee
+          : (input.assigneeUserId ?? (await columnAutoAssignee(input.columnId, tx)));
       if (rigId !== null && allocation !== null && facts !== null) {
         // Label names are read through this same transaction. The ids a client sent are a lookup
         // key, never the fact the policy is given.
@@ -1617,6 +1751,18 @@ export async function createIssue(
         // 'auto' is left out entirely: the owner chooses root or daughter from the parent it reads.
         // root and daughter go literally, and no id or mode fact is taken from the request body.
         const mode = input.beadAllocationMode ?? 'auto';
+        // WHY a create is routed (sentinel-prod-8364, Root msg_8cae56f85d71): with no routing
+        // facts the owner's legacy rule judges the create and reads no mention, so a new card
+        // could name a fleet lane or start in an agent's hands unjudged. The targets are the
+        // holders the INSERT writes and the agents the title and description name.
+        const routed = await routingFactsFor(tx, {
+          beadId: allocation.beadId,
+          projectId: project.id,
+          texts: [title, description],
+          assigneeUserId: assigneeUserId ?? null,
+          delegateUserId: input.delegateUserId ?? null,
+          labels: labelNames,
+        });
         await gateIssueWrite({
           rigId,
           op: {
@@ -1631,6 +1777,10 @@ export async function createIssue(
             description,
             labels: labelNames,
             existing_titles: existingTitles,
+            ...(await skillFactsFor(tx, actorUserId ?? null)),
+            ...(routed.assigneeLane === null ? {} : { proposed_assignee: routed.assigneeLane }),
+            ...(routed.delegateLane === null ? {} : { delegate: routed.delegateLane }),
+            routing_facts: routed.facts,
             proposed_state: {
               labels: labelNames,
               title,
@@ -1651,12 +1801,6 @@ export async function createIssue(
         .select({ pos: sql<number>`COALESCE(MAX(${issue.position}), 0) + 1000` })
         .from(issue)
         .where(eq(issue.columnId, input.columnId));
-      // The assignee is a write value, so a gated create rereads it under the locks it already
-      // holds rather than trusting the answer the pool gave before this transaction started.
-      const assigneeUserId =
-        rigId === null
-          ? poolAssignee
-          : (input.assigneeUserId ?? (await columnAutoAssignee(input.columnId, tx)));
       const [row] = await tx
         .insert(issue)
         .values({
@@ -1889,9 +2033,27 @@ export async function updateIssue(
   id: number,
   patch: IssuePatch,
   actor?: ActivityActor,
-  opts?: { onlyIfColumnId?: number; skipIfColumnFull?: boolean },
+  // WHY executor (sentinel-prod-8429 M): a caller that already holds a transaction must have THIS update judged,
+  // written and finished on that transaction. Without it the snapshot, the four asserts and the WIP check read
+  // the pool, so they judge a state the caller's own uncommitted writes have not reached. With no executor the
+  // function keeps its exact previous geometry, including opening its own transaction.
+  // opts.closeRequest comes from the bead adapter or from the typed closeRequest of PATCH
+  // /issues/:issueId (Root 2026-11-15 msg_5d07db43120d). Either way it names a manifest
+  // repository key, a commit or an artifact path, and an epoch; it cannot name the closer, a
+  // repository path, a ref or a verified flag. On a rig-gated project it lets a closing move
+  // commit once the server has observed the proof it names and the claim row. An ordinary
+  // project has no gate and ignores it.
+  opts?: {
+    onlyIfColumnId?: number;
+    skipIfColumnFull?: boolean;
+    executor?: DbExecutor;
+    closeRequest?: CloseRequest;
+  },
 ): Promise<IssueRow | null> {
-  const before = await loadSnapshot(id);
+  const executor: DbExecutor = opts?.executor ?? db;
+  const runTx = <T>(fn: (tx: DbExecutor) => Promise<T>): Promise<T> =>
+    opts?.executor === undefined ? db.transaction(fn) : fn(opts.executor);
+  const before = await loadSnapshot(id, executor);
   if (!before) return null;
 
   // Each date is checked against the effective other one: a patch sets one date
@@ -1900,26 +2062,29 @@ export async function updateIssue(
     patch.startDate !== undefined ? patch.startDate : before.startDate,
     patch.dueDate !== undefined ? patch.dueDate : before.dueDate,
   );
-  await assertAssignments(before.projectId, patch);
-  await assertInitiative(before.projectId, patch.initiativeId);
-  await assertCycle(before.projectId, patch.cycleId, before.cycleId);
-  await assertColumn(before.projectId, patch.columnId);
+  // WHY every guard takes the executor (sentinel-prod-8429): each one reads rows a caller's transaction may have
+  // written (a member, agent, initiative, cycle or column). Judged on the pool, a patch is refused for a row that
+  // exists on the transaction, or accepted against one the transaction removed.
+  await assertAssignments(before.projectId, patch, executor);
+  await assertInitiative(before.projectId, patch.initiativeId, executor);
+  await assertCycle(before.projectId, patch.cycleId, before.cycleId, executor);
+  await assertColumn(before.projectId, patch.columnId, executor);
   const movedToColumnId =
     patch.columnId !== undefined && patch.columnId !== before.columnId ? patch.columnId : null;
   // Only a move into a different column consumes capacity, so re-saving an issue
   // that already sits in a full column is never refused.
   if (movedToColumnId !== null) {
-    const breach = await wipLimitBreach(movedToColumnId);
+    const breach = await wipLimitBreach(movedToColumnId, 1, executor);
     if (breach && !opts?.skipIfColumnFull) throw breach;
-    if (breach) return getIssue(id);
+    if (breach) return getIssue(id, executor);
   }
-  await assertIssueType(before.projectId, patch.typeId);
-  await assertParent(before.projectId, id, patch.parentId);
+  await assertIssueType(before.projectId, patch.typeId, executor);
+  await assertParent(before.projectId, id, patch.parentId, executor);
 
   // An assignee sent with the same move wins over the column's auto-assignee.
   const autoAssignee =
     movedToColumnId !== null && patch.assigneeUserId === undefined
-      ? await columnAutoAssignee(movedToColumnId)
+      ? await columnAutoAssignee(movedToColumnId, executor)
       : null;
 
   const set: Partial<typeof issue.$inferInsert> = {};
@@ -1951,104 +2116,103 @@ export async function updateIssue(
     // A gated write runs the whole side-effect sequence on its own transaction, before the commit, and
     // hands the written row back; an ordinary project keeps its post-commit geometry and finishes on
     // the default client. Either way the diff is taken from the state the write actually changed.
-    const outcome = await db
-      .transaction(async (tx) => {
-        const rigHint = await projectRigHint(tx, before.projectId);
-        if (rigHint === null) {
-          const writeSet = await ordinaryUpdatePrep(tx, before.projectId, patch.parentId, id, set);
-          if (writeSet === null)
-            return {
-              wrote: false,
-              after: null as IssueRow | null,
-              judgedColumnId: before.columnId,
-            };
-          const rows = await tx
-            .update(issue)
-            .set(writeSet)
-            .where(guard)
-            .returning({ id: issue.id });
+    const outcome = await runTx(async (tx) => {
+      const rigHint = await projectRigHint(tx, before.projectId);
+      if (rigHint === null) {
+        const writeSet = await ordinaryUpdatePrep(tx, before.projectId, patch.parentId, id, set);
+        if (writeSet === null)
           return {
-            wrote: rows.length > 0,
+            wrote: false,
             after: null as IssueRow | null,
             judgedColumnId: before.columnId,
           };
-        }
-        const gated = await gateUpdateWrite(tx, {
-          rigHint,
-          id,
-          before,
-          patch,
-          set,
-          skipIfColumnFull: opts?.skipIfColumnFull === true,
-          onlyIfColumnId: opts?.onlyIfColumnId,
-        });
-        if (gated === null)
-          return { wrote: false, after: null as IssueRow | null, judgedColumnId: before.columnId };
-        const rows = await tx
-          .update(issue)
-          .set(gated.writeSet)
-          .where(guard)
-          .returning({ id: issue.id });
-        if (rows.length === 0)
-          return { wrote: false, after: null as IssueRow | null, judgedColumnId: before.columnId };
-        const afterTx = await getIssue(id, tx);
-        if (!afterTx) {
-          // The row this transaction just locked and updated must read back on the same transaction. If
-          // it does not, something is wrong with the write itself: refuse here rather than letting a
-          // gated write finish later on the pool.
-          throw new Error('This issue could not be read back inside its own update transaction');
-        }
-        // The diff uses the row the gate locked, never the pool snapshot: the pool copy can be stale,
-        // which would duplicate or drop status stretches, activity and notifications.
-        if (afterTx) {
-          await finishUpdate(tx, {
-            id,
-            before: gated.lockedBefore,
-            after: afterTx,
-            changed: true,
-            actor,
-          });
-        }
-        return { wrote: true, after: afterTx, judgedColumnId: gated.lockedBefore.columnId };
-      })
-      .catch((error) => {
-        // The shared @repo/db refusal cannot import an API HttpError, so the gate's refusal is
-        // mapped next to the write it stopped, the same shape the gated create gives a caller.
-        // Every other throw is the writer's own and keeps its status and wording.
-        if (isTrackerGateRefusal(error)) {
-          const safe = error.safe_form ? ` Compliant form: ${error.safe_form}.` : '';
-          throw new HttpError(409, `${error.rule}: ${error.message}.${safe}`, error.code);
-        }
-        throw error;
+        const rows = await tx.update(issue).set(writeSet).where(guard).returning({ id: issue.id });
+        return {
+          wrote: rows.length > 0,
+          after: null as IssueRow | null,
+          judgedColumnId: before.columnId,
+        };
+      }
+      const gated = await gateUpdateWrite(tx, {
+        rigHint,
+        id,
+        before,
+        patch,
+        set,
+        skipIfColumnFull: opts?.skipIfColumnFull === true,
+        onlyIfColumnId: opts?.onlyIfColumnId,
+        actorUserId: actorId(actor),
+        closeRequest: opts?.closeRequest,
       });
-    if (!outcome.wrote) return getIssue(id);
-    if (outcome.after) {
-      // Gated: everything already ran on the write's transaction. Only the subtask cascade stays
-      // post-commit, because its nested updateIssue would wait on the rig row this call still holds.
-      if (outcome.judgedColumnId !== outcome.after.columnId)
-        await applySubtaskAutomation(outcome.after, actor);
-      return outcome.after;
-    }
-    const afterOrdinary = await getIssue(id);
+      if (gated === null)
+        return { wrote: false, after: null as IssueRow | null, judgedColumnId: before.columnId };
+      const rows = await tx
+        .update(issue)
+        .set(gated.writeSet)
+        .where(guard)
+        .returning({ id: issue.id });
+      if (rows.length === 0)
+        return { wrote: false, after: null as IssueRow | null, judgedColumnId: before.columnId };
+      if (gated.closer !== null) await releaseClosedClaim(tx, id, gated.closer);
+      const afterTx = await getIssue(id, tx);
+      if (!afterTx) {
+        // The row this transaction just locked and updated must read back on the same transaction. If
+        // it does not, something is wrong with the write itself: refuse here rather than letting a
+        // gated write finish later on the pool.
+        throw new Error('This issue could not be read back inside its own update transaction');
+      }
+      // The diff uses the row the gate locked, never the pool snapshot: the pool copy can be stale,
+      // which would duplicate or drop status stretches, activity and notifications.
+      if (afterTx) {
+        await finishUpdate(tx, {
+          id,
+          before: gated.lockedBefore,
+          after: afterTx,
+          changed: true,
+          actor,
+        });
+      }
+      // WHY the cascade runs here (Office D1 on 874adc71, Root msg_721028387750): a subtask or
+      // parent the automation closes is its own gated close and needs its own close facts and
+      // live claim. Run after the commit, its refusal reached the caller as a 409 for a close
+      // that had already committed and released its claim. On this transaction the refusal
+      // rolls the primary move, the claim release, the activity and the queued rows back with
+      // it. The nested updateIssue joins this transaction, so it does not wait on the rig row.
+      if (gated.lockedBefore.columnId !== afterTx.columnId)
+        await applySubtaskAutomation(afterTx, actor, tx);
+      return { wrote: true, after: afterTx, judgedColumnId: gated.lockedBefore.columnId };
+    }).catch((error) => {
+      // The shared @repo/db refusal cannot import an API HttpError, so the gate's refusal is
+      // mapped next to the write it stopped, the same shape the gated create gives a caller.
+      // Every other throw is the writer's own and keeps its status and wording.
+      if (isTrackerGateRefusal(error)) {
+        const safe = error.safe_form ? ` Compliant form: ${error.safe_form}.` : '';
+        throw new HttpError(409, `${error.rule}: ${error.message}.${safe}`, error.code);
+      }
+      throw error;
+    });
+    if (!outcome.wrote) return getIssue(id, executor);
+    // Gated: everything, the subtask cascade included, already ran on the write's transaction.
+    if (outcome.after) return outcome.after;
+    const afterOrdinary = await getIssue(id, executor);
     if (afterOrdinary) {
-      await finishUpdate(db, { id, before, after: afterOrdinary, changed: true, actor });
+      await finishUpdate(executor, { id, before, after: afterOrdinary, changed: true, actor });
       if (before.columnId !== afterOrdinary.columnId)
-        await applySubtaskAutomation(afterOrdinary, actor);
+        await applySubtaskAutomation(afterOrdinary, actor, executor);
     }
     return afterOrdinary;
   }
   // Nothing to write: the sequence still runs on the default client, where its calls are no-ops when
   // the snapshot did not move, exactly as before.
-  const current = await getIssue(id);
-  if (current) await finishUpdate(db, { id, before, after: current, changed: false, actor });
+  const current = await getIssue(id, executor);
+  if (current) await finishUpdate(executor, { id, before, after: current, changed: false, actor });
   return current;
 }
 
 // The update side effects, in the order they have always run. A gated write passes its transaction so a
 // failure here rolls the write back with them; an ordinary project passes the default client after the
-// commit. The subtask cascade is deliberately not here: it calls updateIssue again, which opens its own
-// transaction and would wait on the rig row the caller still holds, with no deadlock for Postgres to
-// detect.
+// commit. The subtask cascade is not here: it calls updateIssue again, and each caller runs it after this
+// sequence, on the write's transaction for a gated project and after the commit for an ordinary one.
 async function finishUpdate(
   executor: DbExecutor,
   facts: {
@@ -2172,10 +2336,9 @@ export async function deleteIssue(
 // reads no owner config and spawns nothing.
 //
 // On a gated project a label change can move a card in or out of a routed domain for whoever already
-// holds it, and no authenticated lane fact exists at this base. So a real change on a card someone holds
-// carries routing_facts: null and the owner refuses in its own words until the routing seam exists;
-// when nobody holds the card the key is omitted and the owner's legacy answer stands. The cost is stated
-// plainly: a label change on an assigned or delegated gated card refuses for now.
+// holds it or for an agent its stored text names. So every real change carries the routing facts
+// routingFactsFor builds from the stored holders, title and description, and the owner judges the lane
+// against the proposed labels. A person holding the card is no lane and adds no target.
 //
 // A shared @repo/db refusal mapped to the caller-facing shape the create path already gives: 409,
 // `rule: message`, and the compliant form. Local to this writer, so the create and update mappers stay
@@ -2329,13 +2492,27 @@ async function gatedLabelSave(
       bead_id: beadId,
     },
   };
-  // Only a real change can move a card between routed domains, and only a card somebody holds needs a
-  // routing judgement. With no authenticated seam to build the facts from, the op says so plainly.
-  if (
-    !sameLabelSet(previousLabels, proposedLabels) &&
-    (card.assignee_user_id || card.delegate_user_id)
-  )
-    op.routing_facts = null;
+  // Only a real change can move a card between routed domains. Every real change carries facts, held
+  // or not: the owner reads lane mentions in the stored title and description, and without the key it
+  // falls back to its legacy answer, which reads none. A card nobody holds and that names no agent
+  // gets empty targets, which the owner accepts. The holders are the stored ones; the class is read
+  // from the proposed labels, and the owner still sees a bearing marker the change removes, because
+  // it reads both states.
+  if (!sameLabelSet(previousLabels, proposedLabels)) {
+    const routed = await routingFactsFor(executor, {
+      beadId,
+      projectId,
+      // The label op carries the stored title and description, and the owner reads mentions there.
+      texts: [card.title, description],
+      assigneeUserId: card.assignee_user_id,
+      delegateUserId: card.delegate_user_id,
+      labels: proposedLabels,
+    });
+    if (routed.assigneeLane !== null) op.proposed_assignee = routed.assigneeLane;
+    if (routed.delegateLane !== null) op.delegate = routed.delegateLane;
+    op.routing_facts = routed.facts;
+  }
+  Object.assign(op, await skillFactsFor(executor, actorUserId ?? null));
   try {
     await gateIssueWrite({ rigId, op });
   } catch (error) {
