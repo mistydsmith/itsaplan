@@ -9,6 +9,7 @@ import { expect, test } from 'bun:test';
 import {
   buildRoutingFacts,
   parseRoutingPolicy,
+  routingAppliesToActor,
   routingPolicyProblem,
 } from '../tracker-routing-facts';
 
@@ -373,4 +374,16 @@ test('a label move into law-library with a valid compliance block is answered by
   expect(violations[0].message).toContain(
     "lane 'qwen2' is refused on law-library or legal-template work",
   );
+});
+
+// 8429 (Misty 2026-11-15): "i guarantee you EVERY block will block me too". Whether the routing policy is applied at all is one
+// decision, taken on the actor kind the caller read from the database. A person is not a lane; an agent and a system write are
+// judged by the routing policy exactly as before.
+test('a person is not routed, so no lane problem is decided against her', () => {
+  expect(routingAppliesToActor('human')).toBe(false);
+});
+test('an agent, a system write and an unread kind all keep the routing policy', () => {
+  expect(routingAppliesToActor('agent')).toBe(true);
+  expect(routingAppliesToActor('system')).toBe(true);
+  expect(routingAppliesToActor(undefined)).toBe(true);
 });

@@ -4,10 +4,12 @@ import { loadTrackerRulesConfig } from '@repo/db/tracker-gate';
 import {
   buildRoutingFacts,
   laneToken,
+  routingAppliesToActor,
   type TrackerRoutingFacts,
 } from '@repo/db/tracker-routing-facts';
 import { HttpError } from '#shared/lib';
 import { parseMentionHandles, resolveMentionHandles } from '#shared/mentions';
+import { actorKindOf } from './skill-facts';
 
 // The routing facts for the agents a gated write reaches: the ones it leaves holding the card,
 // or the ones a comment or a description names.
@@ -21,7 +23,7 @@ import { parseMentionHandles, resolveMentionHandles } from '#shared/mentions';
 // writer calls this one function, so there is one routing policy and not one per door.
 export async function routingFactsForUsers(
   tx: DbExecutor,
-  input: { beadId: string; userIds: string[]; labels: string[] },
+  input: { beadId: string; userIds: string[]; labels: string[]; actorUserId?: string | null },
 ): Promise<{
   facts: TrackerRoutingFacts | null;
   laneOf: (userId: string | null) => string | null;
@@ -40,6 +42,14 @@ export async function routingFactsForUsers(
   };
   const config = await loadTrackerRulesConfig();
   if (config.state !== 'configured') return { facts: null, laneOf };
+  // WHY 8429 (Misty 2026-11-15): "i guarantee you EVERY block will block me too". A person who is signed in and writing her own
+  // card is not a lane, so a lane this manifest cannot route must not refuse her write before the owner is asked. Her write goes
+  // on with no routing facts, which is the judgment an ungated card gets. The actor kind is read here from the ai_agent table,
+  // never taken from the request, so a caller cannot call itself a person: only a stored user with no agent row is one, and an
+  // agent or a system write keeps every refusal below exactly as it was.
+  if (routingAppliesToActor(await actorKindOf(tx, input.actorUserId ?? null)) === false) {
+    return { facts: null, laneOf };
+  }
   const built = buildRoutingFacts(config.routing, {
     beadId: input.beadId,
     lanes: agents.map((agent) => laneToken(agent.username)),
@@ -65,6 +75,7 @@ export async function routingFactsForText(
     labels: string[];
     texts: string[];
     userIds: string[];
+    actorUserId?: string | null;
   },
 ): ReturnType<typeof routingFactsForUsers> {
   const handles = new Set(input.texts.flatMap(parseMentionHandles));
@@ -73,5 +84,47 @@ export async function routingFactsForText(
     beadId: input.beadId,
     userIds: [...input.userIds, ...named.agentUserIds],
     labels: input.labels,
+    actorUserId: input.actorUserId ?? null,
   });
+}
+
+// The routing facts for whoever a gated write leaves holding the card, plus the agents its title and
+// description name.
+//
+// WHY this wrapper lives here and not in the write service (sentinel-prod-8429): who is being named is
+// decided only by the states the write leaves in place — the assignee and delegate it sets, and the
+// handles in its text — which is the same decision every gated writer makes here. The person doing the
+// write is carried as the actor, never as a target of her own write: the lanes she is assigning or
+// delegating to are the targets.
+export async function routingFactsFor(
+  tx: DbExecutor,
+  input: {
+    beadId: string;
+    projectId: number;
+    texts: string[];
+    assigneeUserId: string | null;
+    delegateUserId: string | null;
+    labels: string[];
+    actorUserId: string | null;
+  },
+): Promise<{
+  facts: TrackerRoutingFacts | null;
+  assigneeLane: string | null;
+  delegateLane: string | null;
+}> {
+  const { facts, laneOf } = await routingFactsForText(tx, {
+    beadId: input.beadId,
+    projectId: input.projectId,
+    texts: input.texts,
+    userIds: [input.assigneeUserId, input.delegateUserId].filter(
+      (userId): userId is string => userId !== null,
+    ),
+    labels: input.labels,
+    actorUserId: input.actorUserId,
+  });
+  return {
+    facts,
+    assigneeLane: laneOf(input.assigneeUserId),
+    delegateLane: laneOf(input.delegateUserId),
+  };
 }

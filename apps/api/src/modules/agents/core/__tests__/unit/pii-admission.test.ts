@@ -10,6 +10,7 @@ import {
   type TrackerRulesConfig,
 } from '@repo/db/tracker-rules';
 import * as admission from '../../pii-admission';
+import { routingFactsForUsers } from '../../../../issues/lane-routing';
 
 // 8429 row 29, A: one focused mutation pair against the ACTUAL production helper.
 //
@@ -156,5 +157,80 @@ describe('8429 row 29 A: admitRunnerDelivery — control and mutated guard', () 
     } finally {
       await rm(mutantPath, { force: true });
     }
+  });
+});
+
+// 8429 (Misty 2026-11-15): "i guarantee you EVERY block will block me too".
+//
+// The same routing seam this suite already runs for real, judged now on WHO is writing. Only the ai_agent read is synthetic:
+// rows returned make that read say agent, no rows make a signed-in user a person. loadTrackerRulesConfig, buildRoutingFacts,
+// laneToken and the refusal are the production ones. The router reads the lanes first and the actor kind second, so the fake
+// answers in that order and the case below names the order it depends on.
+const LANE_ROWS = [
+  { userId: 'bot-user-1', username: 'Cloud-Lane' },
+  { userId: 'bot-user-2', username: 'Unlisted-Lane' }, // MANIFEST routing.lanes has no entry for this one
+];
+
+function routerTx(actorRows: unknown[]): DbExecutor {
+  let reads = 0;
+  const chain = (rows: unknown[]) => {
+    const result = Promise.resolve(rows) as Promise<unknown> & { limit: () => Promise<unknown> };
+    result.limit = () => Promise.resolve(rows.slice(0, 1));
+    return result;
+  };
+  return {
+    select: () => ({ from: () => ({ where: () => chain(++reads === 1 ? LANE_ROWS : actorRows) }) }),
+  } as unknown as DbExecutor;
+}
+
+describe('8429: the routing seam judged on the actor behind the write', () => {
+  const unrouted = {
+    beadId: 'MKT-42',
+    userIds: ['bot-user-1', 'bot-user-2'],
+    labels: [] as string[],
+  };
+  let dir: string;
+  const priorEnv: Record<string, string | undefined> = {};
+  beforeAll(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'pii-admission-routing-'));
+    const manifestPath = join(dir, 'manifest.json');
+    await writeFile(manifestPath, JSON.stringify(MANIFEST));
+    for (const key of ['TRACKER_RULES_PYTHON', 'TRACKER_RULES_OWNER', 'TRACKER_RULES_MANIFEST']) {
+      priorEnv[key] = process.env[key];
+      if (key === 'TRACKER_RULES_PYTHON') process.env[key] = '/usr/bin/python3';
+      if (key === 'TRACKER_RULES_OWNER') process.env[key] = join(dir, 'owner.py');
+      if (key === 'TRACKER_RULES_MANIFEST') process.env[key] = manifestPath;
+    }
+  });
+  afterAll(async () => {
+    for (const key of ['TRACKER_RULES_PYTHON', 'TRACKER_RULES_OWNER', 'TRACKER_RULES_MANIFEST']) {
+      if (priorEnv[key] === undefined) delete process.env[key];
+      else process.env[key] = priorEnv[key];
+    }
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('a person writing her own card is not refused by a lane the manifest cannot route', async () => {
+    const { facts, laneOf } = await routingFactsForUsers(routerTx([]), {
+      ...unrouted,
+      actorUserId: 'person-1',
+    });
+    expect(facts).toBeNull();
+    // The lanes are still read, so nothing about an agent's identity is lost on the way to allowing the person.
+    expect(laneOf('bot-user-1')).toBe('cloud-lane');
+    expect(laneOf('person-1')).toBeNull();
+  });
+
+  it('an agent writer and a write with no user keep the lane-unrouted refusal unchanged', async () => {
+    const codes: (string | undefined)[] = [];
+    for (const actorUserId of ['bot-user-1', null]) {
+      try {
+        await routingFactsForUsers(routerTx([{ id: 1 }]), { ...unrouted, actorUserId });
+        codes.push(undefined);
+      } catch (error) {
+        codes.push((error as { code?: string }).code);
+      }
+    }
+    expect(codes).toEqual(['lane-unrouted', 'lane-unrouted']);
   });
 });

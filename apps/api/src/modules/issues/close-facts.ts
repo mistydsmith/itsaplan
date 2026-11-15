@@ -2,6 +2,7 @@ import type { DbExecutor } from '@repo/db';
 import { releaseClaim, type ClaimTransaction } from '@repo/db/issue-claim';
 import { observeArtifactFacts, observeCodeFacts } from '@repo/db/tracker-close-facts';
 import { loadTrackerRulesConfig, type TrackerCloseRepo } from '@repo/db/tracker-gate';
+import { type TrackerActorKind } from '@repo/db/tracker-routing-facts';
 import { sql } from 'drizzle-orm';
 import { HttpError } from '#shared/lib';
 
@@ -203,6 +204,19 @@ export function closeIsProven(op: Record<string, unknown>): boolean {
   const facts = op.close_facts as { verified?: unknown } | null | undefined;
   const claim = op.claim_facts;
   return facts != null && facts.verified === true && claim != null && typeof claim === 'object';
+}
+
+// Whether that backstop applies to this close at all.
+//
+// WHY 8429 (Misty 2026-11-15): "i guarantee you EVERY block will block me too". The backstop is the tracker refusing a signed-in
+// person on her own card before any rule owner is asked, so a person whose kind this server read from the database passes it. Her
+// close facts and claim facts are still read and attached exactly as before, and an agent or a system close is refused on the
+// same closeIsProven fact in the same words.
+export function closeBackstopApplies(
+  op: Record<string, unknown>,
+  actorKind: TrackerActorKind,
+): boolean {
+  return actorKind !== 'human' && !closeIsProven(op);
 }
 
 type Observed =

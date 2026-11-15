@@ -51,6 +51,20 @@ export function laneToken(value: string): string {
   return value.trim().toLowerCase();
 }
 
+// Who a gated write is being judged on: the authenticated writer, read from the database by the
+// caller (an ai_agent row is an agent, a user without one is a person, no user is a system write).
+export type TrackerActorKind = 'agent' | 'human' | 'system';
+
+// Whether the routing policy is applied to a write at all.
+//
+// WHY 8429 (Misty 2026-11-15): "i guarantee you EVERY block will block me too". A person is not a lane, so a routing policy
+// problem in some agent's lane is not a reason to refuse the card a person is trying to close, delegate or edit for herself.
+// A person's write is judged by the rule owner with no routing facts, which is the same judgment an ungated card gets, and
+// every agent and system write keeps the routing policy exactly as it is.
+export function routingAppliesToActor(actorKind: TrackerActorKind | undefined): boolean {
+  return actorKind !== 'human';
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }

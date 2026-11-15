@@ -35,7 +35,6 @@ import {
   isTrackerGateRefusal,
   type TrackerGateRefusal,
 } from '@repo/db/tracker-gate';
-import type { TrackerRoutingFacts } from '@repo/db/tracker-routing-facts';
 import { isIdFactsRefusal, snapshotIdFacts } from '@repo/db/tracker-issue-facts';
 import { alias } from 'drizzle-orm/pg-core';
 import {
@@ -82,7 +81,7 @@ import {
 import { stampIssueAnchors } from './anchor-stamp';
 import { skillFactsFor } from './skill-facts';
 import {
-  closeIsProven,
+  closeBackstopApplies,
   closeOpFields,
   closerOf,
   isBareClose,
@@ -91,7 +90,7 @@ import {
   type Closer,
   type CloseRequest,
 } from './close-facts';
-import { routingFactsForText } from './lane-routing';
+import { routingFactsFor } from './lane-routing';
 import { autoWatchIssue } from './watchers';
 import { attachLoggedMinutes } from './worklogs';
 import { recordCycleChange } from './cycle-history';
@@ -1379,16 +1378,16 @@ async function gateUpdateWrite(
       'close-request-without-close',
     );
   }
-  // Every op is judged before the one write. A close op carries no state for the legal-template
-  // rule to judge, so it takes no skill facts.
+  // Every op is judged before the one write. A close op carries the actor kind and no skill flags: it carried neither before, which
+  // hid from the owner and from the backstop below whether the writer closing the card was a person (sentinel-prod-8429).
+  const actorFacts = await skillFactsFor(tx, input.actorUserId ?? null);
   for (const op of ops) {
-    if (op.op !== 'close') Object.assign(op, await skillFactsFor(tx, input.actorUserId));
+    Object.assign(op, op.op === 'close' ? { actor_kind: actorFacts.actor_kind } : actorFacts);
     await gateIssueWrite({ rigId, op });
   }
-  // The writer-side close backstop, after the gate: a close commits only on close facts this
-  // server observed and a claim row it read. A close with no close request has neither, and a
-  // rule config that relaxed the close rule must not let it through.
-  if (closeOp !== undefined && !closeIsProven(closeOp)) {
+  // The writer-side close backstop, after the gate: a close commits only on close facts this server observed and a claim row it
+  // read, unless the writer is a person this server read from the database (closeBackstopApplies, sentinel-prod-8429).
+  if (closeOp !== undefined && closeBackstopApplies(closeOp, actorFacts.actor_kind)) {
     throw new HttpError(
       409,
       'This issue cannot be closed until verified close facts exist',
@@ -1562,45 +1561,13 @@ async function buildUpdateOp(
       assigneeUserId: routingChanged ? proposedAssignee : null,
       delegateUserId: routingChanged ? proposedDelegate : null,
       labels,
+      actorUserId: input.actorUserId,
     });
     if (routed.assigneeLane !== null) op.proposed_assignee = routed.assigneeLane;
     if (routed.delegateLane !== null) op.delegate = routed.delegateLane;
     op.routing_facts = routed.facts;
   }
   return ops;
-}
-
-// The routing facts for whoever the write leaves holding a gated card and for the agents its
-// title and description name. The policy is in lane-routing.ts, shared with the comment writers.
-async function routingFactsFor(
-  tx: DbExecutor,
-  input: {
-    beadId: string;
-    projectId: number;
-    texts: string[];
-    assigneeUserId: string | null;
-    delegateUserId: string | null;
-    labels: string[];
-  },
-): Promise<{
-  facts: TrackerRoutingFacts | null;
-  assigneeLane: string | null;
-  delegateLane: string | null;
-}> {
-  const { facts, laneOf } = await routingFactsForText(tx, {
-    beadId: input.beadId,
-    projectId: input.projectId,
-    texts: input.texts,
-    userIds: [input.assigneeUserId, input.delegateUserId].filter(
-      (userId): userId is string => userId !== null,
-    ),
-    labels: input.labels,
-  });
-  return {
-    facts,
-    assigneeLane: laneOf(input.assigneeUserId),
-    delegateLane: laneOf(input.delegateUserId),
-  };
 }
 
 // The bead identity for a new gated issue, allocated inside the caller's transaction. A
@@ -1762,6 +1729,7 @@ export async function createIssue(
           assigneeUserId: assigneeUserId ?? null,
           delegateUserId: input.delegateUserId ?? null,
           labels: labelNames,
+          actorUserId: actorUserId ?? null,
         });
         await gateIssueWrite({
           rigId,
@@ -2507,6 +2475,7 @@ async function gatedLabelSave(
       assigneeUserId: card.assignee_user_id,
       delegateUserId: card.delegate_user_id,
       labels: proposedLabels,
+      actorUserId: actorUserId ?? null,
     });
     if (routed.assigneeLane !== null) op.proposed_assignee = routed.assigneeLane;
     if (routed.delegateLane !== null) op.delegate = routed.delegateLane;

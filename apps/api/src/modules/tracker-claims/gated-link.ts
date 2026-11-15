@@ -167,6 +167,8 @@ export async function gateLinkChange(tx: ClaimTransaction, input: GatedLinkInput
       labels: card.labels,
       texts: [card.title, card.description],
       userIds: [userId],
+      // WHY 8429 (Misty 2026-11-15): the same door on the link side, judged on the person this server authenticated.
+      actorUserId: userId,
     });
     const facts = { routing_facts: routed.facts, ...skills };
     await gate(rigId, routingCheckOp(card, facts));

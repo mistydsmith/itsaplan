@@ -9,6 +9,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'bun:test';
 import { gateIssueWrite, TRACKER_GATE_ENV } from '@repo/db/tracker-gate';
 import {
   claimFactsOf,
+  closeBackstopApplies,
   closeIsProven,
   closeOpFields,
   closerOf,
@@ -298,5 +299,21 @@ describe('8429 G2 claim facts of a close', () => {
     expect(closeIsProven({ close_facts: { verified: 'true' }, claim_facts: claim })).toBe(false);
     expect(closeIsProven({ close_facts: { verified: true } })).toBe(false);
     expect(closeIsProven({ claim_facts: claim })).toBe(false);
+  });
+
+  // The mutation pair for sentinel-prod-8429: drop the person from closeBackstopApplies and the first line fails.
+  it("leaves a person's unproven close to the rule owner and refuses an agent's and a system's", () => {
+    const claim = claimFactsOf({ ...held, nowMs: NOW }, closerOf(HOLDER, request));
+    const unproven = { close_facts: null, claim_facts: claim };
+    const proven = { close_facts: { verified: true }, claim_facts: claim };
+    // WHY (Misty 2026-11-15): "i guarantee you EVERY block will block me too". The writer's own backstop is the tracker refusing a
+    // signed-in person on her own card before any rule owner speaks, so it does not apply to her. Every agent and system close is
+    // refused on the same closeIsProven fact in the same words as before this change.
+    expect(closeBackstopApplies(unproven, 'human')).toBe(false);
+    expect(closeBackstopApplies(unproven, 'agent')).toBe(true);
+    expect(closeBackstopApplies(unproven, 'system')).toBe(true);
+    expect(closeBackstopApplies(proven, 'human')).toBe(false);
+    expect(closeBackstopApplies(proven, 'agent')).toBe(false);
+    expect(closeBackstopApplies(proven, 'system')).toBe(false);
   });
 });

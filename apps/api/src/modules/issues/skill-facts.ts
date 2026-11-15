@@ -2,11 +2,31 @@ import { eq } from 'drizzle-orm';
 import { aiAgent, type DbExecutor } from '@repo/db';
 import { loadTrackerRulesConfig } from '@repo/db/tracker-gate';
 import { holdsSkillReceipt } from '@repo/db/tracker-skill-receipts';
+import { type TrackerActorKind } from '@repo/db/tracker-routing-facts';
 
 export interface TrackerSkillFacts {
-  actor_kind: 'agent' | 'human' | 'system';
+  actor_kind: TrackerActorKind;
   templates_skill_loaded: boolean;
   law_library_skill_loaded: boolean;
+}
+
+// The actor kind alone, read from the database on the caller's own transaction.
+//
+// WHY 8429 (Misty 2026-11-15): "i guarantee you EVERY block will block me too". A second seam, the lane router, needs the same
+// fact without the two skill flags, and two definitions of what a person is would one day disagree. One reader owns it, and it
+// reads the ai_agent row rather than anything a request could carry: a stored user with an agent row is an agent, a stored user
+// without one is a person, and a write with no user is a system write, which is not a person.
+export async function actorKindOf(
+  tx: DbExecutor,
+  actorUserId: string | null,
+): Promise<TrackerActorKind> {
+  if (actorUserId === null) return 'system';
+  const agents = await tx
+    .select({ id: aiAgent.id })
+    .from(aiAgent)
+    .where(eq(aiAgent.userId, actorUserId))
+    .limit(1);
+  return agents.length === 0 ? 'human' : 'agent';
 }
 
 // The skill declarations and the actor kind a gated write hands the rule owner.
@@ -26,16 +46,9 @@ export async function skillFactsFor(
   tx: DbExecutor,
   actorUserId: string | null,
 ): Promise<TrackerSkillFacts> {
-  if (actorUserId === null) {
-    return { actor_kind: 'system', templates_skill_loaded: false, law_library_skill_loaded: false };
-  }
-  const agents = await tx
-    .select({ id: aiAgent.id })
-    .from(aiAgent)
-    .where(eq(aiAgent.userId, actorUserId))
-    .limit(1);
-  if (agents.length === 0) {
-    return { actor_kind: 'human', templates_skill_loaded: false, law_library_skill_loaded: false };
+  const actor_kind = await actorKindOf(tx, actorUserId);
+  if (actor_kind !== 'agent') {
+    return { actor_kind, templates_skill_loaded: false, law_library_skill_loaded: false };
   }
   const config = await loadTrackerRulesConfig();
   const pins = config.state === 'configured' ? config.skills : undefined;

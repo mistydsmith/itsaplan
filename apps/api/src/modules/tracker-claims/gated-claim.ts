@@ -251,6 +251,10 @@ export async function judgeGatedClaim(
     labels,
     texts: [gatedCard.title, gatedCard.description],
     userIds: [userId],
+    // WHY 8429 (Misty 2026-11-15): this read is a person claiming her own card. The lane read is about the agents the card
+    // names; the person holding it is the actor, and a lane this manifest cannot route must not refuse her before the owner is
+    // asked. "i guarantee you EVERY block will block me too".
+    actorUserId: userId,
   });
   const facts = { routing_facts: routed.facts, ...(await skillFactsFor(tx, userId)) };
   await gate(rigId, routingCheckOp(gatedCard, facts));
