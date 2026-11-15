@@ -30,12 +30,12 @@ import {
 import { and, eq } from 'drizzle-orm';
 import {
   insertDiscoveredIds,
-  createLocalIssueAndRecord,
   createLocalComment,
   upsertImportRecord,
   findImportRecord,
   type ClaimedImportJob,
 } from '../../import-store';
+import { createLocalIssueAndRecord } from '../../import-store-issue';
 import { runCreate } from '../../import-worker';
 import type { SourceReader } from '../../reader';
 import type { CanonicalComment, CanonicalInitiative, CanonicalIssue } from '../../canonical';

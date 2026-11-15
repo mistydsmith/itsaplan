@@ -5,8 +5,12 @@ import {
   importSourceNames,
   readerForJob,
   sourceProjectKeyForJob,
+  afterIssueCreatedForJob,
   type CommonImportConfig,
 } from './import-sources';
+import { recordRetainedRows } from './import-retained';
+import { createLocalIssueAndRecord } from './import-store-issue';
+import { runDiscover } from './import-worker-discover';
 import type { SourceReader } from './reader';
 import type {
   CanonicalAttachment,
@@ -22,7 +26,6 @@ import {
   claimDueImportJobs,
   decryptImportCredential,
   saveImportJobCursor,
-  saveImportJobSourceProject,
   advanceImportJobPhase,
   completeImportJob,
   failImportJob,
@@ -42,7 +45,6 @@ import {
   createLocalStateAndRecord,
   createLocalLabel,
   createLocalCycleAndRecord,
-  createLocalIssueAndRecord,
   setIssueLabels,
   addIssueWatchers,
   createLocalCustomFieldAndRecord,
@@ -123,78 +125,6 @@ function buildReader(job: ClaimedImportJob): SourceReader {
   return readerForJob(job, decryptImportCredential(job));
 }
 
-// --- Discover: snapshot every source id up front, writing import_record rows
-// with no local mapping yet. Plane's own pagination cursor is not a safe
-// resumability anchor across a job that can span many ticks (see "Pagination"
-// in docs/dev/plane-import-source-notes.md) — Create resumes from this
-// snapshot instead, keyed on import_record's own id.
-
-interface DiscoverCursor {
-  subphase: 'meta' | 'issues';
-  planeCursor: string | null;
-}
-
-async function runDiscover(job: ClaimedImportJob, reader: SourceReader): Promise<void> {
-  const cursor = job.cursor as Partial<DiscoverCursor>;
-  if (cursor.subphase !== 'issues') {
-    await saveImportJobSourceProject(job.id, await reader.describeSource());
-    const [states, labels, cycles, customFields, issueTypes, initiatives] = await Promise.all([
-      reader.listStates(),
-      reader.listLabels(),
-      reader.listCycles(),
-      reader.listCustomFields(),
-      reader.listIssueTypes?.() ?? [],
-      reader.listInitiatives?.() ?? [],
-    ]);
-    await insertDiscoveredIds(
-      job.id,
-      'state',
-      states.map((s) => s.sourceId),
-    );
-    await insertDiscoveredIds(
-      job.id,
-      'label',
-      labels.map((l) => l.sourceId),
-    );
-    await insertDiscoveredIds(
-      job.id,
-      'cycle',
-      cycles.map((c) => c.sourceId),
-    );
-    await insertDiscoveredIds(
-      job.id,
-      'custom_field',
-      customFields.map((f) => f.sourceId),
-    );
-    await insertDiscoveredIds(
-      job.id,
-      'issue_type',
-      issueTypes.map((t) => t.sourceId),
-    );
-    await insertDiscoveredIds(
-      job.id,
-      'initiative',
-      initiatives.map((i) => i.sourceId),
-    );
-    const next: DiscoverCursor = { subphase: 'issues', planeCursor: null };
-    await saveImportJobCursor(job.id, next);
-    return;
-  }
-
-  const page = await reader.listIssues(cursor.planeCursor ?? null);
-  await insertDiscoveredIds(
-    job.id,
-    'issue',
-    page.items.map((i) => i.sourceId),
-  );
-  if (page.cursor === null) {
-    await advanceImportJobPhase(job.id, 'create', {});
-    return;
-  }
-  const next: DiscoverCursor = { subphase: 'issues', planeCursor: page.cursor };
-  await saveImportJobCursor(job.id, next);
-}
-
 // --- Create: materialize states/labels/cycles/custom fields once (cheap, unpaginated),
 // then finish one chunk of issues per tick, with their
 // comments and their attachment metadata (byte download is a later phase).
@@ -215,6 +145,7 @@ export async function runCreate(job: ClaimedImportJob, reader: SourceReader): Pr
   const afterId = cursor.lastRecordId ?? 0;
   const pending = await listImportRecords(job.id, 'issue', afterId, ISSUES_PER_TICK);
   if (pending.length === 0) {
+    await recordRetainedRows(job, reader);
     await advanceImportJobPhase(job.id, 'link', {});
     return;
   }
@@ -225,10 +156,6 @@ export async function runCreate(job: ClaimedImportJob, reader: SourceReader): Pr
   await saveImportJobCursor(job.id, next);
 }
 
-// stateOverrides (Plane state id -> itsaplan category) comes from the mapping review
-// step at job creation; only newly-created columns are affected, never a dedup-matched
-// existing one - createLocalStateAndRecord already never touches an existing match's
-// stateType.
 async function materializeStates(job: ClaimedImportJob, reader: SourceReader): Promise<void> {
   const pending = await listUncreatedImportRecords(job.id, 'state', 0, 1000);
   if (pending.length === 0) return;
@@ -375,25 +302,36 @@ async function createOneIssue(
       ? await findImportRecord(job.id, 'initiative', canonical.initiativeSourceId)
       : null;
 
-    localId = await createLocalIssueAndRecord(job.id, sourceId, String(canonical.sequenceId), {
-      projectId: job.projectId,
-      columnId,
-      typeId: typeRecord?.localId ?? null,
-      initiativeId: initiativeRecord?.localId ?? null,
-      cycleId: cycleRecord?.localId ?? null,
-      parentId: parentRecord?.localId ?? null,
-      assigneeUserId,
-      title: canonical.title,
-      description: canonical.descriptionMarkdown,
-      priority: canonical.priority,
-      startDate: canonical.startDate,
-      dueDate: canonical.dueDate,
-      estimatePoints: points(canonical.estimatePoints),
-      estimateMinutes: minutes(canonical.estimateMinutes),
-      createdAt: canonical.createdAt,
-      updatedAt: canonical.updatedAt,
-      archivedAt: canonical.archivedAt,
-    });
+    // The source's after-issue-created stamp (bd: the bead identity), run inside the
+    // create's own transaction - no after-commit stamp (Root, 8363.1, 2026-11-15).
+    const hook = afterIssueCreatedForJob(job);
+    localId = await createLocalIssueAndRecord(
+      job.id,
+      sourceId,
+      String(canonical.sequenceId),
+      {
+        projectId: job.projectId,
+        columnId,
+        typeId: typeRecord?.localId ?? null,
+        initiativeId: initiativeRecord?.localId ?? null,
+        cycleId: cycleRecord?.localId ?? null,
+        parentId: parentRecord?.localId ?? null,
+        assigneeUserId,
+        title: canonical.title,
+        description: canonical.descriptionMarkdown,
+        priority: canonical.priority,
+        startDate: canonical.startDate,
+        dueDate: canonical.dueDate,
+        estimatePoints: points(canonical.estimatePoints),
+        estimateMinutes: minutes(canonical.estimateMinutes),
+        createdAt: canonical.createdAt,
+        updatedAt: canonical.updatedAt,
+        archivedAt: canonical.archivedAt,
+      },
+      hook
+        ? (tx, localId) => hook(tx, { jobId: job.id, sourceId, projectId: job.projectId, localId })
+        : undefined,
+    );
   }
   const labelIds = await localLabelIds(job.id, canonical.labelSourceIds);
   if (labelIds.length) await setIssueLabels(localId, labelIds);
@@ -532,7 +470,8 @@ async function createComments(
 // moment it ran, so a sub-issue processed before its parent existed was left
 // with no parent — by Link, every issue in the job has been created.
 
-async function runLink(job: ClaimedImportJob, reader: SourceReader): Promise<void> {
+// Exported for the 8363.1 whole-pipeline D2 witness (runDiscover: import-worker-discover.ts).
+export async function runLink(job: ClaimedImportJob, reader: SourceReader): Promise<void> {
   const cursor = job.cursor as Partial<RecordCursor>;
   const afterId = cursor.lastRecordId ?? 0;
   const pending = await listCreatedImportRecords(job.id, 'issue', afterId, ISSUES_PER_TICK);
