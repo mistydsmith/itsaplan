@@ -1,9 +1,10 @@
 // scripts/landing-git.ts — sentinel-prod-8429 auto-lander unit 3: read-only Git eligibility.
-// WHY read-only, argv-only and env-isolated: it moves nothing, a ref can never be shell syntax, and an
-// ambient GIT_DIR must not answer about another repository.
+// WHY read-only: it moves nothing. The process that runs git is landing-git-runner.ts.
 
-import { execFileSync } from 'node:child_process';
 import { parseSubject, type LandingReceipt } from './landing-evidence';
+import { execRunner } from './landing-git-runner';
+
+export { execRunner, sanitizedEnv } from './landing-git-runner';
 
 export interface GitPolicy {
   repo: string;
@@ -57,64 +58,9 @@ const GLOB_LOOKING = /[*?[\]]/;
 // WHY separate from the glob test: a caret, dollar or backslash is regex syntax, and a doubled slash is a
 // malformed path; both must be refused with the normalized pattern named, never silently reinterpreted.
 const REGEX_LOOKING = /[\\^$]/;
-const MAX_BUFFER = 8 * 1024 * 1024;
-const TIMEOUT_MS = 30_000;
-
-// WHY all of these are stripped: each redirects which repository answers, or names a program to start.
-const STRIPPED_ENV = (
-  'GIT_DIR GIT_COMMON_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES ' +
-  'GIT_NAMESPACE GIT_CEILING_DIRECTORIES GIT_EXEC_PATH GIT_TEMPLATE_DIR GIT_SSH GIT_SSH_COMMAND GIT_ASKPASS ' +
-  'GIT_PROXY_COMMAND GIT_EDITOR GIT_SEQUENCE_EDITOR GIT_PAGER'
-).split(' ');
-
-// WHY pinned: a tool that answers only about the policy repository must not read user or system config,
-// and it must not refresh a shared index while it reads.
-const PINNED_ENV: Record<string, string> = {
-  GIT_CONFIG_NOSYSTEM: '1',
-  GIT_CONFIG_GLOBAL: '/dev/null',
-  GIT_CONFIG_SYSTEM: '/dev/null',
-  GIT_ATTR_NOSYSTEM: '1',
-  GIT_OPTIONAL_LOCKS: '0',
-};
 
 export function isFullSha(value: unknown): value is string {
   return typeof value === 'string' && FULL_SHA.test(value);
-}
-
-export function sanitizedEnv(
-  source: Record<string, string | undefined> = process.env,
-): NodeJS.ProcessEnv {
-  const env: Record<string, string> = {};
-  for (const [key, value] of Object.entries(source)) {
-    // WHY the whole GIT_TRACE family: with one of them set, git appends trace lines - including the
-    // SHAs under review - to a caller-chosen file, which contradicts a reader that claims to write nothing.
-    const stripped =
-      STRIPPED_ENV.includes(key) || key.startsWith('GIT_CONFIG_') || key.startsWith('GIT_TRACE');
-    if (value !== undefined && !stripped) env[key] = value;
-  }
-  return { ...env, ...PINNED_ENV };
-}
-
-/** One argv array per call, no shell, bounded output, a timeout, and a cleaned environment. */
-export function execRunner(repo: string): GitRunner {
-  return {
-    run(args) {
-      try {
-        const stdout = execFileSync('git', ['-C', repo, ...args], {
-          encoding: 'utf8',
-          maxBuffer: MAX_BUFFER,
-          timeout: TIMEOUT_MS,
-          stdio: ['ignore', 'pipe', 'pipe'],
-          env: sanitizedEnv(),
-        });
-        return { status: 0, stdout, stderr: '' };
-      } catch (error) {
-        const failure = error as { status?: number | null; stdout?: string; stderr?: string };
-        const status = typeof failure.status === 'number' ? failure.status : -1;
-        return { status, stdout: failure.stdout ?? '', stderr: failure.stderr ?? String(error) };
-      }
-    },
-  };
 }
 
 function brief(text: string): string {
@@ -224,12 +170,17 @@ type ReceiptFacts = Pick<LandingReceipt, 'allowedPaths' | 'itemKey'> & {
   baseSha: string;
 };
 
+// 'land' judges a candidate that has not landed. 'published-exact-tip' judges one that has, for the
+// retry of a failed record: the target must be exactly the candidate, and every other check still runs.
+export type GitEligibilityMode = 'land' | 'published-exact-tip';
+
 // Decides whether Git facts allow this candidate to land, in the order an operator would ask, with a named
 // code and a bounded reason for every refusal and no meaning inferred from an unknown exit code.
 export function evaluateGitEligibility(
   policy: GitPolicy,
   receipt: ReceiptFacts,
   runner?: GitRunner,
+  mode: GitEligibilityMode = 'land',
 ): GitDecision {
   // WHY the runner is built after validation: a default parameter is evaluated before the body, so
   // `runner = execRunner(policy.repo)` crashed on a null policy instead of returning POLICY_INVALID.
@@ -311,12 +262,22 @@ export function evaluateGitEligibility(
   const landed = ancestor(candidateSha, targetSha);
   if (landed === null)
     return refusal('GIT_FAILED', 'git could not tell whether the candidate already landed');
-  if (landed)
+  // WHY only these two refusals differ by mode: a published candidate is by definition in the target and
+  // the target is no longer the base. The subject, path, exclusion and authorship checks below are the
+  // reviewed landing's own facts and hold for it after the publish exactly as before.
+  const publishedTip = mode === 'published-exact-tip' && targetSha === candidateSha;
+  if (landed && !publishedTip)
     return refusal('ALREADY_LANDED', `candidate ${candidateSha} is already in ${policy.targetRef}`);
+  if (mode === 'published-exact-tip' && !publishedTip) {
+    return refusal(
+      'STALE_TARGET',
+      `target ${policy.targetRef} is ${targetSha}, not the published candidate ${candidateSha}`,
+    );
+  }
 
   // WHY stale target refuses: the receipt and verdict were written against one base; a moved target means
   // the reviewed sha no longer describes what would land, so a fresh exact-sha PASS is needed.
-  if (targetSha !== baseSha) {
+  if (!publishedTip && targetSha !== baseSha) {
     return refusal(
       'STALE_TARGET',
       `target ${policy.targetRef} is ${targetSha}, the receipt base is ${baseSha}`,
@@ -386,7 +347,9 @@ export function evaluateGitEligibility(
 
   return {
     eligible: true,
-    reason: `candidate ${candidateSha} may land on ${policy.targetRef} with ${paths.length} declared path(s)`,
+    reason: publishedTip
+      ? `candidate ${candidateSha} is the tip of ${policy.targetRef} with ${paths.length} declared path(s)`
+      : `candidate ${candidateSha} may land on ${policy.targetRef} with ${paths.length} declared path(s)`,
     facts: {
       candidateSha,
       baseSha,
