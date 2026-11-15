@@ -21,7 +21,7 @@ export interface TrackerRoutingGrant {
 }
 
 export interface TrackerRoutingPolicy {
-  lanes: Record<string, { execution: TrackerRoutingExecution }>;
+  lanes: Record<string, { execution: TrackerRoutingExecution; client_data_cleared?: boolean }>;
   grants: TrackerRoutingGrant[];
 }
 
@@ -29,6 +29,10 @@ export interface TrackerRoutingTarget {
   lane: string;
   execution: TrackerRoutingExecution;
   role: TrackerRoutingRole;
+  // The per-lane client-data clearance (Misty 2026-11-15), a sibling of execution, never a relabel
+  // of it: where a model runs stays the true execution fact, and other rules read that. Strict
+  // boolean, set by buildRoutingFacts from the manifest; an absent or non-true value lands false.
+  client_data_cleared: boolean;
 }
 
 export interface TrackerRoutingFacts {
@@ -84,6 +88,13 @@ export function routingPolicyProblem(routing: unknown): string | null {
       return `the manifest routing lane ${JSON.stringify(lane)} must be a trimmed lowercase token`;
     if (!isRecord(entry) || !EXECUTIONS.includes(entry.execution as string))
       return `the manifest routing lane ${lane} needs execution local or cloud`;
+    // Fail loudly at load: a present but non-boolean clearance is a config typo, and it must not
+    // silently leave a lane uncleared (Misty 2026-11-15). Absent is fine (not cleared).
+    if (entry.client_data_cleared !== undefined && typeof entry.client_data_cleared !== 'boolean')
+      return (
+        `the manifest routing lane ${lane} client_data_cleared must be a boolean when present, ` +
+        `not ${JSON.stringify(entry.client_data_cleared)}`
+      );
   }
   if (grants === undefined) return null;
   if (!Array.isArray(grants)) return 'the manifest routing grants must be a list';
@@ -159,7 +170,14 @@ export function buildRoutingFacts(
     // The default role is author. Another role exists only as a manifest grant for this exact
     // card and lane, which is then handed to the owner to bound.
     const grant = policy?.grants.find((g) => g.bead_id === input.beadId && g.lane === lane);
-    facts.targets.push({ lane, execution: entry.execution, role: grant?.role ?? 'author' });
+    facts.targets.push({
+      lane,
+      execution: entry.execution,
+      role: grant?.role ?? 'author',
+      // The cleared fact as a strict boolean: only an exact manifest true clears the lane for
+      // client data. Absent or false lands false; a malformed value was already refused at load.
+      client_data_cleared: entry.client_data_cleared === true,
+    });
     if (grant) {
       const { required_reviews, ...rest } = grant;
       facts.grants.push({ ...rest, authorized: true });

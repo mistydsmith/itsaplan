@@ -28,7 +28,7 @@ const ROUTING = {
   lanes: {
     qwen2: { execution: 'local' },
     codex_prime: { execution: 'cloud' },
-    gemini: { execution: 'cloud' },
+    gemini: { execution: 'cloud', client_data_cleared: true },
   },
   grants: [
     {
@@ -121,6 +121,11 @@ test('a valid routing section has no problem and a malformed one names it', () =
       grants: [{ bead_id: BEAD, lane: 'qwen2', role: 'author', scope: 's', reason: 'r' }],
     }),
   ).toContain('no lanes entry');
+  expect(
+    routingPolicyProblem({
+      lanes: { a: { execution: 'local', client_data_cleared: 'x' } },
+    }),
+  ).toContain('boolean');
 });
 
 test('a lane with no manifest entry refuses and is never defaulted to local', () => {
@@ -134,7 +139,7 @@ test('a lane with no manifest entry refuses and is never defaulted to local', ()
 
 test('the lane token is case-folded, the default role is author, and a person adds no target', () => {
   expect(facts(' Qwen2 ', ['size-small']).targets).toEqual([
-    { lane: 'qwen2', execution: 'local', role: 'author' },
+    { lane: 'qwen2', execution: 'local', role: 'author', client_data_cleared: false },
   ]);
   const none = buildRoutingFacts(policy, { beadId: BEAD, lanes: [], labels: ['pii:pii_free'] });
   expect(none).toEqual({
@@ -176,7 +181,9 @@ test('the owner allows a cloud lane on a bare pii_free card and refuses once pii
 
 test('a grant reaches the owner only for its own card and lane', () => {
   const granted = facts('gemini', [], 'sentinel-prod-8392');
-  expect(granted.targets).toEqual([{ lane: 'gemini', execution: 'cloud', role: 'reviewer' }]);
+  expect(granted.targets).toEqual([
+    { lane: 'gemini', execution: 'cloud', role: 'reviewer', client_data_cleared: true },
+  ]);
   expect(granted.grants).toEqual([{ ...ROUTING.grants[0], authorized: true }]);
   const other = facts('gemini', []);
   expect(other.targets[0].role).toBe('author');
