@@ -1,4 +1,13 @@
-import { db, initiative, initiativeLabel, issue, label, projectColumn, user } from '@repo/db';
+import {
+  type DbExecutor,
+  db,
+  initiative,
+  initiativeLabel,
+  issue,
+  label,
+  projectColumn,
+  user,
+} from '@repo/db';
 import { and, asc, desc, eq, ilike, inArray, or, sql } from 'drizzle-orm';
 import { labelNames, rowSide } from '#modules/issues/activity';
 import { getMembership } from '#modules/members/service';
@@ -276,8 +285,14 @@ export async function getInitiative(id: number): Promise<InitiativeRow | null> {
 
 // The project an initiative belongs to, or null if it does not exist. Used by the
 // access check on routes that address an initiative by its own id.
-export async function getInitiativeProjectId(id: number): Promise<number | null> {
-  const rows = await db
+// WHY the executor parameter (sentinel-prod-8429): updateIssue's initiative guard calls this inside a caller's
+// transaction, and an initiative the caller just created is invisible on the pool until commit. The default
+// keeps every existing caller on the pool.
+export async function getInitiativeProjectId(
+  id: number,
+  executor: DbExecutor = db,
+): Promise<number | null> {
+  const rows = await executor
     .select({ projectId: initiative.projectId })
     .from(initiative)
     .where(eq(initiative.id, id));

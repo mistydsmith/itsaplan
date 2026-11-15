@@ -89,6 +89,12 @@ export const IssueResponse = t.Object({
   projectId: t.Number(),
   sequenceNumber: t.Number(),
   identifier: t.String(),
+  beadId: t.Nullable(
+    t.String({
+      description:
+        'The bead id stored for the issue in a project with a rig, or null. The server allocates it; a request cannot set it.',
+    }),
+  ),
   typeId: t.Nullable(t.Number()),
   // The linked initiative, or null. It carries id + title for rendering, and status
   // to order the lanes of a board grouped by initiative. Create and update set it
@@ -661,6 +667,49 @@ export const moveIssueBody = t.Object({
   ),
 });
 
+// What a caller says about a close on a project whose tracker rules are on. It names where the
+// proof is; the server reads the commit or the file and the claim itself. It has no field for the
+// closer, a repository path, a branch or a verified flag: the closer is the session user and the
+// repository and branch come from the rule manifest under the `repo` key.
+const closeRequestBody = t.Object(
+  {
+    kind: t.Union([t.Literal('code'), t.Literal('report'), t.Literal('cancel')], {
+      description: 'code: a landed commit. report: a report file. cancel: the work is dropped.',
+    }),
+    reason: t.String({ minLength: 1, maxLength: 2000, description: 'Why the issue closes now.' }),
+    repo: t.Optional(
+      t.String({
+        minLength: 1,
+        maxLength: 100,
+        description: 'code: the repository key the rule manifest lists for this project.',
+      }),
+    ),
+    sha: t.Optional(
+      t.String({ pattern: '^[0-9a-f]{40}$', description: 'code: the full 40-hex commit.' }),
+    ),
+    artifact: t.Optional(
+      t.String({
+        minLength: 1,
+        maxLength: 1000,
+        description: 'report and cancel: the file path inside a configured artifact root.',
+      }),
+    ),
+    disposition: t.Optional(
+      t.String({ minLength: 1, maxLength: 200, description: 'cancel: where the work goes.' }),
+    ),
+    expectedEpoch: t.Integer({
+      minimum: 0,
+      description: 'The claim epoch you hold on this issue. Read it from the claim route.',
+    }),
+  },
+  {
+    additionalProperties: false,
+    description:
+      'Required to move an issue into a completed or canceled column on a project whose ' +
+      'tracker rules are on. You must hold the claim on the issue. Send it only with such a move.',
+  },
+);
+
 export const updateIssueBody = t.Object({
   columnId: t.Optional(t.Integer({ description: 'Move the issue to this column (state) id.' })),
   position: t.Optional(t.Number({ description: 'Ordering position within the column.' })),
@@ -708,6 +757,7 @@ export const updateIssueBody = t.Object({
   labelIds: t.Optional(
     t.Array(t.Integer(), { description: "Replace the issue's labels with these ids." }),
   ),
+  closeRequest: t.Optional(closeRequestBody),
 });
 
 export const subtaskDispositionQuery = t.Object({
@@ -725,14 +775,37 @@ export const setIssueFieldValueBody = t.Object({
 
 export const issueFieldParams = t.Object({ issueId: t.Numeric(), fieldId: t.Numeric() });
 
+const LINK_EPOCH =
+  'Only in a project with a rig, for a caller that is not a project owner: the claim epoch you last read for ';
+
 export const addIssueLinkBody = t.Object({
   targetIssueId: t.Integer({
     description: 'Numeric id of the issue on the other end of the relation.',
   }),
   kind: IssueLinkKindSchema,
+  expectedEpoch: t.Optional(
+    t.Integer({ minimum: 0, description: `${LINK_EPOCH}the issue in the path.` }),
+  ),
+  targetExpectedEpoch: t.Optional(
+    t.Integer({ minimum: 0, description: `${LINK_EPOCH}the target issue.` }),
+  ),
 });
 
 export const issueLinkParams = t.Object({ issueId: t.Numeric(), linkId: t.Numeric() });
+
+// A delete has no body, so the two epochs of an unlink are query fields.
+export const removeIssueLinkQuery = t.Object({
+  expectedEpoch: t.Optional(
+    t.Numeric({ minimum: 0, multipleOf: 1, description: `${LINK_EPOCH}the issue in the path.` }),
+  ),
+  targetExpectedEpoch: t.Optional(
+    t.Numeric({
+      minimum: 0,
+      multipleOf: 1,
+      description: `${LINK_EPOCH}the issue on the other end of the relation.`,
+    }),
+  ),
+});
 
 export const checklistTitleBody = t.Object({ title: ChecklistTitleSchema });
 

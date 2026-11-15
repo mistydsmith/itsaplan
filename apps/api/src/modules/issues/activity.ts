@@ -27,6 +27,7 @@ import {
   lockCommentForWrite,
   ownerCardFacts,
   readCommentTarget,
+  routedCommentOp,
   storedVersionBodies,
 } from './comment-history';
 import { addedMentionHandles, parseMentionHandles, resolveMentionHandles } from '#shared/mentions';
@@ -426,10 +427,8 @@ async function gatedCreateComment(input: {
       await assertReplyParent(tx, input.replyToId, input.params.issueId);
       const actorName = input.params.authorName ?? (await userName(input.actorUserId, tx));
       // The mention reach is computed once, before the gate, from the locked rows, and
-      // reused for the post-INSERT queue: one reach per write. A comment that reaches
-      // an agent is routed by the lane rule, so the op carries routing_facts: null and
-      // the owner refuses it — agent comments write through the run lifecycle, not this
-      // endpoint — rather than this seam guessing a routing.
+      // reused for the post-INSERT queue: one reach per write. The reached agents become
+      // routing targets, so the lane rule judges them from their stored identities.
       const mentioned = await resolveMentionHandles(
         input.projectId,
         input.params.authorName === undefined ? parseMentionHandles(input.params.body) : [],
@@ -441,16 +440,14 @@ async function gatedCreateComment(input: {
         mentioned.agentUserIds,
         tx,
       );
-      const agentReached =
-        agents.length > 0 &&
-        !(input.actorUserId != null && (await isAgentUser(input.actorUserId, tx)));
+      // The fan-out skips a comment an agent wrote, so that comment reaches nobody.
+      const actorIsAgent = input.actorUserId != null && (await isAgentUser(input.actorUserId, tx));
       const op = await buildCommentOp(tx, {
         issueId: input.params.issueId,
+        projectId: input.projectId,
         rigId: lockedRigId,
-        title: issue.title ?? '',
-        description: issue.description ?? '',
         body: input.params.body,
-        agentReached,
+        reachedUserIds: actorIsAgent ? [] : agents.map((agent) => agent.userId),
       });
       // The owner judges BEFORE the INSERT; a refusal rolls the whole write back.
       await gateIssueWrite({ rigId: lockedRigId, op });
@@ -587,32 +584,28 @@ async function assertReplyParent(
 
 // The comment_create op the owner judges: the full post-write state built from the
 // locked rows — the card's labels and identity as stored, the retained comments in id
-// order, the incoming body last. An agent-reached comment additionally carries
-// routing_facts: null, so the lane rule refuses it with its own wording rather than
-// this seam guessing a routing.
+// order, the incoming body last, with the routing facts routedCommentOp adds.
 async function buildCommentOp(
   tx: DbExecutor,
   input: {
     issueId: number;
+    projectId: number;
     rigId: number;
-    title: string;
-    description: string;
     body: string;
-    agentReached: boolean;
+    reachedUserIds: string[];
   },
 ): Promise<Record<string, unknown>> {
   // One builder for all three comment doors: this private shape stays what createComment calls, and the
   // op itself comes from comment-history, so a create judges the same retained version bodies an edit
   // does instead of only the live ones.
   const facts = await ownerCardFacts(tx, input.issueId, input.rigId);
-  return commentOp({
+  return routedCommentOp(tx, input.projectId, input.reachedUserIds, {
     opName: 'comment_create',
     facts,
     versions: await storedVersionBodies(tx, input.issueId),
     liveBefore: await liveCommentRows(tx, input.issueId),
     superseded: [],
     editBody: input.body,
-    agentReached: input.agentReached,
   });
 }
 
@@ -691,23 +684,25 @@ export async function updateComment(
       const facts = await ownerCardFacts(tx, locked.issueId, locked.rigId);
       const versions = await storedVersionBodies(tx, locked.issueId);
       const liveBefore = await liveCommentRows(tx, locked.issueId);
-      const op = commentOp({
-        opName: 'comment_edit',
-        facts,
-        versions,
-        liveBefore,
-        // The body this edit supersedes, from the locked row - never the request.
-        superseded: [locked.body],
-        targetId: locked.commentId,
-        editBody: body,
-        // The same condition W1's createComment uses: an agent is really reached, and the fan-out below
-        // will not skip the actor. A raw mentioned list is not that fact.
-        // The same author the reach and the queue use: a comment written by an agent is skipped
-        // however a human edits it, and a human comment is judged as human even when an agent edits.
-        agentReached:
-          reach.agents.length > 0 &&
-          !(locked.authorUserId != null && (await isAgentUser(locked.authorUserId, tx))),
-      });
+      // The same author the reach and the queue use: the fan-out skips a comment an agent wrote
+      // however a human edits it, so that edit reaches nobody.
+      const authorIsAgent =
+        locked.authorUserId != null && (await isAgentUser(locked.authorUserId, tx));
+      const op = await routedCommentOp(
+        tx,
+        projectId,
+        authorIsAgent ? [] : reach.agents.map((agent) => agent.userId),
+        {
+          opName: 'comment_edit',
+          facts,
+          versions,
+          liveBefore,
+          // The body this edit supersedes, from the locked row - never the request.
+          superseded: [locked.body],
+          targetId: locked.commentId,
+          editBody: body,
+        },
+      );
       try {
         await gateCommentOp(locked.rigId, op);
       } catch (error) {
@@ -810,7 +805,6 @@ export async function deleteComment(
         superseded: cascade.map((row) => row.body),
         // The whole locked cascade leaves the post-write list, not just the root.
         omitIds: cascade.map((row) => row.commentId),
-        agentReached: false,
       });
       try {
         await gateCommentOp(root.rigId, op);
