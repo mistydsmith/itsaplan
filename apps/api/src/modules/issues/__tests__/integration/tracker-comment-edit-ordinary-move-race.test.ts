@@ -13,7 +13,8 @@ import { sql } from 'drizzle-orm';
 const REQUIRED_DB = 'itsaplan_8364_d2_test';
 const LOOPBACK = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
 const GRANT = 'ITSAPLAN_8364_E3_MOVE_RACE';
-const OWNER_CONFIG = '/Users/misty/Output/reports/8364_root_policy_owner_R5/CONFIG.json';
+const OWNER_CONFIG =
+  '/Users/misty/Output/reports/itsaplan_cutover_20261114_ROOT_R1/8364_owner_composition/CONFIG.json';
 const MIGRATION = new URL(
   '../../../../../../../packages/db/drizzle/0183_comment_version.sql',
   import.meta.url,

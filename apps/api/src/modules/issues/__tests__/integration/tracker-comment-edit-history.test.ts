@@ -7,7 +7,9 @@ import { sql } from 'drizzle-orm';
 const REQUIRED_DB = 'itsaplan_8364_d2_test';
 const LOOPBACK = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
 const GRANT = 'ITSAPLAN_8364_E3_COMMENT_EDIT';
-const OWNER_CONFIG = '/Users/misty/Output/reports/8364_root_policy_owner_R5/CONFIG.json';
+// Root's composed owner pin (Sentinel 07a7bde25b): it routes comment_edit.
+const OWNER_CONFIG =
+  '/Users/misty/Output/reports/itsaplan_cutover_20261114_ROOT_R1/8364_owner_composition/CONFIG.json';
 const MIGRATION = new URL(
   '../../../../../../../packages/db/drizzle/0183_comment_version.sql',
   import.meta.url,
@@ -230,13 +232,18 @@ function causeChain(error: unknown): string {
     parts.push(String(link.code ?? '') + String(link.message ?? link));
   return parts.join(' | ');
 }
-async function refusedUnchanged(p: P, run: () => Promise<unknown>, ...phrases: string[]) {
+// A named agent whose lane the rule manifest does not list refuses before the owner runs.
+const unroutedUnchanged = (p: P, run: () => Promise<unknown>) =>
+  refusedWith('lane-unrouted', p, run, 'lane-routing');
+const refusedUnchanged = (p: P, run: () => Promise<unknown>, ...phrases: string[]) =>
+  refusedWith('tracker-rules-violation', p, run, ...phrases);
+async function refusedWith(code: string, p: P, run: () => Promise<unknown>, ...phrases: string[]) {
   const before = await board(p.projectId, p.rigId);
   const error = await withOwner(run).then(
     () => 'allowed',
     (e: Error) => e,
   );
-  expect(error).toMatchObject({ status: 409, code: 'tracker-rules-violation' });
+  expect(error).toMatchObject({ status: 409, code });
   for (const phrase of phrases) expect((error as Error).message).toContain(phrase);
   expect(await board(p.projectId, p.rigId)).toEqual(before);
 }
@@ -294,7 +301,6 @@ describe('the comment-edit history boundary', () => {
       superseded: ['progress: step one'],
       targetId: c.humanId,
       editBody: body,
-      agentReached: false,
     }) as Record<string, { comments: string[] }>;
     expect(op.previous_state.comments).toEqual([LL_BLOCK, 'progress: step one', AGENT_BODY]);
     expect(op.proposed_state.comments).toEqual([LL_BLOCK, 'progress: step one', body, AGENT_BODY]);
@@ -325,25 +331,18 @@ describe('the comment-edit history boundary', () => {
       () => updateComment(bare.humanId, 'progress: drafted section 3', p.author, p.projectId),
       'law-library-compliance',
     );
-    // Judged on the author, oagent is reached and refused; judged on the editor it would pass.
+    // A named agent is a routing target whoever edits, and the fixture agents hold no manifest lane.
     const c = await card(p, 'Agent reach', true, true);
-    await refusedUnchanged(
-      p,
-      () => updateComment(c.humanId, `please look @oagent${p.projectId}`, p.editor, p.projectId),
-      'lane-routing',
-      'routing needs routing_facts',
+    await unroutedUnchanged(p, () =>
+      updateComment(c.humanId, `please look @oagent${p.projectId}`, p.editor, p.projectId),
     );
-    // An agent editor is judged on the human author too, so adding @oagent is the same refusal.
-    await refusedUnchanged(
-      p,
-      () => updateComment(c.humanId, `agent asks @oagent${p.projectId}`, p.agent, p.projectId),
-      'lane-routing',
+    await unroutedUnchanged(p, () =>
+      updateComment(c.humanId, `agent asks @oagent${p.projectId}`, p.agent, p.projectId),
     );
-    // Owner edits the agent's comment: nobody reached; judging the editor would falsely refuse.
-    const runs = (await board(p.projectId, p.rigId)).runs;
-    const agentBody = `${AGENT_BODY} @agent${p.projectId}`;
-    await withOwner(() => updateComment(c.agentId, agentBody, p.editor, p.projectId));
-    expect((await board(p.projectId, p.rigId)).runs).toBe(runs);
+    // The same holds on an agent's own comment, where the edit reaches nobody and queues no run.
+    await unroutedUnchanged(p, () =>
+      updateComment(c.agentId, `${AGENT_BODY} @agent${p.projectId}`, p.editor, p.projectId),
+    );
     // A late failure rolls history, body, activity, webhook, notification and run back together.
     const late = await card(p, 'Late marker', true, true);
     const before = await board(p.projectId, p.rigId);
