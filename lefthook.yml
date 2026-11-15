@@ -18,6 +18,34 @@ pre-commit:
       run: bunx prettier --ignore-unknown --write {staged_files}
       stage_fixed: true
 
+# Bead-id commit-msg guard (sentinel-prod-8429 inventory row 1, carried from sentinel-prod/.beads/hooks/commit-msg,
+# bead sentinel-prod-ky5e): every commit subject must name the bead, because isolation says WHERE code landed and
+# the bead ID says WHY it exists. The rule itself lives in scripts/git-guard-rules.ts so it is testable without a
+# hook installed. Misty's NO-JAM law travels with it: BD_SKIP_BEAD_ID_CHECK=1 always bypasses, so this can never
+# permanently block her. Merge subjects are exempt, and nothing else is.
+# WHY the quoted zero and not the commit-msg-file template name: measured against lefthook 2.2.2 in a scratch
+# repository. Lefthook hands the commit message file to the command as its first positional argument, and it
+# passes the commit-msg-file template name through unexpanded, so a command written that way refuses every commit
+# with its own unreadable-file code. The receipt is
+# Output/reports/8429_qwen2_git_guard_atom_R1/scratch_hook_receipt_part1.log.
+commit-msg:
+  commands:
+    bead-id:
+      priority: 1
+      run: bun run scripts/git-guard-rules.ts commit-msg "{0}"
+
+# Shared-checkout rebase refusal (sentinel-prod-8429 inventory row 7, carried from
+# sentinel-prod/.beads/hooks/pre-rebase after the 2026-08-06 incident): the shared checkout commits forward only,
+# because a rebase there rewrites history other lanes already built on. This file is installed in lane worktrees
+# too, so the guard asks git which checkout it is in and refuses only in the shared one, in its own words.
+# git hands the pre-rebase hook the upstream as its first argument, and lefthook passes it through as "{0}", so
+# the refusal can name the branch and the upstream it stopped.
+pre-rebase:
+  commands:
+    shared-checkout:
+      priority: 1
+      run: bun run scripts/git-guard-rules.ts pre-rebase "{0}"
+
 # Anchor-map landing restamp (sentinel-prod-8428): after a merge lands in this
 # checkout — including a merge that carries a drizzle migration — re-stamp the
 # unfinished issues whose exact anchored files changed in the landed range, so
