@@ -66,7 +66,9 @@ export async function requestUser(request: Request): Promise<SessionUser | null>
 // A deactivated account goes no further. Any other gets its personal workspace here when
 // it has none yet, so one made before personal workspaces, by SCIM or while they were off
 // has it on its next request instead of its next sign-in.
-async function signedIn(user: SessionUser): Promise<SessionUser> {
+// WHY exported (sentinel-prod-8429): the executor entry must run the same deactivation and personal-workspace policy the
+// routes run, rather than a second, weaker identity path into the same writes. Body unchanged.
+export async function signedIn(user: SessionUser): Promise<SessionUser> {
   if (isAccountDeactivated(user)) throw new HttpError(401, 'This account is deactivated');
   await ensurePersonalWorkspace(user);
   await noteSeen(user.id);
