@@ -150,12 +150,11 @@ describe('the comment-create boundary', () => {
     const error = await refused(() =>
       withOwner(() => createComment({ issueId: card.issueId, body, actorUserId: p.authorId })),
     );
-    // The owner's own lane-rule wording for the missing routing facts, mapped to a 409 —
-    // and the board is exactly as it was: no comment row, nothing committed.
+    // A 409, and the board is exactly as it was: no comment row, nothing committed.
     expect(error.status).toBe(409);
-    expect(error.code).toBe('tracker-rules-violation');
+    // The fixture agent holds no manifest lane, so the write refuses before the owner runs.
+    expect(error.code).toBe('lane-unrouted');
     expect(error.message).toContain('lane-routing');
-    expect(error.message).toContain('routing needs routing_facts');
     expect(await board(p.projectId, p.rigId)).toEqual(before);
   }, 120_000);
 
@@ -180,9 +179,9 @@ describe('the comment-create boundary', () => {
       ),
     );
     expect(error.status).toBe(409);
-    expect(error.code).toBe('tracker-rules-violation');
+    // The fixture agent holds no manifest lane, so the write refuses before the owner runs.
+    expect(error.code).toBe('lane-unrouted');
     expect(error.message).toContain('lane-routing');
-    expect(error.message).toContain('routing needs routing_facts');
     expect(await board(p.projectId, p.rigId)).toEqual(before);
   }, 120_000);
 

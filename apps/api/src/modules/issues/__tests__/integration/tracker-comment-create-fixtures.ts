@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { sql } from 'drizzle-orm';
+import { tempManifest, withTempManifest } from '#tests/helpers/temp-manifest';
 
 // Synthetic fixtures for the comment-create proof, and nothing else: real rows, the real public
 // writer, the real pinned owner, the board read back. DATABASE HELD: without Root's grant flag this
@@ -8,7 +9,9 @@ import { sql } from 'drizzle-orm';
 const REQUIRED_DB = 'itsaplan_8364_d2_test';
 const LOOPBACK = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
 const GRANT = 'ITSAPLAN_8364_D3_COMMENT_CREATE';
-const OWNER_CONFIG = '/Users/misty/Output/reports/8364_root_policy_owner_R4/CONFIG.json';
+// Root's composed owner pin (Sentinel 07a7bde25b): it routes comment_create and comment_edit.
+const OWNER_CONFIG =
+  '/Users/misty/Output/reports/itsaplan_cutover_20261114_ROOT_R1/8364_owner_composition/CONFIG.json';
 export const MARK = 'zz_qw3_d3cc';
 
 function grantAndTarget(): void {
@@ -35,11 +38,31 @@ export async function one<T>(query: ReturnType<typeof sql>): Promise<T> {
 const OWNER = JSON.parse(readFileSync(OWNER_CONFIG, 'utf8')) as { python: string; owner: string };
 const GATE_NAMES = [TRACKER_GATE_ENV.python, TRACKER_GATE_ENV.owner, TRACKER_GATE_ENV.manifest];
 
+// The same pins plus a synthetic routing section, in a test-owned temp file: the shared CONFIG is
+// never written. qwen2 is local here for the test only; it states nothing about the real lane.
+// The file-lifetime copy is removed at process exit; the shared CONFIG is only read.
+const ROUTED_MANIFEST = tempManifest('tracker-comment-routing-', {
+  ...JSON.parse(readFileSync(OWNER_CONFIG, 'utf8')),
+  routing: { lanes: { qwen2: { execution: 'local' } } },
+}).path;
+
 // Each case's gate env comes back exactly as it was, so no case leaks its own onward.
-export async function withOwner<T>(run: () => Promise<T>): Promise<T> {
+export const withOwner = <T>(run: () => Promise<T>) => withManifest(OWNER_CONFIG, run);
+export const withRoutedOwner = <T>(run: () => Promise<T>) => withManifest(ROUTED_MANIFEST, run);
+// The same pins with the given usernames listed as synthetic local lanes, for a fixture agent
+// whose username carries its project id and so cannot be written into a manifest ahead of time.
+export function withLanesOwner<T>(lanes: string[], run: () => Promise<T>): Promise<T> {
+  const listed = Object.fromEntries(lanes.map((lane) => [lane, { execution: 'local' }]));
+  const content = { ...JSON.parse(readFileSync(OWNER_CONFIG, 'utf8')), routing: { lanes: listed } };
+  // The per-call copy is removed when run settles, also when it throws.
+  return withTempManifest('tracker-comment-lanes-', content, (manifest) =>
+    withManifest(manifest, run),
+  );
+}
+async function withManifest<T>(manifest: string, run: () => Promise<T>): Promise<T> {
   const prior = GATE_NAMES.map((name) => process.env[name]);
   GATE_NAMES.forEach((name, i) => {
-    process.env[name] = [OWNER.python, OWNER.owner, OWNER_CONFIG][i];
+    process.env[name] = [OWNER.python, OWNER.owner, manifest][i];
   });
   try {
     return await run();
