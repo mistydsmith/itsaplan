@@ -120,6 +120,13 @@ describe('outbound PII admission on the claimed chat answer', () => {
         targets: [{ lane: agent.username.toLowerCase(), execution: 'cloud' }],
       });
 
+      // A second owned PII-bearing answer: the control's answer is already closed
+      // failed above, and the claim selects only live rows, so the mutant's claim
+      // must be judged on a row that is still claimable.
+      const second = await send(asOwner, agent.id, 'Amend the property deed for the Ruiz estate file.');
+      expect(second.status).toBe(200);
+      const secondMessageId = second.data!.messageId;
+
       // The one targeted mutation: remove the actual gate call from a throwaway copy
       // of the real delivery source and claim the same owned answer through the copy.
       const deliveryPath = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'delivery.ts');
@@ -140,8 +147,9 @@ describe('outbound PII admission on the claimed chat answer', () => {
           '(actual gate call severed -> forbidden handoff observed)',
         );
         expect(forbidden).not.toBeNull();
+        expect(forbidden!.id).toBe(secondMessageId);
         expect(forbidden!.prompt).toContain('The person writes');
-        expect(forbidden!.prompt).toContain('Smith family property file');
+        expect(forbidden!.prompt).toContain('Ruiz estate file');
       } finally {
         rmSync(mutantPath, { force: true });
       }
