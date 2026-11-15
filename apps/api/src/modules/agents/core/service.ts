@@ -548,8 +548,15 @@ async function setFieldTriggers(
 // True if the user id is the bot user of an agent working in this project. Validates
 // that a delegate is an agent of the project before it is written to an issue, and is
 // what keeps the delegation and field triggers off an agent that is not a member.
-export async function isProjectAgent(projectId: number, userId: string): Promise<boolean> {
-  const rows = await db
+// WHY the executor parameter (sentinel-prod-8429): updateIssue's delegate guard calls this inside a caller's
+// transaction, where a pool read misses the caller's own uncommitted agent or membership rows. The default
+// keeps every existing caller on the pool.
+export async function isProjectAgent(
+  projectId: number,
+  userId: string,
+  executor: DbExecutor = db,
+): Promise<boolean> {
+  const rows = await executor
     .select({ id: aiAgent.id })
     .from(aiAgent)
     .where(and(eq(aiAgent.userId, userId), inProject(projectId)))

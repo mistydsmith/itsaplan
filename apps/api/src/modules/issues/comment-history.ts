@@ -2,6 +2,7 @@ import { issueActivity, lockIssueTree, type DbExecutor } from '@repo/db';
 import { gateIssueWrite } from '@repo/db/tracker-gate';
 import { eq, sql } from 'drizzle-orm';
 import { HttpError } from '#shared/lib';
+import { routingFactsForText } from './lane-routing';
 
 // The lock, history and owner-op facts the gated comment writers need, in one place.
 //
@@ -258,7 +259,6 @@ export function commentOp(input: {
   // proposed live list is the remainder and the cascade is never appended back.
   omitIds?: number[];
   editBody?: string;
-  agentReached: boolean;
 }): Record<string, unknown> {
   // An edit substitutes its body where it stands; a delete drops the whole omitted set; a create appends.
   const liveAfter: string[] = [];
@@ -296,7 +296,38 @@ export function commentOp(input: {
       comments: [...input.versions, ...input.superseded, ...liveAfter],
     },
   };
-  if (input.agentReached) op.routing_facts = null;
+  return op;
+}
+
+// The comment_create or comment_edit op with its routing facts.
+//
+// WHY every create and edit carries facts, reached agent or not (sentinel-prod-8364, Root
+// msg_9c74bb90114a): an op with no routing_facts goes to the owner's legacy rule, which reads no
+// mention, so a comment naming a fleet lane that has no agent here would pass. With facts the owner
+// refuses a mention that has no target. The texts are every body the owner is given, because it
+// reads mentions in all of them. A delete routes nobody and keeps calling commentOp.
+export async function routedCommentOp(
+  tx: DbExecutor,
+  projectId: number,
+  reachedUserIds: string[],
+  input: Parameters<typeof commentOp>[0],
+): Promise<Record<string, unknown>> {
+  const op = commentOp(input);
+  const routed = await routingFactsForText(tx, {
+    projectId,
+    beadId: input.facts.beadId,
+    labels: input.facts.labels,
+    texts: [
+      input.facts.title,
+      input.facts.description,
+      ...input.versions,
+      ...input.liveBefore.map((row) => row.body),
+      ...input.superseded,
+      input.editBody ?? '',
+    ],
+    userIds: reachedUserIds,
+  });
+  op.routing_facts = routed.facts;
   return op;
 }
 

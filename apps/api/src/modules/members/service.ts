@@ -96,8 +96,15 @@ export async function getMembershipSource(
 }
 
 // The current user's role in a project, or null when they are not a member.
-export async function getMembership(projectId: number, userId: string): Promise<MemberRole | null> {
-  const rows = await db
+// WHY the executor parameter (sentinel-prod-8429): updateIssue's assignee guard calls this, and a caller that
+// holds a transaction must have the membership judged on it. On the pool, a member the caller just added is
+// invisible and one it just removed still passes. The default keeps every existing caller on the pool.
+export async function getMembership(
+  projectId: number,
+  userId: string,
+  executor: DbExecutor = db,
+): Promise<MemberRole | null> {
+  const rows = await executor
     .select({ role: projectMember.role })
     .from(projectMember)
     .where(and(eq(projectMember.projectId, projectId), eq(projectMember.userId, userId)));
