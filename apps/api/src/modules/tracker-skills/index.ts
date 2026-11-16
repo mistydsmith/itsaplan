@@ -23,10 +23,12 @@ export const trackerSkillRoutes = new Elysia({
       detail: {
         summary: 'Read a tracker skill',
         description:
-          'Returns the pinned text of the templates or law_library skill and records that you ' +
-          'were served it. A legal-template issue write by an agent is refused until that agent ' +
-          'has read both skills in the last eight hours. Read the text before you write: the ' +
-          'record covers only you and only this version of the text.',
+          'Returns the pinned text of a tracker skill - templates, law_library, pleading, ' +
+          'headnote_authoring or jurisprudence - and records that you were served it. A ' +
+          'legal-template issue write by an agent is refused until that agent has read templates ' +
+          'and law_library in the last eight hours, and a claim names the skills its card labels ' +
+          'ask for. Read the text before you write: the record covers only you and only this ' +
+          'version of the text.',
         ...mcpTool('read_tracker_skill'),
       },
     },

@@ -31,6 +31,25 @@ export const ClaimResponse = t.Object({
   unchanged: t.Optional(
     t.Boolean({ description: 'True when the request found your live claim and wrote nothing.' }),
   ),
+  // What this card's labels ask its worker to load, read from the owner's pinned work-item table (8429). WHY the path and the
+  // sha256 travel with the name: the lane loads the exact bytes the manifest pins, and a delivery is recorded against that
+  // sha256. WHY a prompt and not a condition: the claim already succeeded, and nothing in this list withholds the card.
+  // A person's claim carries no list at all.
+  skills: t.Optional(
+    t.Array(
+      t.Object({
+        skill: t.String({ description: 'A skill this kind of card needs.' }),
+        path: t.String({ description: 'Absolute path the manifest pins this skill text at.' }),
+        sha256: t.String({
+          description: 'sha256 of the pinned text a delivery is recorded against.',
+        }),
+        loadCommand: t.String({ description: 'Route that serves the pinned text and records it.' }),
+      }),
+      {
+        description: 'Skills to load for this card. Absent when there is nothing for you to load.',
+      },
+    ),
+  ),
 });
 
 const Excluded = t.Record(t.String(), t.Integer(), {

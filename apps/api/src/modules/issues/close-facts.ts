@@ -101,6 +101,28 @@ export async function closeOpFields(input: {
   };
 }
 
+// The starting facts of a gated close op, built where the close facts are built (moved from
+// service.ts by sentinel-prod-8429.2 so the module stays within its measured line count).
+// WHY the name, not a state_type (sentinel-prod-8429.2): the claim rule's cancel arm compares
+// the observed column NAME against the native Review literal; the update op's previous and
+// proposed states keep state_type unchanged.
+export function closeOpStart(
+  beadId: string,
+  rigPrefix: string,
+  stateRows: { id: number | string; state_type: string; name: string | null }[],
+  lockedColumnId: number,
+): Record<string, unknown> {
+  const closeOp: Record<string, unknown> = {
+    op: 'close',
+    id: beadId,
+    rig_prefix: rigPrefix,
+  };
+  // 8429.2: the observed locked column's stored name - the Review literal the claim
+  // rule's cancel arm compares; null (no column row) fails closed in the owner.
+  closeOp.column_state = stateRows.find((r) => Number(r.id) === lockedColumnId)?.name ?? null;
+  return closeOp;
+}
+
 // Who closes and at which epoch. WHY actor is not part of CloseRequest (Root msg_9f996783879c):
 // claim_owner is readable by anyone who can read the card, so a closer that could name its own
 // actor could name the stored owner. The actor is the user id the update was authenticated as,
@@ -183,6 +205,15 @@ export function isBareClose(writeSet: Record<string, unknown>): boolean {
 // (Root msg_b6d390a40af4): a closed card must not stay held, and a release that fails means the
 // claim the owner judged is no longer the stored one, so the whole close rolls back.
 export async function releaseClosedClaim(tx: DbExecutor, issueId: number, closer: Closer) {
+  // 8429.2: the claim rule now allows an authorized cancel of an UNOWNED card. Releasing a claim
+  // that does not exist would refuse (not-claimed) and roll back the close the owner allowed, so
+  // the release is skipped when the locked row holds no owner. With an owner present the release
+  // runs exactly as before: the same actor and epoch, the same refusals.
+  const rows = (await tx.execute(
+    sql`SELECT claim_owner FROM issue WHERE id = ${issueId} FOR UPDATE`,
+  )) as unknown as { claim_owner: string | null }[];
+  if (rows.length === 0) throw new HttpError(404, 'Issue not found');
+  if (rows[0].claim_owner === null) return;
   const released = await releaseClaim(tx as ClaimTransaction, {
     issueId,
     actor: closer.actor,
@@ -200,7 +231,11 @@ export async function releaseClosedClaim(tx: DbExecutor, issueId: number, closer
 // The writer's own check after the gate allowed a close. WHY it stays (sentinel-prod-8429 G2): a
 // rule config that relaxed the close rule must still not let a close commit without facts this
 // server observed and a claim row it read.
+// 8429.2: the server-computed operator_close is its own proof - a human owner's screen close
+// carries no close request, so it has no observed close facts and no closer's claim row. The
+// fact is computed from the transaction's own reads, never from the body (see operatorCloseFact).
 export function closeIsProven(op: Record<string, unknown>): boolean {
+  if (op.operator_close === true) return true;
   const facts = op.close_facts as { verified?: unknown } | null | undefined;
   const claim = op.claim_facts;
   return facts != null && facts.verified === true && claim != null && typeof claim === 'object';
@@ -217,6 +252,102 @@ export function closeBackstopApplies(
   actorKind: TrackerActorKind,
 ): boolean {
   return actorKind !== 'human' && !closeIsProven(op);
+}
+
+// The one server-side fact the operator close rides on (8429.2): true only when the authenticated
+// user of this update is a human non-agent holding the project owner role. Computed from the
+// transaction's own reads - the aiAgent row and the membership role - never from the request
+// body. An agent key always has an aiAgent row, so it can never carry this fact, and a caller
+// that names the flag in its request is never read: buildUpdateOp builds the op field by field.
+export async function operatorCloseFact(
+  tx: DbExecutor,
+  input: { projectId: number; actorUserId: string | null },
+): Promise<boolean> {
+  if (input.actorUserId === null || input.actorUserId.length === 0) return false;
+  const rows = (await tx.execute(
+    sql`SELECT EXISTS(
+          SELECT 1 FROM ai_agent WHERE user_id = ${input.actorUserId}
+        ) AS is_agent,
+        (SELECT role FROM project_member
+         WHERE project_id = ${input.projectId} AND user_id = ${input.actorUserId}) AS member_role`,
+  )) as unknown as { is_agent: boolean; member_role: string | null }[];
+  if (rows.length === 0) return false;
+  return !rows[0].is_agent && rows[0].member_role === 'owner';
+}
+
+// The close op's trusted facts, all read on the transaction that holds the card's lock (8429.2):
+// the close request's observed proof (closeOpFields), the claim row of the authenticated closer,
+// and the operator_close fact. The closer is the authenticated user of the update, refused before
+// any proof is read; nothing a caller sent can set any of these.
+export async function attachCloseFacts(
+  closeOp: Record<string, unknown>,
+  input: {
+    tx: DbExecutor;
+    id: number;
+    rigPrefix: string;
+    beadId: string;
+    request?: CloseRequest;
+    projectId: number;
+    actorUserId: string | null;
+  },
+): Promise<void> {
+  const closer = input.request === undefined ? null : closerOf(input.actorUserId, input.request);
+  Object.assign(
+    closeOp,
+    await closeOpFields({
+      rigPrefix: input.rigPrefix,
+      beadId: input.beadId,
+      request: input.request,
+    }),
+  );
+  if (closer !== null) closeOp.claim_facts = await readClaimFacts(input.tx, input.id, closer);
+  closeOp.operator_close = await operatorCloseFact(input.tx, {
+    projectId: input.projectId,
+    actorUserId: input.actorUserId,
+  });
+  // 8429.2 producer wiring: the unowned Review cancel arm's trusted facts. review_cancel_actors is
+  // the owner CONFIG's pinned list (loadTrackerRulesConfig omits a malformed or empty list, so an
+  // absent fact means nobody, never a wider arm); author is the creator user id this server
+  // recorded when the card was created. Both ride on the op the owner judges, read on the
+  // transaction that holds the card's lock and never from the request; a missing author makes the
+  // owner's arm refuse, so a card whose creator cannot be proven is never cancelable on it.
+  const config = await loadTrackerRulesConfig();
+  if (config.state === 'configured' && config.review_cancel_actors !== undefined) {
+    closeOp.review_cancel_actors = config.review_cancel_actors;
+  }
+  closeOp.author = await cardAuthor(input.tx, input.id);
+}
+
+// The operator close wins over any held claim (8429.2): a closed card must not stay held, so when
+// the operator closes a card another lane holds, the server clears that claim on the same
+// transaction. WHY a direct clear rather than releaseClaim: the operator is not the claim's owner,
+// so the owner/epoch release would refuse; the owner rule already judged this close, and the clear
+// reads the claim row it judged under the same locks. The stored epoch stays, so the unowned row
+// sits at its released epoch, exactly as after an ordinary release.
+export async function clearOperatorCloseClaim(tx: DbExecutor, issueId: number): Promise<void> {
+  const rows = (await tx.execute(
+    sql`SELECT claim_owner FROM issue WHERE id = ${issueId} FOR UPDATE`,
+  )) as unknown as { claim_owner: string | null }[];
+  if (rows.length === 0) throw new HttpError(404, 'Issue not found');
+  if (rows[0].claim_owner === null) return;
+  await tx.execute(
+    sql`UPDATE issue SET claim_owner = NULL, claim_expires_at = NULL WHERE id = ${issueId}`,
+  );
+}
+
+// The trusted creator of a card (8429.2): the actor user id this server recorded on the card's
+// 'created' activity, the oldest such row. Null when there is no recorded creator; the owner's
+// cancel arm fails closed on a missing author, so a card whose creator cannot be proven is never
+// cancelable on that arm. Read on the transaction that holds the card's lock, never the request.
+export async function cardAuthor(tx: DbExecutor, issueId: number): Promise<string | null> {
+  const rows = (await tx.execute(
+    sql`SELECT actor_user_id
+       FROM issue_activity
+       WHERE issue_id = ${issueId} AND kind = 'activity' AND action = 'created'
+       ORDER BY created_at ASC, id ASC
+       LIMIT 1`,
+  )) as unknown as { actor_user_id: string | null }[];
+  return rows.length > 0 ? rows[0].actor_user_id : null;
 }
 
 type Observed =

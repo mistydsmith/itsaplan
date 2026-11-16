@@ -226,6 +226,29 @@ describe('8429 G2 gated close with a close request', () => {
   }, 120_000);
 });
 
+// 8429.2 D1 (office PAIRED-RETURN-R3): the server-proven operator close must win over a held
+// claim. An explicit human CloseRequest sets gated.closer nonnull AND operator_close true, so the
+// writer must clear the held claim (operator path) instead of delegating a wrong-owner release.
+describe('8429.2 D1 operator close over a held claim', () => {
+  it("clears another lane's held claim on an explicit owner close instead of rolling back", async () => {
+    const { f, card, done, request } = await setUp('ok');
+    // The fixture actor is a human project owner, so the server-computed operator_close is true.
+    await F.db.execute(
+      sql`INSERT INTO project_member (project_id, user_id, role)
+          VALUES (${f.projectId}, ${f.actorId}, 'owner')`,
+    );
+    // Another lane holds the card (not the fixture actor), so an ordinary release would refuse wrong-owner.
+    const holder = await F.laneAgent(f, 'closehold');
+    await claim(card.issueId, holder, 3, '5 minutes');
+    // The human owner sends an explicit CloseRequest: gated.closer nonnull AND operator_close true.
+    const after = await close(card.issueId, { columnId: done }, f.actorId, request);
+    expect(after?.columnId).toBe(done);
+    // The operator close cleared the held claim on the same transaction (no wrong-owner rollback).
+    const stored = await storedOf(card.issueId);
+    expect(stored.claim_owner).toBe(null);
+  }, 120_000);
+});
+
 // The same close through PATCH /issues/:issueId with a real session. The closer is the session
 // user; the body names only where the proof is.
 describe('8429 gated close through PATCH with a closeRequest', () => {

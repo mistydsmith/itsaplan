@@ -19,7 +19,12 @@ import {
   routingPolicyProblem,
   type TrackerRoutingPolicy,
 } from './tracker-routing-facts';
-import { skillPinsProblem, type TrackerSkillPins } from './tracker-skill-receipts';
+import {
+  skillPinsProblem,
+  workItemSkillsProblem,
+  type TrackerSkillPins,
+  type TrackerWorkItemSkills,
+} from './tracker-skill-receipts';
 
 // Trusted server config only: the sanctioned interpreter, the reviewed owner script, and the
 // manifest that pins the interpreter bytes and every file the owner imports.
@@ -81,12 +86,20 @@ export type TrackerGateConfigState =
   // reads it to build routing_facts, so it stays beside the transport config, not inside it.
   // `skills` is the manifest's optional skills section: the path and sha256 of each skill text the
   // server may deliver and take a receipt for. The transport never sees it either.
+  // `workItemSkills` is the manifest's optional work-item table: a card label to the skills that kind of card needs (8429). The
+  // transport never sees it either: a lane is told what to read, which is not a fact the owner rule judges.
   | {
       state: 'configured';
       config: TrackerRulesConfig;
       routing?: TrackerRoutingPolicy;
       skills?: TrackerSkillPins;
+      workItemSkills?: TrackerWorkItemSkills;
       close?: TrackerClosePolicy;
+      // `review_cancel_actors` is the manifest's pinned list for the claim rule's unowned Review
+      // cancel arm (sentinel-prod-8429.2): the only authenticated actors that arm accepts. The
+      // transport never sees it; the writer reads it to build the trusted op fact. Absent means
+      // nobody.
+      review_cancel_actors?: string[];
     };
 
 // The manifest's optional close section: per rig prefix, the repositories a code close may be
@@ -138,7 +151,9 @@ interface ManifestFile {
   limits?: unknown;
   routing?: unknown;
   skills?: unknown;
+  workItemSkills?: unknown;
   close?: unknown;
+  review_cancel_actors?: unknown;
 }
 
 const HEX64 = /^[0-9a-f]{64}$/;
@@ -161,13 +176,22 @@ function manifestProblem(manifest: unknown): string | null {
   if (typeof manifest !== 'object' || manifest === null || Array.isArray(manifest)) {
     return 'the manifest must be a json object';
   }
-  const { pythonSha256, fileSha256, limits, routing, skills, close } = manifest as ManifestFile;
+  const { pythonSha256, fileSha256, limits, routing, skills, workItemSkills, close } =
+    manifest as ManifestFile;
   if (close !== undefined) {
     const problem = closePolicyProblem(close);
     if (problem !== null) return problem;
   }
   if (skills !== undefined) {
     const problem = skillPinsProblem(skills);
+    if (problem !== null) return problem;
+  }
+  // WHY the work-item table is judged against the pins here (sentinel-prod-8429): a row may name only a skill the manifest
+  // already pins a path and sha256 for. Otherwise the server would tell a lane to load a skill its own tracker-skills route
+  // cannot serve. WHY a config refusal and not a gate: the table carries no allow and no deny. It changes nothing a write or a
+  // person may do; it only names what to read, so its own bad row is a config problem, judged before the service starts.
+  if (workItemSkills !== undefined) {
+    const problem = workItemSkillsProblem(skills, workItemSkills);
     if (problem !== null) return problem;
   }
   if (routing !== undefined) {
@@ -285,7 +309,19 @@ export async function loadTrackerRulesConfig(): Promise<TrackerGateConfigState> 
     state = { state: 'configured', config };
     if (pinned.routing !== undefined) state.routing = parseRoutingPolicy(pinned.routing);
     if (pinned.skills !== undefined) state.skills = pinned.skills as TrackerSkillPins;
+    if (pinned.workItemSkills !== undefined)
+      state.workItemSkills = pinned.workItemSkills as TrackerWorkItemSkills;
     if (pinned.close !== undefined) state.close = pinned.close as TrackerClosePolicy;
+    // A malformed or empty list is omitted, not an error: the arm treats absent as nobody, so a
+    // bad install value can only make the arm unavailable, never widen it.
+    const cancelActors = pinned.review_cancel_actors;
+    if (
+      Array.isArray(cancelActors) &&
+      cancelActors.length > 0 &&
+      cancelActors.every((name) => typeof name === 'string' && name.trim() !== '')
+    ) {
+      state.review_cancel_actors = cancelActors as string[];
+    }
   }
   configStates.set(key, state);
   return state;

@@ -8,12 +8,16 @@ import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'bun:test';
 import { gateIssueWrite, TRACKER_GATE_ENV } from '@repo/db/tracker-gate';
 import {
+  attachCloseFacts,
   claimFactsOf,
+  clearOperatorCloseClaim,
   closeBackstopApplies,
   closeIsProven,
   closeOpFields,
   closerOf,
   isBareClose,
+  operatorCloseFact,
+  releaseClosedClaim,
   closeRepoFor,
   type CloseRequest,
 } from '../../close-facts';
@@ -315,5 +319,96 @@ describe('8429 G2 claim facts of a close', () => {
     expect(closeBackstopApplies(proven, 'human')).toBe(false);
     expect(closeBackstopApplies(proven, 'agent')).toBe(false);
     expect(closeBackstopApplies(proven, 'system')).toBe(false);
+  });
+});
+
+describe('8429.2 release skip for a closing claim on an unowned card', () => {
+  // D1: an authorized cancel of an UNOWNED card must not attempt a release that the claim
+  // layer would refuse (not-claimed) and that would roll the close back.
+  const closer = closerOf('u-lane', {
+    kind: 'cancel',
+    reason: 'overtaken on operator order',
+    expectedEpoch: 0,
+  });
+  const fakeTx = (rows: unknown[]) =>
+    ({ execute: async () => rows }) as unknown as Parameters<typeof releaseClosedClaim>[0];
+
+  it('skips the release when the locked row holds no owner', async () => {
+    await expect(
+      releaseClosedClaim(fakeTx([{ claim_owner: null }]), 7, closer),
+    ).resolves.toBeUndefined();
+  });
+
+  it('refuses when the locked row is gone', async () => {
+    await expect(releaseClosedClaim(fakeTx([]), 7, closer)).rejects.toThrow('Issue not found');
+  });
+});
+
+describe('8429.2 operator close: the server-computed fact and the claim clear', () => {
+  type Tx = Parameters<typeof operatorCloseFact>[0];
+  const countingTx = (rows: unknown[] | ((query: unknown) => unknown[])) => {
+    const calls: unknown[] = [];
+    const tx = {
+      execute: async (query: unknown) => {
+        calls.push(query);
+        return typeof rows === 'function' ? rows(query) : rows;
+      },
+    } as unknown as Tx;
+    return { tx, calls };
+  };
+
+  it('computes operator_close only for a human non-agent holding the owner role', async () => {
+    const human = { is_agent: false, member_role: 'owner' };
+    expect(
+      await operatorCloseFact(countingTx([human]).tx, { projectId: 1, actorUserId: 'u-owner' }),
+    ).toBe(true);
+    expect(
+      await operatorCloseFact(countingTx([{ is_agent: true, member_role: 'owner' }]).tx, {
+        projectId: 1,
+        actorUserId: 'u-agent',
+      }),
+    ).toBe(false);
+    expect(
+      await operatorCloseFact(countingTx([{ is_agent: false, member_role: 'member' }]).tx, {
+        projectId: 1,
+        actorUserId: 'u-member',
+      }),
+    ).toBe(false);
+    expect(
+      await operatorCloseFact(countingTx([human]).tx, { projectId: 1, actorUserId: null }),
+    ).toBe(false);
+    expect(await operatorCloseFact(countingTx([]).tx, { projectId: 1, actorUserId: 'u' })).toBe(
+      false,
+    );
+  });
+
+  it('treats the server-computed operator_close as proven, exactly the boolean True', () => {
+    expect(closeIsProven({ operator_close: true })).toBe(true);
+    expect(closeIsProven({ operator_close: 1 })).toBe(false);
+    expect(closeIsProven({ operator_close: 'true' })).toBe(false);
+  });
+
+  it('clears a held claim on the operator close and leaves none behind', async () => {
+    const unowned = countingTx([{ claim_owner: null }]);
+    await clearOperatorCloseClaim(unowned.tx, 7);
+    expect(unowned.calls.length).toBe(1); // the locked read only: no UPDATE behind an empty row
+    const held = countingTx(() => [{ claim_owner: 'u-lane' }]);
+    await clearOperatorCloseClaim(held.tx, 7);
+    expect(held.calls.length).toBe(2); // the locked read, then the UPDATE
+    const gone = countingTx([]);
+    await expect(clearOperatorCloseClaim(gone.tx, 7)).rejects.toThrow('Issue not found');
+  });
+
+  it('sets the fact from the transaction only: nothing the caller sent rides on the op', async () => {
+    const human = countingTx([{ is_agent: false, member_role: 'owner' }]);
+    const op: Record<string, unknown> = {};
+    const input = { id: 7, rigPrefix: 'sentinel-prod', beadId: 'sentinel-prod-9', projectId: 1 };
+    await attachCloseFacts(op, { ...input, tx: human.tx, actorUserId: 'u-owner' });
+    expect(op.operator_close).toBe(true);
+    expect(op.claim_facts).toBeUndefined(); // no close request: no closer, no claim row
+    const agent = countingTx([{ is_agent: true, member_role: 'owner' }]);
+    const second: Record<string, unknown> = { operator_close: true }; // a caller-sent flag
+    await attachCloseFacts(second, { ...input, tx: agent.tx, actorUserId: 'u-agent' });
+    expect(second.operator_close).toBe(false); // recomputed from the row, never copied
   });
 });

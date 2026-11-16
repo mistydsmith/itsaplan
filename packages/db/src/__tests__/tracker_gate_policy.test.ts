@@ -1,5 +1,5 @@
-// Non-DB tests for the optional routing, skills and close sections of the gate manifest: what
-// loadTrackerRulesConfig returns for a sound section and the refusal for each malformed one.
+// Non-DB tests for the optional routing, skills, work-item and close sections of the gate manifest:
+// what loadTrackerRulesConfig returns for a sound section and the refusal for each malformed one.
 // The interpreter, owner and file pins are read from the composed owner CONFIG, which this suite
 // never writes. Nothing is spawned: only the manifest is parsed. Each case writes its own
 // manifest in a suite-owned temp dir, because the config is cached per env triple.
@@ -89,6 +89,59 @@ const CLOSE = {
 };
 const rig = (target: unknown) => ({ close: { rigs: { 'sentinel-prod': target } } });
 
+// The five skills the tracker can deliver, and the table of sentinel-prod-8429 in the shape the owner's manifest carries it.
+const PINNED_SKILLS = {
+  ...SKILLS,
+  pleading: { path: '/srv/skills/pleading.md', sha256: HEX },
+  headnote_authoring: { path: '/srv/skills/headnote-authoring.md', sha256: HEX },
+  jurisprudence: { path: '/srv/skills/jurisprudence.md', sha256: HEX },
+};
+const WORK_ITEMS = {
+  headnotes: ['headnote_authoring', 'law_library', 'jurisprudence'],
+  templates: ['templates', 'pleading', 'law_library'],
+};
+
+test('a sound work-item table comes back beside the pins it names', async () => {
+  const state = await load({ skills: PINNED_SKILLS, workItemSkills: WORK_ITEMS });
+  expect(state).toMatchObject({
+    state: 'configured',
+    skills: PINNED_SKILLS,
+    workItemSkills: WORK_ITEMS,
+  });
+});
+
+test('a work-item table with no skills section refuses: the row names a skill nothing pins', async () => {
+  const state = await load({ workItemSkills: { law_library: ['law_library'] } });
+  expect(state.state).toBe('refusal');
+  if (state.state === 'refusal') {
+    expect(state.code).toBe('tracker-rules-manifest-invalid');
+    expect(state.message).toContain('needs the law_library skill, which the manifest pins no path');
+  }
+});
+
+test('a malformed work-item table refuses and names its own row', async () => {
+  const row = (label: string, needed: unknown) => ({
+    skills: PINNED_SKILLS,
+    workItemSkills: { [label]: needed },
+  });
+  await expectInvalid([
+    ['not-mapping', { workItemSkills: [] }, 'work_item_skills section must be a mapping'],
+    ['unknown-label', row('headnote', ['law_library']), 'unknown work item label: headnote'],
+    ['empty-row', row('headnotes', []), 'headnotes must be a nonempty list of skills'],
+    [
+      'unknown-skill',
+      row('headnotes', ['pleading_forms']),
+      'names an unknown skill: pleading_forms',
+    ],
+    ['twice', row('headnotes', ['law_library', 'law_library']), 'names law_library twice'],
+    [
+      'unpinned-skill',
+      { skills: SKILLS, workItemSkills: { templates: ['templates', 'pleading'] } },
+      'needs the pleading skill, which the manifest pins no path for',
+    ],
+  ]);
+});
+
 test('sound routing, skills and close sections come back beside the composed pins', async () => {
   const state = await load({
     routing: { lanes: LANES, grants: [GRANT] },
@@ -110,7 +163,8 @@ test('a manifest with no optional section configures with none of them', async (
     state: 'configured',
     config: { python: owner.python, owner: owner.owner, ...PINS },
   });
-  for (const section of ['routing', 'skills', 'close']) expect(state).not.toHaveProperty(section);
+  for (const section of ['routing', 'skills', 'workItemSkills', 'close'])
+    expect(state).not.toHaveProperty(section);
 });
 
 test('routing with no grants gets an empty grant list, and one skill may be pinned alone', async () => {
@@ -159,7 +213,11 @@ test('a malformed routing section refuses', async () => {
 test('a malformed skills section refuses', async () => {
   await expectInvalid([
     ['not-mapping', { skills: [] }, 'skills section must be a mapping'],
-    ['unknown-skill', { skills: { pleading: SKILLS.templates } }, 'unknown skill: pleading'],
+    [
+      'unknown-skill',
+      { skills: { pleading_forms: SKILLS.templates } },
+      'unknown skill: pleading_forms',
+    ],
     [
       'relative-path',
       { skills: { templates: { path: 'skills/t.md', sha256: HEX } } },

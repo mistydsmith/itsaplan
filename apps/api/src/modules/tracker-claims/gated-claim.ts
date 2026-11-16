@@ -1,11 +1,14 @@
 import { sql } from 'drizzle-orm';
 import { claimIssue, type ClaimResult, type ClaimTransaction } from '@repo/db/issue-claim';
 import { gateIssueWrite, isTrackerGateRefusal } from '@repo/db/tracker-gate';
+import type { TrackerActorKind } from '@repo/db/tracker-routing-facts';
 import { claimFactsOf } from '#modules/issues/close-facts';
 import { routingFactsForText } from '#modules/issues/lane-routing';
 import { skillFactsFor } from '#modules/issues/skill-facts';
 import { HttpError } from '#shared/lib';
 import { buildReadinessFacts, type ReadinessFacts, type ReadinessRole } from './readiness-facts';
+import { claimSkillPromptsAfterClaim } from './skill-answer';
+import type { TrackerSkillPrompt } from '@repo/db/tracker-skill-receipts';
 
 // The claim of an issue in a project with a rig. WHY it is more than the lease (Root 2026-11-15,
 // 8429_READY_NATIVE_FACT_RULINGS_R1): the lease says only that nobody else holds the card. Whether
@@ -179,13 +182,28 @@ export interface GatedClaimInput {
 export async function claimGatedIssue(
   tx: ClaimTransaction,
   input: GatedClaimInput,
-): Promise<ClaimResult> {
+): Promise<ClaimResult & { skillPrompts?: TrackerSkillPrompt[] }> {
   const judged = await judgeGatedClaim(tx, input, true);
-  return claimIssue(tx, {
+  const result = await claimIssue(tx, {
     issueId: input.issueId,
     actor: input.userId,
     expectedEpoch: judged.expectedEpoch,
   });
+  // WHY the prompt travels on the answer and not as a check before the claim: the claim already ran the owner's own judgment,
+  // and a skill the lane has not loaded is not a reason to refuse the card. It is the next thing to read, and the claim is the
+  // answer a lane has in hand before it writes the card. Nothing here refuses, and nothing here speaks to a person: the wrapper
+  // answers a person before it reads anything, and answers an agent with nothing when the read itself fails (Office RETURN
+  // 2026-11-15), so a prompt can neither cost a claim nor roll one back.
+  if (!result.ok) return result;
+  const skillPrompts = await claimSkillPromptsAfterClaim(tx, {
+    labels: judged.labels,
+    actorKind: judged.actorKind,
+    userId: input.userId,
+  });
+  // WHY nothing is added when the list is empty: an empty list is the server saying "load these", which is a sentence with no
+  // object. A person is never told what to read, and an actor whose card asks for nothing gets no field at all.
+  if (skillPrompts.length === 0) return result;
+  return { ...result, skillPrompts };
 }
 
 // Both owner calls for one card, with no write. It returns when the owner allows the claim and
@@ -195,7 +213,15 @@ export async function judgeGatedClaim(
   tx: ClaimTransaction,
   input: GatedClaimInput,
   lock: boolean,
-): Promise<{ beadId: string; title: string; expectedEpoch: number }> {
+): Promise<{
+  beadId: string;
+  title: string;
+  expectedEpoch: number;
+  // The card's own stored labels and the actor kind the database gave, handed up so the claim answer can name the skills this
+  // kind of card needs. Both are reads, not request fields.
+  labels: string[];
+  actorKind: TrackerActorKind;
+}> {
   const { issueId, rigId, userId } = input;
   const [card] = await rows(
     tx,
@@ -295,5 +321,11 @@ export async function judgeGatedClaim(
     { actor: userId, expectedEpoch },
   );
   await gate(rigId, claimOp(gatedCard, facts, claim, built.facts));
-  return { beadId, title: gatedCard.title, expectedEpoch };
+  return {
+    beadId,
+    title: gatedCard.title,
+    expectedEpoch,
+    labels,
+    actorKind: facts.actor_kind,
+  };
 }

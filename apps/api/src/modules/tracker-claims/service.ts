@@ -11,6 +11,7 @@ import {
 import { eq, sql } from 'drizzle-orm';
 import { HttpError, iso } from '#shared/lib';
 import { claimGatedIssue } from './gated-claim';
+import type { TrackerSkillPrompt } from '@repo/db/tracker-skill-receipts';
 
 // The HTTP side of the issue claim. WHY userId is the only owner these functions take (Root
 // 2026-11-15): claim_owner is readable by anyone who can read the card, so a caller that could
@@ -25,6 +26,8 @@ export interface ClaimDto {
   expired: boolean;
   mine: boolean;
   unchanged?: boolean;
+  /** The skills this card's labels ask for that this user has no live receipt for (8429). Absent when no path answered. */
+  skills?: TrackerSkillPrompt[];
 }
 
 export function claimDto(state: ClaimState, expired: boolean, userId: string): ClaimDto {
@@ -53,7 +56,7 @@ export function claimExpired(state: ClaimState, nowMs: number): boolean {
 type Primitive = (
   tx: ClaimTransaction,
   input: { issueId: unknown; actor: unknown; expectedEpoch: unknown },
-) => Promise<ClaimResult>;
+) => Promise<ClaimResult & { skillPrompts?: TrackerSkillPrompt[] }>;
 
 async function write(primitive: Primitive, issueId: number, userId: string, expectedEpoch: number) {
   const result = await db.transaction((tx) =>
@@ -61,7 +64,12 @@ async function write(primitive: Primitive, issueId: number, userId: string, expe
   );
   if (!result.ok) throw claimRefusalError(result);
   // A claim or heartbeat that succeeded is live; a release leaves no deadline.
-  return { ...claimDto(result.claim, false, userId), unchanged: result.unchanged };
+  const dto = claimDto(result.claim, false, userId);
+  // WHY the skills travel only when a path answered them: a release, a heartbeat and an ordinary-project claim have no
+  // work-item answer to give. An empty list would read as "this card needs nothing", which nobody proved. The gated claim
+  // answers it from the card's stored labels and this user's live receipts.
+  if (result.skillPrompts !== undefined) dto.skills = result.skillPrompts;
+  return { ...dto, unchanged: result.unchanged };
 }
 
 // WHY the project row is read FOR SHARE before the issue is locked: a project with a rig is

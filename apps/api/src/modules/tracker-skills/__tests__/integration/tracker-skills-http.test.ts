@@ -1,11 +1,14 @@
-// GET /tracker/skills/:skill and its MCP tool with real sessions: the pinned text of the two real
-// skills is served byte for byte, the receipt is recorded for the session user only, and a
-// receipt one user holds opens nothing for another.
+// GET /tracker/skills/:skill and its MCP tool with real sessions: the pinned text of each pinned skill
+// is served byte for byte, the receipt is recorded for the session user only, and a
+// receipt one user holds opens nothing for another. This file exists for the two skills Root pinned at
+// the cutover (8364) and now carries the three 8429 skills (8429_SKILLS_BY_WORK_ITEM_SPEC_R1.md).
 // DATABASE HELD: the fixtures refuse before any client exists without Root's grant flag. This file
 // never calls resetDb. It removes by id the users it signs up, their workspaces, their receipts
 // and the OAuth client it registers. The skill files and the shared CONFIG are only read.
 import { createHash } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'bun:test';
 import { sql } from 'drizzle-orm';
 import { TRACKER_SKILLS, type TrackerSkill } from '@repo/db/tracker-skill-receipts';
@@ -17,12 +20,49 @@ const { signUpTestUser } = await import('#tests/helpers/auth');
 const { connectMcpClient, mcpRpc, registerMcpClient } = await import('#tests/helpers/mcp');
 const { routeTools } = await import('#mcp/generate');
 
-// The pins Root composed for the two real skills. The files are read through the route only.
+// The pins Root composed for the two skills the tracker knew at the cutover. The files are read through
+// the route only.
 const PINS_SOURCE =
   process.env.TRACKER_SKILLS_TEST_MANIFEST ??
   '/Users/misty/Output/reports/itsaplan_cutover_20261114_ROOT_R1/8364_owner_composition/MANIFEST_DRAFT.json';
 type Pins = Record<TrackerSkill, { path: string; sha256: string }>;
-const pins = (JSON.parse(readFileSync(PINS_SOURCE, 'utf8')) as { skills: Pins }).skills;
+// The three 8429 skills are named here rather than read from a review candidate, because a test may not
+// go red when a candidate file moves and the route serves only bytes a pin names. The same three path
+// and digest pairs are in /Users/misty/Output/reports/8429_SKILLS_CONFIG_CANDIDATE_R2.json for Prime to
+// install. WHY headnote_authoring is pinned to the master text (Root final ruling 2026-11-16): the pin names
+// 52b5c955e1721b07d99de39e13fcbcb2d6ad3fa8f4f0d15977e6f0cc4664177f, the sha256 of the master copy of that
+// skill. WHY the bytes are copied into a temporary directory this test owns rather than read from the shared
+// path or from a future owner release: the release export has no path until Root composes one, and the shared
+// skill file is what its owner is editing, so the test proves against a frozen local copy of the master text
+// that no lane is writing to. WHY the copy is checked before it is pinned: a fixture that is not the master
+// text would prove nothing, so its own digest is read here and the route's answer is proved again in the
+// cases below.
+const HEADNOTE_MASTER_SHA = '52b5c955e1721b07d99de39e13fcbcb2d6ad3fa8f4f0d15977e6f0cc4664177f';
+const HEADNOTE_MASTER_SOURCE =
+  process.env.TRACKER_SKILLS_TEST_HEADNOTE_MASTER ??
+  '/Users/misty/Output/reports/8429_headnote_master_export/SKILL.md';
+const headnoteFixtureDir = mkdtempSync(join(tmpdir(), 'tracker-skills-http-master-'));
+const HEADNOTE_MASTER_PATH = join(headnoteFixtureDir, 'SKILL.md');
+writeFileSync(HEADNOTE_MASTER_PATH, readFileSync(HEADNOTE_MASTER_SOURCE));
+process.on('exit', () => rmSync(headnoteFixtureDir, { recursive: true, force: true }));
+const NAMED_PINS: Partial<Pins> = {
+  pleading: {
+    path: '/Users/misty/Code/dss-law/skills/pleading/SKILL.md',
+    sha256: '8797dc8bb632a7762bbd0ff80692428bd4de4f6908ec44fe0409e95da0ec21ac',
+  },
+  headnote_authoring: {
+    path: HEADNOTE_MASTER_PATH,
+    sha256: HEADNOTE_MASTER_SHA,
+  },
+  jurisprudence: {
+    path: '/Users/misty/Code/dss-law/skills/jurisprudence/SKILL.md',
+    sha256: '807ac141011b4366f6a5f0bd344ebe64c114debedc9202c54cb51efa4eb24ef6',
+  },
+};
+const pins = {
+  ...NAMED_PINS,
+  ...(JSON.parse(readFileSync(PINS_SOURCE, 'utf8')) as { skills: Partial<Pins> }).skills,
+} as Pins;
 const composed = JSON.parse(readFileSync(F.OWNER_CONFIG, 'utf8')) as Record<string, unknown>;
 const PINNED = tempManifest('tracker-skills-http-', { ...composed, skills: pins }).path;
 // The same paths under a digest no file has.
@@ -80,6 +120,15 @@ const codeOf = (error: unknown) =>
   String((error as { value?: { code?: string } } | null)?.value?.code ?? '');
 
 describe('8364 G5 GET /tracker/skills/:skill', () => {
+  it('holds the master headnote text it claims to hold, in a copy no lane is editing', () => {
+    // Root final ruling 2026-11-16: the config and this test pin the master headnote text 52b5c955... The
+    // witness is the one a reviewer can run without Root's DB grant: the copy the pins name carries the digest
+    // the pins name, and the pins name that copy and no other path.
+    const fixture = createHash('sha256').update(readFileSync(HEADNOTE_MASTER_PATH)).digest('hex');
+    expect(fixture).toBe(HEADNOTE_MASTER_SHA);
+    expect(pins.headnote_authoring.sha256).toBe(HEADNOTE_MASTER_SHA);
+    expect(pins.headnote_authoring.path).toBe(HEADNOTE_MASTER_PATH);
+  });
   it('refuses a request with no session and records nothing', async () => {
     const before = await receiptCount();
     for (const skill of TRACKER_SKILLS) {

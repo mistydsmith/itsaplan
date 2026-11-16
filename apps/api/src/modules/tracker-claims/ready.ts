@@ -4,6 +4,7 @@ import { sql } from 'drizzle-orm';
 import { HttpError } from '#shared/lib';
 import { judgeGatedClaim } from './gated-claim';
 import { claimDto, claimRefusalError, type ClaimDto } from './service';
+import { claimSkillPromptsAfterClaim } from './skill-answer';
 
 // The ready pool of a project with a rig: the open cards nobody holds, each judged by the rule
 // owner for the requesting user. WHY every card is judged and none is assumed (Root 2026-11-15):
@@ -48,7 +49,7 @@ const candidates = (projectId: number) => sql`
     AND c.state_type NOT IN ('completed', 'canceled')
     AND (i.claim_expires_at IS NULL OR i.claim_expires_at <= clock_timestamp())`;
 
-type Candidate = { id: number | string; priority: string | null };
+export type Candidate = { id: number | string; priority: string | null };
 
 // The project's rig, held FOR SHARE until commit so every card is judged under one rig.
 async function heldRig(tx: ClaimTransaction, projectId: number): Promise<number> {
@@ -89,6 +90,54 @@ const count = (excluded: Record<string, number>, reason: string) => {
   excluded[reason] = (excluded[reason] ?? 0) + 1;
 };
 
+// HOW MUCH judgment work one page pays (sentinel-prod-8429, measured 2026-11-16): one card is two
+// rule-owner spawns, the state op and the claim op, and one page is DEFAULT_PAGE_SIZE = 25 cards, so
+// a page of the ready pool is 50 spawns of the pinned owner. Measured through the same transport the
+// server uses (loadTrackerRulesConfig plus checkTrackerRules, the pinned runtime config, synthetic
+// cards, no database): serial, 1689 ms for the page at 34 ms a spawn, p50 33 ms, p95 37 ms. Two
+// judgments in flight: 966 ms, p50 36 ms, p95 39 ms. Three: 714 ms but p95 71 ms. Four: 594 ms, p95
+// 80 ms. Eight: 354 ms, p95 61 ms, p50 44 ms. The wall keeps shrinking, the latency of each judgment
+// does not, and this machine has 12 cpus already carrying a load average near 7. Two is the largest
+// gain that costs nothing in tail latency and the smallest bound the measurement supports, so the
+// bound is 2 and not a rounder number. The whole 100-card pool is the same shape: 6876 ms serial,
+// 4081 ms at two, 2041 ms at four. Proof file
+// /Users/misty/Output/reports/8429_READY_OWNER_SPAWN_TIMING_R2.json.
+export const JUDGE_CONCURRENCY = 2;
+
+// Judge every candidate on the page with at most `concurrency` judgments in flight, and hand back
+// the allowed ones in the order the candidates arrived. WHY the slots (exported for the focused
+// test): a plain concurrent map would answer the page in completion order, and the ready pool is
+// ordered by priority and age, so a faster card must not overtake a more urgent one. WHY the
+// judgment itself is untouched: every card is still judged by the rule owner, state op and claim op
+// both, exactly as a single-card claim is judged. Nothing here decides a card may be skipped.
+export async function judgePage(
+  rows: Candidate[],
+  judge: (row: Candidate) => Promise<ReadyItem>,
+  excluded: Record<string, number>,
+  concurrency: number = JUDGE_CONCURRENCY,
+): Promise<ReadyItem[]> {
+  const slots: (ReadyItem | null)[] = rows.map(() => null);
+  const bound = Math.max(1, Math.min(concurrency, JUDGE_CONCURRENCY));
+  let cursor = 0;
+  const judgeOne = async () => {
+    for (;;) {
+      const at = cursor++;
+      if (at >= rows.length) return;
+      try {
+        slots[at] = await judge(rows[at]);
+      } catch (error) {
+        const reason = excludedReason(error);
+        // An error about the whole request (no rule config, no user) fails the request, as it did
+        // when the page was walked one card at a time.
+        if (reason === null) throw error;
+        count(excluded, reason);
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(bound, rows.length) }, () => judgeOne()));
+  return slots.filter((item): item is ReadyItem => item !== null);
+}
+
 export async function readReady(
   projectId: number,
   userId: string,
@@ -104,29 +153,26 @@ export async function readReady(
         sql`SELECT count(*)::int AS total ${candidates(projectId)}`,
       )) as unknown as { total: number }[];
       const rows = await window(tx, projectId, page);
-      const items: ReadyItem[] = [];
       const excluded: Record<string, number> = {};
-      for (const row of rows) {
-        const id = Number(row.id);
-        try {
+      const items = await judgePage(
+        rows,
+        async (row) => {
+          const id = Number(row.id);
           const judged = await judgeGatedClaim(
             tx,
             { issueId: id, rigId, userId, expectedEpoch: 'locked' },
             false,
           );
-          items.push({
+          return {
             id,
             beadId: judged.beadId,
             title: judged.title,
             priority: row.priority,
             epoch: judged.expectedEpoch,
-          });
-        } catch (error) {
-          const reason = excludedReason(error);
-          if (reason === null) throw error;
-          count(excluded, reason);
-        }
-      }
+          };
+        },
+        excluded,
+      );
       return {
         items,
         candidateTotal: total,
@@ -159,6 +205,12 @@ export async function claimReady(
     // leave the candidates while the walk runs (another user claims it), and an offset would then
     // pass over a card nobody judged. Each card is judged in a savepoint, so a refused card's row
     // lock is released and the walk holds only the one card it is judging.
+    // WHY this walk stays one card at a time while the page read judges two cards at once
+    // (sentinel-prod-8429): every judgment here runs in its own savepoint inside one transaction and
+    // ends by taking the lease, and savepoints on one connection cannot be open side by side - two
+    // in flight would write into each other's savepoint. The page read is reads only, so it can
+    // overlap. The walk also stops at the first allowed card, so its usual cost is one judgment, not
+    // a page of them.
     const judged: number[] = [];
     for (;;) {
       const rows = await window(tx, projectId, { limit: WALK_BATCH, offset: 0 }, judged);
@@ -176,8 +228,18 @@ export async function claimReady(
               expectedEpoch: allowed.expectedEpoch,
             });
             if (!result.ok) throw claimRefusalError(result);
+            // WHY the ready walk answers the same way a claim does (8429): the lane picks the card from this walk and then works
+            // it, so a skill this card needs has to reach it here as well as on a claim it asked for by hand. The same wrapper
+            // answers here, so a person is answered before anything is read and a prompt that cannot be computed leaves the walk
+            // and the claim intact.
+            const skillPrompts = await claimSkillPromptsAfterClaim(card, {
+              labels: allowed.labels,
+              actorKind: allowed.actorKind,
+              userId,
+            });
             const claimed = {
               ...claimDto(result.claim, false, userId),
+              ...(skillPrompts.length === 0 ? {} : { skills: skillPrompts }),
               id,
               beadId: allowed.beadId,
             };

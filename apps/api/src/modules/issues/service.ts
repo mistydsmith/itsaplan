@@ -81,11 +81,12 @@ import {
 import { stampIssueAnchors } from './anchor-stamp';
 import { skillFactsFor } from './skill-facts';
 import {
+  attachCloseFacts,
+  clearOperatorCloseClaim,
   closeBackstopApplies,
-  closeOpFields,
+  closeOpStart,
   closerOf,
   isBareClose,
-  readClaimFacts,
   releaseClosedClaim,
   type Closer,
   type CloseRequest,
@@ -1292,6 +1293,8 @@ async function gateUpdateWrite(
   lockedBefore: IssueSnapshot & { projectId: number; parentId: number | null };
   // The closer whose claim the owner judged, when this write is an allowed close.
   closer: Closer | null;
+  // The server-computed operator close fact of the close op, when this write is a close (8429.2).
+  operatorClose: boolean;
 } | null> {
   const { id, before, patch, set, skipIfColumnFull } = input;
   const rigRows = (await tx.execute(
@@ -1398,7 +1401,7 @@ async function gateUpdateWrite(
     closeOp !== undefined && input.closeRequest !== undefined
       ? closerOf(input.actorUserId, input.closeRequest)
       : null;
-  return { writeSet, lockedBefore, closer };
+  return { writeSet, lockedBefore, closer, operatorClose: closeOp?.operator_close === true };
 }
 
 // The operations the rule owner judges a gated update on, in judging order, built only from facts this
@@ -1432,11 +1435,11 @@ async function buildUpdateOp(
   const { id, rigId, lockedBefore, patch, movedToColumnId, set } = input;
   const columnIds = [lockedBefore.columnId, ...(movedToColumnId !== null ? [movedToColumnId] : [])];
   const stateRows = (await tx.execute(
-    sql`SELECT id, state_type FROM project_column WHERE id IN (${sql.join(
+    sql`SELECT id, state_type, name FROM project_column WHERE id IN (${sql.join(
       columnIds.map((columnId) => sql`${columnId}`),
       sql`, `,
     )})`,
-  )) as unknown as { id: number | string; state_type: string }[];
+  )) as unknown as { id: number | string; state_type: string; name: string | null }[];
   // A column the card names or targets with no row is a fact the seam cannot judge: refuse
   // it instead of inventing a state.
   const stateType = (columnId: number): string => {
@@ -1502,28 +1505,21 @@ async function buildUpdateOp(
   };
   const ops: Record<string, unknown>[] = [];
   if (isClose) {
-    const closeOp: Record<string, unknown> = {
-      op: 'close',
-      id: beadId,
-      rig_prefix: identityRows[0].prefix,
-    };
+    const closeOp = closeOpStart(beadId, identityRows[0].prefix, stateRows, lockedBefore.columnId);
     // The close op carries no states, because the identity rule owns a whole proposed state
     // only for the mutating ops and a close with one refuses before the close rule answers.
     // WHY the facts are read here (sentinel-prod-8429 G2): the commit or artifact and the claim
     // row are observed on the transaction that holds the card's lock, so the owner judges the
     // row this write changes. With no close request the facts are null and the owner refuses.
-    // The closer is the authenticated user of this update, refused before any proof is read.
-    const closer =
-      input.closeRequest === undefined ? null : closerOf(input.actorUserId, input.closeRequest);
-    Object.assign(
-      closeOp,
-      await closeOpFields({
-        rigPrefix: identityRows[0].prefix,
-        beadId,
-        request: input.closeRequest,
-      }),
-    );
-    if (closer !== null) closeOp.claim_facts = await readClaimFacts(tx, id, closer);
+    await attachCloseFacts(closeOp, {
+      tx,
+      id,
+      rigPrefix: identityRows[0].prefix,
+      beadId,
+      request: input.closeRequest,
+      projectId: lockedBefore.projectId,
+      actorUserId: input.actorUserId,
+    });
     ops.push(closeOp);
     // WHY a second op (Root msg_b6d390a40af4): a closing write that also sets a title, a
     // description, an assignee or a column auto-assignee is a full write, and the close op
@@ -2121,7 +2117,8 @@ export async function updateIssue(
         .returning({ id: issue.id });
       if (rows.length === 0)
         return { wrote: false, after: null as IssueRow | null, judgedColumnId: before.columnId };
-      if (gated.closer !== null) await releaseClosedClaim(tx, id, gated.closer);
+      if (gated.operatorClose) await clearOperatorCloseClaim(tx, id);
+      else if (gated.closer !== null) await releaseClosedClaim(tx, id, gated.closer);
       const afterTx = await getIssue(id, tx);
       if (!afterTx) {
         // The row this transaction just locked and updated must read back on the same transaction. If
