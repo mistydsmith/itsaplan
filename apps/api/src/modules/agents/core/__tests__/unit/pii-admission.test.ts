@@ -66,9 +66,14 @@ const syntheticOwner = async (
 // return into an early {ok:true}, the same forbidden outcome, without altering any
 // other production line. If this block moves in the helper, the pair is stale and
 // must be re-anchored.
-const GUARD =
-  '  if (!answer.ok)\n' + '    return { ok: false, code: answer.code, message: answer.message };';
-const MUTATED_GUARD = '  if (!answer.ok)\n    return { ok: true };';
+//
+// Re-anchored (sentinel-prod-8429, qwen2 2026-11-15): the anchor had drifted to a two-line if-body while the helper on main has
+// always carried this guard on one line - line 166 of pii-admission.ts - and one line is also the form prettier holds at
+// printWidth 100. The helper's own WHY requires only that every non-allow carries the config's, the owner's or the transport's
+// named code and words passed through; nothing in it requires a broken body. So the anchor follows the helper, and the mutation
+// is the same forbidden outcome as before: the refusal guard becomes an early allow.
+const GUARD = '  if (!answer.ok) return { ok: false, code: answer.code, message: answer.message };';
+const MUTATED_GUARD = '  if (!answer.ok) return { ok: true };';
 
 describe('8429 row 29 A: admitRunnerDelivery — control and mutated guard', () => {
   let dir: string;
