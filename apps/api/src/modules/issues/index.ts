@@ -437,13 +437,22 @@ export const issueRoutes = new Elysia({ name: 'issues', detail: { tags: ['Issues
   // Text search: matches q (case-insensitive substring) against the title,
   // description, issue number, and custom field text. Always searches every issue,
   // archived included, and each hit carries an 'archived' flag. Filtering by fields is
-  // a separate concern (see list_issues). This route comes before
-  // /issues/:sequenceNumber so the static "search" segment wins over the numeric param.
+  // a separate concern (see list_issues). Field mode (fieldId + afterId) instead
+  // selects one custom field as the match scope and pages it strictly by issue id;
+  // without fieldId the relevance order and results are byte-unchanged. This route
+  // comes before /issues/:sequenceNumber so the static "search" segment wins over the
+  // numeric param.
   .get(
     '/projects/:projectKey/issues/search',
     async ({ project, query }) => {
       const limit = Math.min(Math.max(query.limit ?? 50, 1), 500);
-      return searchIssues(project, { query: query.q, limit }, { includeArchived: true });
+      // fieldId/afterId pass straight through; the service refuses a cursor without the
+      // field mode, so a cursor can never ride the relevance order.
+      return searchIssues(
+        project,
+        { query: query.q, limit, fieldId: query.fieldId, afterId: query.afterId },
+        { includeArchived: true },
+      );
     },
     {
       params: projectKeyParams,

@@ -41,6 +41,7 @@ import {
   and,
   eq,
   exists,
+  gt,
   gte,
   ilike,
   inArray,
@@ -522,6 +523,11 @@ export async function searchIssues(
     createdTo?: Date;
     updatedFrom?: Date;
     updatedTo?: Date;
+    // Field mode (sentinel-prod-8427): one custom field as the match scope, paged
+    // strictly by issue.id. See the fieldMode branch below for why the cursor is
+    // only legal there.
+    fieldId?: number;
+    afterId?: number;
   },
   opts: { includeArchived?: boolean } = {},
 ): Promise<IssueSearchHit[]> {
@@ -529,12 +535,44 @@ export async function searchIssues(
   if (!opts.includeArchived) conds.push(isNull(issue.archivedAt));
 
   const raw = filters.query?.trim();
+  // Field mode (sentinel-prod-8427): the caller selects one custom field as the whole
+  // match scope and pages it strictly by issue.id. WHY the guards: the escaped-ILIKE
+  // field scope IS the query (no q would list every value-bearing card, a board-sized
+  // read), and a cursor over the relevance order would skip lower ids in later
+  // buckets - so afterId is refused outside this explicit id-ASC mode.
+  if (filters.fieldId !== undefined && !raw)
+    throw new HttpError(400, 'fieldId requires a non-empty q');
+  if (filters.afterId !== undefined && filters.fieldId === undefined)
+    throw new HttpError(400, 'afterId is only valid in field mode (with fieldId)');
+  const fieldMode = filters.fieldId !== undefined;
   let numberMatch: SQL | undefined;
   if (raw) {
-    const number = parseIssueNumber(raw);
-    if (number && (number.key === null || number.key.toLowerCase() === project.key.toLowerCase()))
-      numberMatch = eq(issue.sequenceNumber, number.seq);
-    conds.push(textMatch(raw, numberMatch));
+    if (fieldMode) {
+      // The field-scoped match reuses the marker's own EXISTS correlation shape
+      // (issueId + fieldId + escaped ILIKE on valueText): title, description, the
+      // issue number and every other field stay out of the match, so a hit is a
+      // value hit on exactly this field.
+      conds.push(
+        exists(
+          db
+            .select({ one: sql`1` })
+            .from(issueFieldValue)
+            .where(
+              and(
+                eq(issueFieldValue.issueId, issue.id),
+                eq(issueFieldValue.fieldId, filters.fieldId!),
+                ilike(issueFieldValue.valueText, `%${escapeLike(raw)}%`),
+              ),
+            ),
+        ),
+      );
+      if (filters.afterId !== undefined) conds.push(gt(issue.id, filters.afterId));
+    } else {
+      const number = parseIssueNumber(raw);
+      if (number && (number.key === null || number.key.toLowerCase() === project.key.toLowerCase()))
+        numberMatch = eq(issue.sequenceNumber, number.seq);
+      conds.push(textMatch(raw, numberMatch));
+    }
   }
 
   // Exact filters, mirroring matchesIssue: undefined skips the filter, null matches
@@ -594,9 +632,11 @@ export async function searchIssues(
   const base = db
     .select(hitColumns)
     .from(issue)
-    .where(and(...conds))
-    .orderBy(...hitOrder(numberMatch));
-  const rows = filters.limit !== undefined ? await base.limit(filters.limit) : await base;
+    .where(and(...conds));
+  // Field mode orders SOLELY issue.id ASC: a cursor composes only over a total order.
+  // The normal arm keeps its relevance order and results byte-unchanged.
+  const ordered = fieldMode ? base.orderBy(issue.id) : base.orderBy(...hitOrder(numberMatch));
+  const rows = filters.limit !== undefined ? await ordered.limit(filters.limit) : await ordered;
 
   const hits = rows.map((r) => toHit(r, project.key));
   await attachLabels(hits);

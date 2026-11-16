@@ -573,6 +573,28 @@ export const searchIssuesQuery = t.Object({
     }),
   ),
   limit: t.Optional(t.Numeric({ description: 'Max results (1-500). Default 50.' })),
+  // Field mode (sentinel-prod-8427): select ONE custom field as the whole match scope and
+  // page it strictly by issue id. A cursor over the relevance order would skip lower ids
+  // in later buckets, so the cursor only exists in this explicit id-ASC mode. t.Numeric
+  // (not t.Integer): query strings must be coerced to numbers - the file's established
+  // convention (see lines 13-15 and the limit field above); multipleOf: 1 keeps them
+  // integral.
+  fieldId: t.Optional(
+    t.Numeric({
+      minimum: 1,
+      multipleOf: 1,
+      description:
+        'Field mode: restrict text matches to this issue custom field only. Requires a non-empty q; pages strictly by issue id with afterId. Omit for normal relevance search.',
+    }),
+  ),
+  afterId: t.Optional(
+    t.Numeric({
+      minimum: 0,
+      multipleOf: 1,
+      description:
+        'Field-mode cursor: only issue ids strictly greater than this. Valid only with fieldId; the first page omits it or uses 0.',
+    }),
+  ),
 });
 
 export const searchAllIssuesQuery = t.Object({
