@@ -79,7 +79,7 @@ import {
   type IssueSnapshot,
 } from './activity';
 import { stampIssueAnchors } from './anchor-stamp';
-import { skillFactsFor } from './skill-facts';
+import { actorKindOf, skillFactsFor } from './skill-facts';
 import {
   attachCloseFacts,
   clearOperatorCloseClaim,
@@ -2681,11 +2681,11 @@ export async function bulkAddLabels(
   labelIds: number[],
   actorUserId?: string | null,
 ): Promise<number> {
-  // 8364 U4: a gated bulk label change is disabled here rather than judged member by member. A bulk
-  // write must validate every member before committing any, and gating each issue on its own would let
-  // some cards change while others refuse. Refusing the whole operation disables it instead of bypassing
-  // the gate; real gated bulk belongs to the bulk unit. Ordinary projects are unchanged.
-  if ((await projectRigHint(db, projectId)) !== null)
+  // People retain bulk label editing; agents and system writes keep the gated-bulk refusal.
+  if (
+    (await projectRigHint(db, projectId)) !== null &&
+    (await actorKindOf(db, actorUserId ?? null)) !== 'human'
+  )
     throw new HttpError(409, 'Bulk label changes are not available on a gated project yet');
   const add = [...new Set(labelIds)];
   await assertIssueLabels(projectId, add);

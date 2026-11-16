@@ -1,15 +1,6 @@
-// The gate on the direct label writer (8364 U4): a gated project's labels may change only through the gate, the ordinary branch is held by the project
-// row, and a card a lane holds is judged on routing facts built from stored identities and the manifest. Source only for now: every call is internal, there is no HTTP endpoint
-// or browser test, and nothing here runs until Root's serial DB GO sets the grant. A4 owns the whole create path, so the cards below come from createIssue
-// on a gated project and from plain SQL on an ordinary one; nothing simulates a card by bypassing a gate it is testing.
-// A write case always asks for a change the owner allows: the stored size-small out and size-large in. A request that drops the only size or adds a second
-// one belongs to a refusal case. A refusal case asks for the same valid request, so the rule that answers is the rule under test - size, routing, Law
-// Library, ledger, the gate's config rule or the ordinary branch's fence - and each case names that rule while the card staying intact is proved by untouched.
-// Root's mutation expectations, recorded so a later pass cannot quietly drop them:
-// (A) remove the gate call from a gated label change: 'refuses the size label that is no longer there', 'refuses a second size label', the stored-state
-//     case, both routed cases, the no-ledger-row case, 'refuses a gated label write that arrives through a supplied executor' and both bulk refusals fail.
-// (B) remove the FOR SHARE read the ordinary branch takes first: both race cases fail and only those.
+// 8364: direct label gates, ordinary-project fencing and the human bulk exemption.
 import { afterEach, describe, expect, it } from 'bun:test';
+import { readFileSync } from 'node:fs';
 import * as F from './tracker-labels-gate-fixtures';
 
 afterEach(async () => {
@@ -18,14 +9,11 @@ afterEach(async () => {
 
 const stored = (f: F.GateFacts) => [{ labelId: f.small, name: F.SIZE_SMALL }];
 const swapped = (f: F.GateFacts) => [{ labelId: f.large, name: F.SIZE_LARGE }];
-// The one case that adds a label instead of swapping one asserts its own shape: two links, one add row, one more label row on the board.
 const plusPlain = (f: F.GateFacts) => [
   { labelId: f.plain, name: F.PLAIN_LABEL },
   { labelId: f.small, name: F.SIZE_SMALL },
 ];
 
-// The change a successful size swap must make: the size-large link in place of size-small, one add row and one remove row naming each label as it was, the
-// same number of label rows, the card's own stamp moved, one delivery when the write asked for one, and nothing else on the board moved.
 async function swappedIn(f: F.GateFacts, issueId: number, before: F.Board, events: boolean) {
   expect(await F.linksOf(issueId)).toEqual(swapped(f));
   const acts = await F.activityOf(issueId);
@@ -54,7 +42,6 @@ async function swappedIn(f: F.GateFacts, issueId: number, before: F.Board, event
   expect(after.updatedAt).not.toBeNull();
   return after;
 }
-// A single add on an ordinary card: one new link, one add row, one more label row, one delivery.
 async function addedOne(f: F.GateFacts, issueId: number, before: F.Board) {
   expect(await F.linksOf(issueId)).toEqual(plusPlain(f));
   const acts = await F.activityOf(issueId);
@@ -67,7 +54,6 @@ async function addedOne(f: F.GateFacts, issueId: number, before: F.Board) {
   expect(after.updatedAt).not.toBe(before.updatedAt);
   return after;
 }
-// The proof of a refusal: nothing moved anywhere a label change could have moved it, and every card still holds exactly the labels it held before.
 async function untouched(f: F.GateFacts, cards: F.Card[], links: F.Link[], before: F.Board) {
   const after = await F.board(f);
   const counters = ['seq', 'root', 'issues', 'identities', 'labels', 'activity'] as const;
@@ -88,8 +74,6 @@ describe('8364 U4 gated label writer', () => {
     const ledgerBefore = await F.ledgerOf(F.RIG_PREFIX);
     const card = await F.gatedCard(f, 'Labelled work');
     const before = await F.board(f);
-    // The identity the owner reads is the one the server adapter minted: <rig prefix>-<local token>, with the title opening on the local token. Counters
-    // and ledger are compared against the baseline this case started from, because the shared rig accumulates across cases.
     const bead = card.beadId ?? '';
     expect(bead).toStartWith(`${F.RIG_PREFIX}-`);
     expect(card.title).toStartWith(bead.slice(F.RIG_PREFIX.length + 1));
@@ -163,8 +147,6 @@ describe('8364 U4 gated label writer', () => {
     ];
     expect(await F.linksOf(plain.issueId)).toEqual(stored(f));
     expect(await F.linksOf(lawStored.issueId)).toEqual(lawLinks);
-    // The identical request on two cards: the card that stores only a size takes it, the card that stores a Law Library label does not. The refusal comes
-    // from what the card already holds, not from what the call asked for.
     await F.withOwner(() =>
       F.setIssueLabels(f.projectId, plain.issueId, [f.large], f.actorId, true),
     );
@@ -187,7 +169,6 @@ describe('8364 U4 gated label writer', () => {
   it('allows the same labels resent in a different order on a held card', async () => {
     const f = await F.fixture(true, 'reorder');
     const card = await F.gatedCard(f, 'Reordered labels');
-    // First the second label is added through the gate on a card nobody holds, so the card genuinely stores both.
     await F.withOwner(() =>
       F.setIssueLabels(f.projectId, card.issueId, [f.plain, f.small], f.actorId, false),
     );
@@ -195,7 +176,6 @@ describe('8364 U4 gated label writer', () => {
     const held = await F.linksOf(card.issueId);
     expect(held).toEqual(plusPlain(f));
     const mid = await F.board(f);
-    // The same two ids, in the opposite order, on a card somebody holds. Nothing moved, so no routing judgement is owed and none is refused.
     await F.withOwner(() =>
       F.setIssueLabels(f.projectId, card.issueId, [f.small, f.plain], f.actorId, true),
     );
@@ -207,7 +187,6 @@ describe('8364 U4 gated label writer', () => {
     const card = await F.gatedCard(f, 'Held by a person');
     await F.assign(card.issueId, f.actorId);
     const before = await F.board(f);
-    // A person is not a lane: the routing facts carry no target, so only the label rules answer.
     await F.withOwner(() =>
       F.setIssueLabels(f.projectId, card.issueId, [f.large], f.actorId, true),
     );
@@ -216,7 +195,6 @@ describe('8364 U4 gated label writer', () => {
   it('refuses a card held by a lane the manifest does not list and keeps its stored size label', async () => {
     const f = await F.fixture(true, 'routed');
     const cards = await gatedPair(f, 'Assigned work');
-    // The owner config under test has no routing section, so no lane has an execution entry.
     await F.asAgent(f.projectId, f.actorId, 'qwen2');
     const before = await F.board(f);
     for (const card of cards) {
@@ -245,14 +223,30 @@ describe('8364 U4 gated label writer', () => {
     expect(refusal.status).toBe(409);
     expect(refusal.code).toBe('issue-without-identity');
     expect(refusal.message).toContain('no ledger identity for this rig');
-    // The writer's own refusal, before the rule owner is consulted: a foreign or missing id is never handed to the owner.
     expect(refusal.message).not.toContain('canonical size label');
     await untouched(f, [card], stored(f), before);
     await F.resetRig(f);
   });
+  it('allows a human to add a label in bulk on a gated project', async () => {
+    const f = await F.fixture(true, 'bulk-human');
+    const cards = await gatedPair(f, 'Human bulk');
+    const manifest = '/Users/misty/Output/reports/8429_COMPOSED_OWNER_SKILLS_CONFIG_R1.json';
+    const owner = JSON.parse(readFileSync(manifest, 'utf8')) as { python: string; owner: string };
+    const changed = await F.withGateEnv([owner.python, owner.owner, manifest], () =>
+      F.bulkAddLabels(
+        f.projectId,
+        cards.map((card) => card.issueId),
+        [f.plain],
+        f.actorId,
+      ),
+    );
+    expect(changed).toBe(2);
+    for (const card of cards) expect(await F.linksOf(card.issueId)).toEqual(plusPlain(f));
+  });
   it('refuses a gated bulk label add with both configs and still serves an ordinary project', async () => {
     const f = await F.fixture(true, 'bulk-gated');
     const cards = await gatedPair(f, 'Gated bulk');
+    await F.asAgent(f.projectId, f.actorId, 'qwen2');
     const before = await F.board(f);
     for (const run of [F.withOwner, F.withNoConfig]) {
       const refusal = await F.refusalOf(() =>
@@ -266,7 +260,6 @@ describe('8364 U4 gated label writer', () => {
         ),
       );
       expect(refusal.status).toBe(409);
-      // A gated bulk change is disabled as a whole before any member is read or judged, so the wording is the writer's own on either config.
       expect(refusal.message).toContain('Bulk label changes are not available on a gated project');
       expect(refusal.message).not.toContain('canonical size label');
     }
@@ -293,7 +286,6 @@ describe('8364 U4 gated label writer', () => {
           run(() => F.setIssueLabels(f.projectId, card.issueId, [f.large], f.actorId, true)),
         );
         expect(refusal.status).toBe(409);
-        // A gated write with no usable manifest never reaches the rule owner, so no rule wording can appear in the refusal.
         expect(refusal.message).toContain(wording);
         expect(refusal.message).not.toContain('canonical size label');
       }
@@ -356,8 +348,6 @@ describe('8364 U4 gated label writer', () => {
     expect(outcome.blockedByOther).toBeGreaterThan(0);
     expect(outcome.saved).toBe(false);
     expect(outcome.refusal?.status).toBe(409);
-    // The ordinary branch's own fence: the save saw the rig the activation committed first and wrote nothing. No rule owner is consulted on this branch, and
-    // this fixture mints no identity, so the rig and ledger counts stay where the ordinary fixture left them.
     expect(outcome.refusal?.message).toContain('changed its rig while the labels were being saved');
     expect(outcome.refusal?.message).not.toContain('canonical size label');
     await untouched(f, [card], stored(f), before);
@@ -383,14 +373,10 @@ describe('8364 U4 gated label writer', () => {
     expect(after.identities).toBe(0);
   });
   it('leaves no test data and no ledger row with an issue still attached', async () => {
-    // Nothing is created here: every fixture this run made has already been cleaned by the afterEach that follows each case, so the residue is read from
-    // the immutable inventory of ids the run created, not from a queue cleanup has already drained.
     await F.cleanUp();
     expect(F.cleanupErrors).toEqual([]);
     const left = await F.residue();
     expect(Object.values(left).every((count) => typeof count === 'number')).toBe(true);
-    // Only the synthetic rig remains, which the schema forbids deleting. Every issue, label, webhook, column, team, workspace, project and user this run
-    // made is gone, and every ledger row it made is a tombstone: still there, with no issue attached.
     expect(left).toEqual({
       project: 0,
       label: 0,
