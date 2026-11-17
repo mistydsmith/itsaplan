@@ -5,7 +5,9 @@ import type { TrackerActorKind } from '@repo/db/tracker-routing-facts';
 import { claimFactsOf } from '#modules/issues/close-facts';
 import { routingFactsForText } from '#modules/issues/lane-routing';
 import { skillFactsFor } from '#modules/issues/skill-facts';
+import { getProjectAccess } from '#shared/access';
 import { HttpError } from '#shared/lib';
+import { hasPermission } from '#shared/permissions';
 import {
   buildReadinessFacts,
   type PageGateFacts,
@@ -279,6 +281,17 @@ export async function judgeGatedClaim(
         FROM "user" u WHERE u.id = ${userId}`,
   );
   if (!actor) throw new HttpError(409, 'A claim needs an authenticated user', 'claim-no-user');
+  // WHY 8365.65 (Misty 2026-11-16: "I don't think I can make you owners. But you have full
+  // permissions as orchestrators"): readiness judges the caller's effective project standing -
+  // the member's role matrix raised by the workspace grant - not the membership row alone. The
+  // existing resolver is the only source of that standing (the same read gated-link.ts makes
+  // in standingIn); readiness receives exactly one boolean from it: effective
+  // workflow_config.edit. A missing access or a missing grant resolves to false and stays a
+  // worker; the resolver reads the pool, as every other per-request permission check in this
+  // app does.
+  const access = await getProjectAccess(projectId, userId);
+  const workflowConfigEdit =
+    access !== null && hasPermission(access.permissions, 'workflow_config', 'edit');
 
   const gatedCard: GatedCard = {
     beadId,
@@ -324,6 +337,7 @@ export async function judgeGatedClaim(
     })),
     userRole: actor.user_role === null ? null : String(actor.user_role),
     memberRole: actor.member_role === null ? null : String(actor.member_role),
+    workflowConfigEdit,
     routingAllowed: true,
   });
   if (!built.ok) throw unproven(built.reason);

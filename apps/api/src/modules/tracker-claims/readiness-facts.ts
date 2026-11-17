@@ -91,9 +91,21 @@ export function operatorOwned(labels: string[]): boolean {
 
 // The project authorization of the authenticated user. memberRole is the project_member row's
 // role, or null for a user who reaches the project without a row.
-export function actorRole(userRole: string | null, memberRole: string | null): ReadinessRole {
+// WHY the third argument (8365.65, Misty 2026-11-16: "I don't think I can make you owners. But
+// you have full permissions as orchestrators"): the caller's effective workflow_config.edit in
+// this project - the member's role matrix raised by the workspace grant, resolved by the
+// existing access resolver (gated-claim.ts, the same read gated-link.ts makes). This function
+// maps that one boolean and never re-derives access: god stays operator, the project owner
+// stays coordinator, a member holding the effective grant is a coordinator, everyone else a
+// worker. A missing or false grant is the same boolean and stays a worker.
+export function actorRole(
+  userRole: string | null,
+  memberRole: string | null,
+  workflowConfigEdit = false,
+): ReadinessRole {
   if (userRole === 'god') return 'operator';
-  return memberRole === 'owner' ? 'coordinator' : 'worker';
+  if (memberRole === 'owner' || workflowConfigEdit) return 'coordinator';
+  return 'worker';
 }
 
 export interface ReadinessInput {
@@ -109,6 +121,10 @@ export interface ReadinessInput {
   }[];
   userRole: string | null;
   memberRole: string | null;
+  // WHY 8365.65: the caller's effective workflow_config.edit in the card's project, the one
+  // boolean the existing access resolver proved in gated-claim.ts; see actorRole for the
+  // mapping and the workspace-raise semantics.
+  workflowConfigEdit: boolean;
   // True only when the rule owner allowed the routing check for the requesting user.
   routingAllowed: boolean;
 }
@@ -135,7 +151,7 @@ export function buildReadinessFacts(input: ReadinessInput): ReadinessFactsResult
       dependencies,
       eligibility: input.routingAllowed,
       operator_owned: operatorOwned(input.labels),
-      actor_role: actorRole(input.userRole, input.memberRole),
+      actor_role: actorRole(input.userRole, input.memberRole, input.workflowConfigEdit),
     },
   };
 }

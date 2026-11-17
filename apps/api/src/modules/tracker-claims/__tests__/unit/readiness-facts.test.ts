@@ -18,6 +18,7 @@ const input = (over: Partial<ReadinessInput> = {}): ReadinessInput => ({
   prerequisites: [],
   userRole: 'user',
   memberRole: 'member',
+  workflowConfigEdit: false,
   routingAllowed: true,
   ...over,
 });
@@ -83,12 +84,56 @@ describe('operatorOwned and actorRole', () => {
   });
 
   test('the role is the project authorization of the user', () => {
-    expect(actorRole('god', null)).toBe('operator');
-    expect(actorRole('god', 'member')).toBe('operator');
-    expect(actorRole('user', 'owner')).toBe('coordinator');
-    expect(actorRole('user', 'member')).toBe('worker');
-    expect(actorRole(null, null)).toBe('worker');
-    expect(actorRole('GOD', 'Owner')).toBe('worker');
+    // 8365.65: the pinned (user, member) -> worker line is updated DELIBERATELY (Muse review
+    // condition 1): the third argument is the caller's effective workflow_config.edit, and
+    // every pre-existing case now says it with an explicit false. The mapping itself moved
+    // nowhere: god stays operator, owner stays coordinator, everyone else worker.
+    expect(actorRole('god', null, false)).toBe('operator');
+    expect(actorRole('god', 'member', false)).toBe('operator');
+    expect(actorRole('user', 'owner', false)).toBe('coordinator');
+    expect(actorRole('user', 'member', false)).toBe('worker');
+    expect(actorRole(null, null, false)).toBe('worker');
+    expect(actorRole('GOD', 'Owner', false)).toBe('worker');
+  });
+
+  test('an effective workflow_config.edit maps the same user to coordinator (orchestrator-epic witness)', () => {
+    // 8365.65 (Misty 2026-11-16: "you have full permissions as orchestrators"): the same
+    // authenticated user reads coordinator with the grant and worker without it. This is the
+    // green arm the red mutant (mapping removed) must fail.
+    expect(actorRole('user', 'member', true)).toBe('coordinator');
+    // a grant that is false and a grant that is missing both resolve to the same boolean
+    // (hasPermission on a missing resource/action is false) and both stay worker
+    expect(actorRole('user', 'member', false)).toBe('worker');
+    expect(actorRole('god', 'member', true)).toBe('operator'); // god stays operator
+    expect(actorRole('user', 'owner', true)).toBe('coordinator'); // owner stays coordinator
+    expect(actorRole('user', 'owner', false)).toBe('coordinator');
+  });
+
+  test('a workspace-only grant arrives as the same true boolean (workspace-raise witness)', () => {
+    // 8365.65 workspace-raise path: the grant arrives only through the workspace grant - the
+    // member row carries no project grant of its own. The resolver's raise is the access
+    // model's own semantics (Root ruling: a workspace-only effective grant MUST count), so it
+    // reaches readiness as the one boolean and maps to coordinator.
+    expect(actorRole('user', 'member', true)).toBe('coordinator');
+  });
+
+  test('buildReadinessFacts carries the grant through to the actor role fact', () => {
+    // End-to-end fact plumbing: the boolean flows ReadinessInput -> facts.actor_role, so the
+    // owner sees the coordinator role on the claim op, not just on the pure mapping.
+    expect(
+      (
+        buildReadinessFacts(input({ workflowConfigEdit: true })) as {
+          facts: { actor_role: string };
+        }
+      ).facts.actor_role,
+    ).toBe('coordinator');
+    expect(
+      (
+        buildReadinessFacts(input({ workflowConfigEdit: false })) as {
+          facts: { actor_role: string };
+        }
+      ).facts.actor_role,
+    ).toBe('worker');
   });
 });
 
