@@ -3,7 +3,6 @@
 // response. Nothing here decides policy, reads the database, imports an API type or trusts a
 // value a client sent. An ordinary project never touches the config; a gated project with no
 // config refuses instead of running.
-//
 // The next unit supplies `op`: the writer builds it from the facts it read on its own locked
 // transaction. Nothing in this file claims those facts are authenticated.
 
@@ -333,6 +332,8 @@ export interface IssueWriteGateInput {
   rigId: number | null;
   // The operation the rule owner evaluates. The next unit builds it from transaction facts.
   op: Record<string, unknown>;
+  config?: TrackerRulesConfig;
+  proof?: Awaited<ReturnType<typeof checkTrackerRules>> | null;
 }
 
 // The gate a gated issue write calls inside the caller's own locks. It returns on the ordinary
@@ -362,21 +363,21 @@ export async function gateIssueWrite(input: IssueWriteGateInput): Promise<void> 
     );
   }
 
-  const state = await loadTrackerRulesConfig();
-  if (state.state === 'unset') {
+  const loaded = input.config === undefined ? await loadTrackerRulesConfig() : null;
+  if (loaded !== null && loaded.state === 'unset') {
     throw new TrackerGateRefusal(
       'tracker-rules-unconfigured',
-      `a gated project needs ${TRACKER_GATE_ENV.python}, ${TRACKER_GATE_ENV.owner} and ` +
-        `${TRACKER_GATE_ENV.manifest} set`,
+      `a gated project needs ${TRACKER_GATE_ENV.python}, ${TRACKER_GATE_ENV.owner} and ${TRACKER_GATE_ENV.manifest} set`,
     );
   }
-  if (state.state === 'refusal') {
-    throw new TrackerGateRefusal(state.code, state.message);
-  }
+  if (loaded !== null && loaded.state === 'refusal')
+    throw new TrackerGateRefusal(loaded.code, loaded.message);
+  const config = (input.config ??
+    (loaded && loaded.state === 'configured' ? loaded.config : null))!; // unset/refusal threw above
 
   let answer: Awaited<ReturnType<typeof checkTrackerRules>>;
   try {
-    answer = await checkTrackerRules(state.config, op);
+    answer = await checkTrackerRules(config, op, input.proof);
   } catch {
     // The transport refuses instead of throwing; an unexpected throw is still not an allow.
     throw new TrackerGateRefusal(

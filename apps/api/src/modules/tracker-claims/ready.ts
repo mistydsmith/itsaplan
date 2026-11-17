@@ -3,6 +3,7 @@ import { claimIssue, type ClaimTransaction } from '@repo/db/issue-claim';
 import { sql } from 'drizzle-orm';
 import { HttpError } from '#shared/lib';
 import { judgeGatedClaim } from './gated-claim';
+import { pageGateFacts } from './readiness-facts';
 import { claimDto, claimRefusalError, type ClaimDto } from './service';
 import { claimSkillPromptsAfterClaim } from './skill-answer';
 
@@ -149,6 +150,10 @@ export async function readReady(
   return db.transaction(
     async (tx) => {
       const rigId = await heldRig(tx, projectId);
+      // 8429.8: the user-stable gate facts are made once per page, inside the transaction, and
+      // every card on the page is judged on them. With unset or refusal rule config this is null
+      // and the per-card paths behave exactly as before.
+      const pageFacts = await pageGateFacts(tx, userId);
       const [{ total }] = (await tx.execute(
         sql`SELECT count(*)::int AS total ${candidates(projectId)}`,
       )) as unknown as { total: number }[];
@@ -162,6 +167,7 @@ export async function readReady(
             tx,
             { issueId: id, rigId, userId, expectedEpoch: 'locked' },
             false,
+            pageFacts,
           );
           return {
             id,

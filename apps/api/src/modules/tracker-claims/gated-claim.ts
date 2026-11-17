@@ -6,7 +6,12 @@ import { claimFactsOf } from '#modules/issues/close-facts';
 import { routingFactsForText } from '#modules/issues/lane-routing';
 import { skillFactsFor } from '#modules/issues/skill-facts';
 import { HttpError } from '#shared/lib';
-import { buildReadinessFacts, type ReadinessFacts, type ReadinessRole } from './readiness-facts';
+import {
+  buildReadinessFacts,
+  type PageGateFacts,
+  type ReadinessFacts,
+  type ReadinessRole,
+} from './readiness-facts';
 import { claimSkillPromptsAfterClaim } from './skill-answer';
 import type { TrackerSkillPrompt } from '@repo/db/tracker-skill-receipts';
 
@@ -118,9 +123,18 @@ function unproven(reason: string): HttpError {
   );
 }
 
-export async function gate(rigId: number, op: Record<string, unknown>): Promise<void> {
+// 8429.8: when the caller made the page's gate facts, the gate runs on the page's config and
+// proof instead of loading the config and re-hashing the pinned files per op. Without them the
+// gate loads and verifies exactly as before.
+export async function gate(
+  rigId: number,
+  op: Record<string, unknown>,
+  page?: PageGateFacts | null,
+): Promise<void> {
   try {
-    await gateIssueWrite({ rigId, op });
+    await gateIssueWrite(
+      page ? { rigId, op, config: page.config.config, proof: page.proof } : { rigId, op },
+    );
   } catch (error) {
     if (!isTrackerGateRefusal(error)) throw error;
     const safe = error.safe_form ? ` Compliant form: ${error.safe_form}.` : '';
@@ -209,10 +223,13 @@ export async function claimGatedIssue(
 // Both owner calls for one card, with no write. It returns when the owner allows the claim and
 // throws the refusal otherwise. WHY lock is a parameter: a claim must hold the row it judges
 // until it writes, and a ready list writes nothing, so it reads the row without the lock.
+// 8429.8: `page` carries the user-stable facts the ready page made once for its whole page;
+// without it every read happens per call, exactly as before.
 export async function judgeGatedClaim(
   tx: ClaimTransaction,
   input: GatedClaimInput,
   lock: boolean,
+  page?: PageGateFacts | null,
 ): Promise<{
   beadId: string;
   title: string;
@@ -271,19 +288,26 @@ export async function judgeGatedClaim(
     labels,
     columnState: String(card.state_type),
   };
-  const routed = await routingFactsForText(tx, {
-    projectId,
-    beadId,
-    labels,
-    texts: [gatedCard.title, gatedCard.description],
-    userIds: [userId],
-    // WHY 8429 (Misty 2026-11-15): this read is a person claiming her own card. The lane read is about the agents the card
-    // names; the person holding it is the actor, and a lane this manifest cannot route must not refuse her before the owner is
-    // asked. "i guarantee you EVERY block will block me too".
-    actorUserId: userId,
-  });
-  const facts = { routing_facts: routed.facts, ...(await skillFactsFor(tx, userId)) };
-  await gate(rigId, routingCheckOp(gatedCard, facts));
+  const routed = await routingFactsForText(
+    tx,
+    {
+      projectId,
+      beadId,
+      labels,
+      texts: [gatedCard.title, gatedCard.description],
+      userIds: [userId],
+      // WHY 8429 (Misty 2026-11-15): this read is a person claiming her own card. The lane read is about the agents the card
+      // names; the person holding it is the actor, and a lane this manifest cannot route must not refuse her before the owner is
+      // asked. "i guarantee you EVERY block will block me too".
+      actorUserId: userId,
+    },
+    page ? { actorKind: page.actorKind, config: page.config } : undefined,
+  );
+  const facts = {
+    routing_facts: routed.facts,
+    ...(page ? page.skillFacts : await skillFactsFor(tx, userId)),
+  };
+  await gate(rigId, routingCheckOp(gatedCard, facts), page);
   // The routing call returned, so the owner allowed this user on this card. That answer is the
   // only source of eligibility; no other line sets it.
   const built = buildReadinessFacts({
@@ -320,7 +344,7 @@ export async function judgeGatedClaim(
     },
     { actor: userId, expectedEpoch },
   );
-  await gate(rigId, claimOp(gatedCard, facts, claim, built.facts));
+  await gate(rigId, claimOp(gatedCard, facts, claim, built.facts), page);
   return {
     beadId,
     title: gatedCard.title,

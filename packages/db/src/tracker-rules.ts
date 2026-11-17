@@ -164,7 +164,12 @@ async function sha256Hex(path: string): Promise<string | undefined> {
 
 // Re-read and re-hash on every run: a positive check from an earlier byte state
 // must never be reused.
-async function verifyManifest(
+//
+// WHY (sentinel-prod-8429.8) it is exported: one request judges a page of cards and used to re-hash the
+// pinned files twice per card. The caller now makes ONE proof per request with this function and hands it
+// to every checkTrackerRules call in that request. The proof is a value, never stored: nothing reads a
+// proof made by an earlier request, so a byte that changed between requests still refuses on the next one.
+export async function verifyPinnedManifest(
   python: string,
   pythonSha256: string,
   fileSha256: Record<string, string>,
@@ -263,12 +268,18 @@ function parseViolations(text: string): TrackerRulesAnswer {
 export async function checkTrackerRules(
   config: TrackerRulesConfig,
   op: Record<string, unknown>,
+  // A proof this request already made with verifyPinnedManifest. undefined means "make your own", which
+  // keeps every existing caller re-hashing exactly as before; null is a proof that the pins matched.
+  proof?: TrackerRulesAnswer | null,
 ): Promise<TrackerRulesAnswer> {
   const validated = validateConfig(config);
   if (typeof validated === 'object' && 'ok' in validated) return validated;
   const limits = validated;
 
-  const manifestBad = await verifyManifest(config.python, config.pythonSha256, config.fileSha256);
+  const manifestBad =
+    proof === undefined
+      ? await verifyPinnedManifest(config.python, config.pythonSha256, config.fileSha256)
+      : proof;
   if (manifestBad) return manifestBad;
 
   const input = new TextEncoder().encode(JSON.stringify(op)); // the caller's op is never rewritten

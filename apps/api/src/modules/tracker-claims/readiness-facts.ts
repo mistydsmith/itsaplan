@@ -1,10 +1,17 @@
-// The readiness facts a gated claim hands the rule owner, mapped from stored rows. Nothing here
-// reads the database, decides whether a card is ready or accepts a value a client sent.
+// The readiness facts a gated claim hands the rule owner, mapped from stored rows. Nothing above
+// reads the database, decides whether a card is ready or accepts a value a client sent; the
+// per-page builder at the bottom of this file is the one exception: it reads the user-stable
+// facts on the caller's own transaction, once per page (sentinel-prod-8429.8).
 //
 // WHY every mapping is an exact table (Root 2026-11-15, 8429_READY_NATIVE_FACT_RULINGS_R1): the
 // owner refuses a card on these facts, so a guessed status, kind or role would open or close work
 // by accident. A value no table names is reported as unproven and the card is left out; it is
 // never turned into the nearest known value.
+import { loadTrackerRulesConfig, type TrackerGateConfigState } from '@repo/db/tracker-gate';
+import { verifyPinnedManifest, type TrackerRulesAnswer } from '@repo/db/tracker-rules';
+import { type TrackerActorKind } from '@repo/db/tracker-routing-facts';
+import type { DbExecutor } from '@repo/db';
+import { actorKindOf, skillFactsFor, type TrackerSkillFacts } from '#modules/issues/skill-facts';
 
 export type ReadinessKind = 'task' | 'epic' | 'slot';
 export type ReadinessRole = 'worker' | 'coordinator' | 'operator';
@@ -131,4 +138,36 @@ export function buildReadinessFacts(input: ReadinessInput): ReadinessFactsResult
       actor_role: actorRole(input.userRole, input.memberRole),
     },
   };
+}
+
+// The gate facts one ready page makes once and hands every card it judges (sentinel-prod-8429.8).
+//
+// WHY once per page and not once per card: the ready page judges 25 cards in one transaction and
+// used to read the actor kind twice per card (routing, then skills) and load the rule config and
+// re-hash the pinned files twice per card as well. These are user-stable within the page: one
+// read, one load, one proof. The proof is a value, never stored: a pinned byte that changes
+// between requests still refuses on the next one, which makes its own proof.
+//
+// WHY null when the config is not configured: with unset or refusal config the page carries no
+// facts and every per-card path runs exactly as it does today, where the gate loads the config
+// itself and refuses in its own code. A configured page never re-asks: its cards judge on these
+// facts and only these facts.
+export interface PageGateFacts {
+  config: Extract<TrackerGateConfigState, { state: 'configured' }>;
+  proof: TrackerRulesAnswer | null;
+  actorKind: TrackerActorKind;
+  skillFacts: TrackerSkillFacts;
+}
+
+export async function pageGateFacts(tx: DbExecutor, userId: string): Promise<PageGateFacts | null> {
+  const config = await loadTrackerRulesConfig();
+  if (config.state !== 'configured') return null;
+  const proof = await verifyPinnedManifest(
+    config.config.python,
+    config.config.pythonSha256,
+    config.config.fileSha256,
+  );
+  const actorKind = await actorKindOf(tx, userId);
+  const skillFacts = await skillFactsFor(tx, userId, { actorKind, config });
+  return { config, proof, actorKind, skillFacts };
 }

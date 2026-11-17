@@ -1,6 +1,6 @@
 import { eq } from 'drizzle-orm';
 import { aiAgent, type DbExecutor } from '@repo/db';
-import { loadTrackerRulesConfig } from '@repo/db/tracker-gate';
+import { loadTrackerRulesConfig, type TrackerGateConfigState } from '@repo/db/tracker-gate';
 import { holdsSkillReceipt } from '@repo/db/tracker-skill-receipts';
 import { type TrackerActorKind } from '@repo/db/tracker-routing-facts';
 
@@ -42,15 +42,19 @@ export async function actorKindOf(
 // without one is a human, and a write with no user is a system write, which is not a human.
 // The owner exempts only a human from the two skill checks, so a wrong 'human' here would open
 // legal-template work to an agent that read nothing.
+// 8429.8: a page of cards hands the facts it already read for this request so the actor kind is
+// not re-read and the rule config not re-loaded per card. Omitting `known` behaves exactly as
+// before: both reads happen on the caller's own transaction.
 export async function skillFactsFor(
   tx: DbExecutor,
   actorUserId: string | null,
+  known?: { actorKind: TrackerActorKind; config: TrackerGateConfigState },
 ): Promise<TrackerSkillFacts> {
-  const actor_kind = await actorKindOf(tx, actorUserId);
+  const actor_kind = known?.actorKind ?? (await actorKindOf(tx, actorUserId));
   if (actor_kind !== 'agent') {
     return { actor_kind, templates_skill_loaded: false, law_library_skill_loaded: false };
   }
-  const config = await loadTrackerRulesConfig();
+  const config = known?.config ?? (await loadTrackerRulesConfig());
   const pins = config.state === 'configured' ? config.skills : undefined;
   return {
     actor_kind: 'agent',

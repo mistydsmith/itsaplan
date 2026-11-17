@@ -1,10 +1,11 @@
 import { inArray } from 'drizzle-orm';
 import { aiAgent, type DbExecutor } from '@repo/db';
-import { loadTrackerRulesConfig } from '@repo/db/tracker-gate';
+import { loadTrackerRulesConfig, type TrackerGateConfigState } from '@repo/db/tracker-gate';
 import {
   buildRoutingFacts,
   laneToken,
   routingAppliesToActor,
+  type TrackerActorKind,
   type TrackerRoutingFacts,
 } from '@repo/db/tracker-routing-facts';
 import { HttpError } from '#shared/lib';
@@ -21,9 +22,14 @@ import { actorKindOf } from './skill-facts';
 // owner runs, because a guessed locality could send a PII card to a cloud lane. With no usable
 // rule config the facts stay null and the gate refuses with its own config code. Every gated
 // writer calls this one function, so there is one routing policy and not one per door.
+// 8429.8: a page of cards hands the facts it already read for this request so the rule config is
+// not re-loaded and the actor kind not re-read per card. Omitting `known` behaves exactly as
+// before. buildRoutingFacts and resolveMentionHandles stay per card: they are the card's own
+// routing decision, not a user-stable fact.
 export async function routingFactsForUsers(
   tx: DbExecutor,
   input: { beadId: string; userIds: string[]; labels: string[]; actorUserId?: string | null },
+  known?: { actorKind: TrackerActorKind; config: TrackerGateConfigState },
 ): Promise<{
   facts: TrackerRoutingFacts | null;
   laneOf: (userId: string | null) => string | null;
@@ -40,14 +46,15 @@ export async function routingFactsForUsers(
     const agent = agents.find((row) => row.userId === userId);
     return agent ? laneToken(agent.username) : null;
   };
-  const config = await loadTrackerRulesConfig();
+  const config = known?.config ?? (await loadTrackerRulesConfig());
   if (config.state !== 'configured') return { facts: null, laneOf };
   // WHY 8429 (Misty 2026-11-15): "i guarantee you EVERY block will block me too". A person who is signed in and writing her own
   // card is not a lane, so a lane this manifest cannot route must not refuse her write before the owner is asked. Her write goes
   // on with no routing facts, which is the judgment an ungated card gets. The actor kind is read here from the ai_agent table,
   // never taken from the request, so a caller cannot call itself a person: only a stored user with no agent row is one, and an
   // agent or a system write keeps every refusal below exactly as it was.
-  if (routingAppliesToActor(await actorKindOf(tx, input.actorUserId ?? null)) === false) {
+  const actorKind = known?.actorKind ?? (await actorKindOf(tx, input.actorUserId ?? null));
+  if (routingAppliesToActor(actorKind) === false) {
     return { facts: null, laneOf };
   }
   const built = buildRoutingFacts(config.routing, {
@@ -77,15 +84,20 @@ export async function routingFactsForText(
     userIds: string[];
     actorUserId?: string | null;
   },
+  known?: { actorKind: TrackerActorKind; config: TrackerGateConfigState },
 ): ReturnType<typeof routingFactsForUsers> {
   const handles = new Set(input.texts.flatMap(parseMentionHandles));
   const named = await resolveMentionHandles(input.projectId, [...handles], tx);
-  return routingFactsForUsers(tx, {
-    beadId: input.beadId,
-    userIds: [...input.userIds, ...named.agentUserIds],
-    labels: input.labels,
-    actorUserId: input.actorUserId ?? null,
-  });
+  return routingFactsForUsers(
+    tx,
+    {
+      beadId: input.beadId,
+      userIds: [...input.userIds, ...named.agentUserIds],
+      labels: input.labels,
+      actorUserId: input.actorUserId ?? null,
+    },
+    known,
+  );
 }
 
 // The routing facts for whoever a gated write leaves holding the card, plus the agents its title and
