@@ -4,13 +4,11 @@ import { loadTrackerRulesConfig, type TrackerGateConfigState } from '@repo/db/tr
 import {
   buildRoutingFacts,
   laneToken,
-  routingAppliesToActor,
   type TrackerActorKind,
   type TrackerRoutingFacts,
 } from '@repo/db/tracker-routing-facts';
 import { HttpError } from '#shared/lib';
 import { parseMentionHandles, resolveMentionHandles } from '#shared/mentions';
-import { actorKindOf } from './skill-facts';
 
 // The routing facts for the agents a gated write reaches: the ones it leaves holding the card,
 // or the ones a comment or a description names.
@@ -48,15 +46,16 @@ export async function routingFactsForUsers(
   };
   const config = known?.config ?? (await loadTrackerRulesConfig());
   if (config.state !== 'configured') return { facts: null, laneOf };
-  // WHY 8429 (Misty 2026-11-15): "i guarantee you EVERY block will block me too". A person who is signed in and writing her own
-  // card is not a lane, so a lane this manifest cannot route must not refuse her write before the owner is asked. Her write goes
-  // on with no routing facts, which is the judgment an ungated card gets. The actor kind is read here from the ai_agent table,
-  // never taken from the request, so a caller cannot call itself a person: only a stored user with no agent row is one, and an
-  // agent or a system write keeps every refusal below exactly as it was.
-  const actorKind = known?.actorKind ?? (await actorKindOf(tx, input.actorUserId ?? null));
-  if (routingAppliesToActor(actorKind) === false) {
-    return { facts: null, laneOf };
-  }
+  // WHY a person's write carries facts too (sentinel-prod-8364, Root ruling 2026-11-18, msg_3f36ed266b29): 8429 exempted a
+  // signed-in person by sending no facts at all, and the published owner reads the routing_facts key by its presence - a key
+  // present as null is a malformed mapping to it, not an exemption (tools/tracker_rules.py lane_rule, tools/tracker_rule_routing.py
+  // validate_routing). So the two operations 8429 conflated are separated here instead. A person writing her own card with no
+  // fleet-routing intent is a write that routes nobody: no stored agent row is left holding the card and no handle is named, the
+  // lanes list is empty, and the facts say so - targets [] - which the owner accepts while every other gate still answers. A
+  // write that assigns, delegates or names a real fleet lane is the other operation, and it is judged exactly as an agent's
+  // write is: the typed lane-unrouted refusal when this manifest cannot route that lane, and the owner's own verdict when it can
+  // and the lane is prohibited on that work. Nothing here is taken from the request: the lanes are only the ai_agent rows behind
+  // stored user ids read on this transaction, so a caller cannot call itself a person or name a target the server has not read.
   const built = buildRoutingFacts(config.routing, {
     beadId: input.beadId,
     lanes: agents.map((agent) => laneToken(agent.username)),

@@ -222,15 +222,34 @@ describe('8429: the routing seam judged on the actor behind the write', () => {
     await rm(dir, { recursive: true, force: true });
   });
 
-  it('a person writing her own card is not refused by a lane the manifest cannot route', async () => {
+  it('a person whose write names nobody and holds nobody routes nobody, and the facts say so', async () => {
     const { facts, laneOf } = await routingFactsForUsers(routerTx([]), {
-      ...unrouted,
+      beadId: 'MKT-42',
+      userIds: [],
+      labels: [],
       actorUserId: 'person-1',
     });
-    expect(facts).toBeNull();
-    // The lanes are still read, so nothing about an agent's identity is lost on the way to allowing the person.
-    expect(laneOf('bot-user-1')).toBe('cloud-lane');
+    // 8429's guarantee stands for this write (Misty 2026-11-15, "i guarantee you EVERY block will block me too"): a signed-in
+    // person is not refused by a lane she never routed. It is carried by facts the server built - empty targets, no lane, no
+    // grant - because the published owner reads a routing_facts key that is present as null as a malformed mapping (sentinel-prod-8364).
+    expect(facts).not.toBeNull();
+    expect(facts?.targets).toEqual([]);
     expect(laneOf('person-1')).toBeNull();
+  });
+
+  it('a person is not exempted from the typed refusal when her write hands the card to an unroutable lane', async () => {
+    const codes: (string | undefined)[] = [];
+    for (const actorUserId of ['person-1', 'bot-user-1', null]) {
+      try {
+        await routingFactsForUsers(routerTx([]), { ...unrouted, actorUserId });
+        codes.push(undefined);
+      } catch (error) {
+        codes.push((error as { code?: string }).code);
+      }
+    }
+    // The lanes are read the same way for every actor, so the manifest that cannot route Unlisted-Lane refuses a person's write
+    // with the same named refusal it gives an agent's: a named target is never hidden by who typed it.
+    expect(codes).toEqual(['lane-unrouted', 'lane-unrouted', 'lane-unrouted']);
   });
 
   it('an agent writer and a write with no user keep the lane-unrouted refusal unchanged', async () => {
@@ -264,10 +283,20 @@ describe('8429: the routing seam judged on the actor behind the write', () => {
     actorUserId,
   });
 
-  it('a person commenting on that card is judged a person and reaches the owner unrouted', async () => {
-    const op = await routedCommentOp(routerTx([]), 7, ['bot-user-2'], commentInput('person-1'));
+  it('a person commenting on a card that routes nobody carries facts that route nobody', async () => {
+    const op = await routedCommentOp(routerTx([]), 7, [], commentInput('person-1'));
     expect(op.actor_kind).toBe('human');
-    expect(op.routing_facts).toBeNull();
+    expect(op.routing_facts).toMatchObject({ targets: [] });
+  });
+
+  it('a person commenting is refused by a named lane the manifest cannot route, the same refusal an agent gets', async () => {
+    let code: string | undefined;
+    try {
+      await routedCommentOp(routerTx([]), 7, ['bot-user-2'], commentInput('person-1'));
+    } catch (error) {
+      code = (error as { code?: string }).code;
+    }
+    expect(code).toBe('lane-unrouted');
   });
 
   it('an agent comment and a comment with no user keep the lane-unrouted refusal unchanged', async () => {

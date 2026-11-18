@@ -75,6 +75,8 @@ const storedOf = async (issueId: number) =>
 const small = (f: F.GateFacts) => [{ labelId: f.small, name: F.SIZE_SMALL }];
 const messageOf = (error: unknown) =>
   String((error as { value?: { error?: string } } | null)?.value?.error ?? '');
+const codeOf = (error: unknown) =>
+  String((error as { value?: { code?: string } } | null)?.value?.code ?? '');
 
 describe('8364 PATCH /issues/:issueId with labelIds', () => {
   it('writes nothing when the labels in a mixed body are refused', async () => {
@@ -211,5 +213,35 @@ describe('8364 PATCH /issues/:issueId with labelIds', () => {
     ]);
     expect(after.labels).toBe(before.labels);
     expect(after.issues).toBe(before.issues);
+  }, 120_000);
+
+  // The refusal shape a caller actually sees (sentinel-prod-8364): the status, the code the route hands back, the rule name
+  // that opens the message and the compliant form that closes it, all four in one body, with nothing written. The card is held
+  // by nobody and its text names no fleet lane, so this write routes nobody and the only rule that answers is the size gate:
+  // the adapter must not ride along with a routing problem of its own, and the guidance a caller needs to fix the request is in
+  // the body. The assertions name the rule, the guidance and the code; they pin no repeated prefix and no punctuation.
+  it('refuses a size-less gated label write with the size rule, the code and the compliant form', async () => {
+    const f = await F.fixture(true, 'patch-body');
+    const card = await F.gatedCard(f, 'Refusal body witness');
+    const owner = await person(f, true);
+    const before = await F.board(f);
+    const stored = await storedOf(card.issueId);
+    const res = await F.withOwner(() =>
+      owner
+        .issues({ issueId: card.issueId })
+        .patch({ title: `${card.title} retitled`, labelIds: [f.plain] }),
+    );
+    expect(res.status).toBe(409);
+    expect(codeOf(res.error)).toBe('tracker-rules-violation');
+    const body = messageOf(res.error);
+    expect(body.startsWith('size:')).toBe(true);
+    expect(body).toContain('exactly one canonical size label is required');
+    expect(body).toContain(
+      'Compliant form: add exactly one of size-small, size-medium, size-large',
+    );
+    expect(body).not.toContain('routing needs routing_facts');
+    expect(await storedOf(card.issueId)).toEqual(stored);
+    expect(await F.linksOf(card.issueId)).toEqual(small(f));
+    expect(await F.board(f)).toEqual(before);
   }, 120_000);
 });
