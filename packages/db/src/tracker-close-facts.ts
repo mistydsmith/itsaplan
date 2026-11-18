@@ -268,13 +268,30 @@ export async function observeCodeFacts(config: CodeFactsConfig): Promise<CodeRes
     : [];
 
   // The paths this commit actually changed, repo-relative. A root commit diffs against
-  // nothing (--root); a merge commit diffs against its first parent (plain diff-tree shows
-  // nothing for a merge, which would fabricate an empty fact).
+  // nothing (--root); an ordinary commit diffs against its one parent; a merge is compared with
+  // its OWN VERIFIED FIRST PARENT, named explicitly as the base of the diff.
+  // WHY the explicit pair (sentinel-prod-8364 close-gate repair): `diff-tree --no-commit-id
+  // --name-only -r --first-parent <merge>` prints nothing for a merge commit - measured on the
+  // landed merge a3e145db5310c632ae2750b69ab2543af05c9f45, where it returned zero paths while the
+  // merge's own first-parent diff holds five. A real landing was therefore observed as changing no
+  // paths and the owner refused the close with a 409. Plain diff-tree on a merge is equally empty.
+  // The first parent is taken from the same verified `log -1 --format=%P` read as the parents
+  // themselves, so the comparison is derived from the commit's own ancestry: no ref, path or
+  // bypass is ever taken from a caller. Root and ordinary single-parent commits keep their old
+  // commands unchanged, and the ancestry, subject, repository guard, timeout and buffer reads are
+  // the same calls as before.
   let diffArgs: string[];
   if (parents === '')
     diffArgs = ['diff-tree', '--root', '--no-commit-id', '--name-only', '-r', fullSha];
   else if (parents.includes(' '))
-    diffArgs = ['diff-tree', '--no-commit-id', '--name-only', '-r', '--first-parent', fullSha];
+    diffArgs = [
+      'diff-tree',
+      '--no-commit-id',
+      '--name-only',
+      '-r',
+      parents.split(' ')[0],
+      fullSha,
+    ];
   else diffArgs = ['diff-tree', '--no-commit-id', '--name-only', '-r', fullSha];
   const diffRun = await git(repoRoot, diffArgs, timeoutMs, maxBuffer);
   if (diffRun.unavailable) return gitUnavailable(diffRun.unavailable);
