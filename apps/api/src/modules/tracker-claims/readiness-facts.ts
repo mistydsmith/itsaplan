@@ -12,6 +12,7 @@ import { verifyPinnedManifest, type TrackerRulesAnswer } from '@repo/db/tracker-
 import { type TrackerActorKind } from '@repo/db/tracker-routing-facts';
 import type { DbExecutor } from '@repo/db';
 import { actorKindOf, skillFactsFor, type TrackerSkillFacts } from '#modules/issues/skill-facts';
+import { getProjectAccess, type ProjectAccess } from '#shared/access';
 
 export type ReadinessKind = 'task' | 'epic' | 'slot';
 export type ReadinessRole = 'worker' | 'coordinator' | 'operator';
@@ -173,9 +174,20 @@ export interface PageGateFacts {
   proof: TrackerRulesAnswer | null;
   actorKind: TrackerActorKind;
   skillFacts: TrackerSkillFacts;
+  // WHY 9924: the same project and the same user for every card on the page, so the effective
+  // project standing (the read gated-claim.ts makes for the owner decision) is resolved once for
+  // the page here and handed to each card. getProjectAccess resolves on the pool and takes no
+  // transaction, so this read is outside the page's repeatable-read transaction; fixing the
+  // effective role once at page start means a grant that changes partway through the request can
+  // no longer split the verdict across the cards of one page.
+  standing: ProjectAccess | null;
 }
 
-export async function pageGateFacts(tx: DbExecutor, userId: string): Promise<PageGateFacts | null> {
+export async function pageGateFacts(
+  tx: DbExecutor,
+  projectId: number,
+  userId: string,
+): Promise<PageGateFacts | null> {
   const config = await loadTrackerRulesConfig();
   if (config.state !== 'configured') return null;
   const proof = await verifyPinnedManifest(
@@ -185,5 +197,6 @@ export async function pageGateFacts(tx: DbExecutor, userId: string): Promise<Pag
   );
   const actorKind = await actorKindOf(tx, userId);
   const skillFacts = await skillFactsFor(tx, userId, { actorKind, config });
-  return { config, proof, actorKind, skillFacts };
+  const standing = await getProjectAccess(projectId, userId);
+  return { config, proof, actorKind, skillFacts, standing };
 }

@@ -126,7 +126,7 @@ describe('ready page gate facts (8429.8)', () => {
     const { judgeGatedClaim } = await import('../../gated-claim');
     const tx = makeTx();
 
-    const page = await pageGateFacts(tx, 'user-1');
+    const page = await pageGateFacts(tx, 7, 'user-1');
     expect(page).not.toBeNull();
     expect(aiAgentSelects).toBe(1); // the actor kind is read once for the whole page
     expect(configLoads).toBe(1); // the rule config is loaded once for the whole page
@@ -151,13 +151,13 @@ describe('ready page gate facts (8429.8)', () => {
     const { pageGateFacts } = await import('../../readiness-facts');
     const { judgeGatedClaim } = await import('../../gated-claim');
     const tx = makeTx();
-    const clean = await pageGateFacts(tx, 'user-1');
+    const clean = await pageGateFacts(tx, 7, 'user-1');
     expect(clean).not.toBeNull();
 
     // A pinned byte changed between requests: the next page makes its own proof and the pins
     // no longer match. The page facts carry the bad proof, and the first gate refuses.
     proofToMake = DRIFT_PROOF;
-    const drifted = await pageGateFacts(makeTx(), 'user-1');
+    const drifted = await pageGateFacts(makeTx(), 7, 'user-1');
     expect(drifted?.proof).toBe(DRIFT_PROOF);
     await expect(
       judgeGatedClaim(
@@ -174,7 +174,7 @@ describe('ready page gate facts (8429.8)', () => {
     proofToMake = GOOD_PROOF;
     const { pageGateFacts } = await import('../../readiness-facts');
     const { judgeGatedClaim } = await import('../../gated-claim');
-    const withPage = await pageGateFacts(makeTx(), 'user-1');
+    const withPage = await pageGateFacts(makeTx(), 7, 'user-1');
     const a = await judgeGatedClaim(
       makeTx(),
       { issueId: 1, rigId: 9, userId: 'user-1', expectedEpoch: 3 },

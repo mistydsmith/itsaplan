@@ -289,7 +289,15 @@ export async function judgeGatedClaim(
   // workflow_config.edit. A missing access or a missing grant resolves to false and stays a
   // worker; the resolver reads the pool, as every other per-request permission check in this
   // app does.
-  const access = await getProjectAccess(projectId, userId);
+  const access = page
+    ? // WHY 9924: the page resolves the shared standing once at page start (pageGateFacts ->
+      // getProjectAccess). getProjectAccess takes no transaction - it resolves through getMemberContext
+      // and projectWorkspaceGrant on the pool - so this read sits outside the page's repeatable-read
+      // transaction. Fixing the effective role once at page start means a grant that changes partway
+      // through the request can no longer split the verdict across the cards of one page. The claim path
+      // passes no page, so it keeps its own per-card read exactly as before.
+      page.standing
+    : await getProjectAccess(projectId, userId);
   const workflowConfigEdit =
     access !== null && hasPermission(access.permissions, 'workflow_config', 'edit');
 

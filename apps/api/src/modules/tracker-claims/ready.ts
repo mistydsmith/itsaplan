@@ -153,7 +153,7 @@ export async function readReady(
       // 8429.8: the user-stable gate facts are made once per page, inside the transaction, and
       // every card on the page is judged on them. With unset or refusal rule config this is null
       // and the per-card paths behave exactly as before.
-      const pageFacts = await pageGateFacts(tx, userId);
+      const pageFacts = await pageGateFacts(tx, projectId, userId);
       const [{ total }] = (await tx.execute(
         sql`SELECT count(*)::int AS total ${candidates(projectId)}`,
       )) as unknown as { total: number }[];
