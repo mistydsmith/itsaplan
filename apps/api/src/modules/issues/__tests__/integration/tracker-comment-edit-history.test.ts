@@ -299,12 +299,11 @@ describe('the comment-edit history boundary', () => {
       versions: stored,
       liveBefore: await liveCommentRows(db, c.issueId),
       superseded: ['progress: step one'],
-      targetId: c.humanId,
       editBody: body,
       actorUserId: p.editor, // The actor updateComment authenticates (8429).
     }) as Record<string, { comments: string[] }>;
     expect(op.previous_state.comments).toEqual([LL_BLOCK, 'progress: step one', AGENT_BODY]);
-    expect(op.proposed_state.comments).toEqual([LL_BLOCK, 'progress: step one', body, AGENT_BODY]);
+    expect(op.proposed_state.comments).toBeUndefined(); // 8364: no duplicate copy.
     const written = await withOwner(() => updateComment(c.humanId, body, p.editor, p.projectId));
     expect(written.body).toBe(body);
     expect(await board(p.projectId, p.rigId)).toEqual(

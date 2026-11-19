@@ -55,8 +55,8 @@ export async function ownerCardFacts(
   };
 }
 
-// The op the owner judges: the retained comments on both sides, the new body on the edit, and the live
-// list after the write. Built only from the facts read on this transaction.
+// The op the owner judges: the retained comments in previous_state and the new body as the top-level
+// comment. Built only from the facts read on this transaction.
 //
 // WHY the actor user id is a required field (sentinel-prod-8429): it is the only way the op can say who wrote this comment, and
 // the kind is derived from her database rows by actorKindOf on the caller's transaction - never from the body, never from a field
@@ -71,24 +71,9 @@ export function commentOp(input: {
   // The bodies this write supersedes, taken from the locked rows: the edited comment's old body, or
   // every body a delete removes. Never a body the request supplied.
   superseded: string[];
-  targetId?: number;
-  // The rows this write removes outright: a delete drops the root and every locked descendant, so the
-  // proposed live list is the remainder and the cascade is never appended back.
-  omitIds?: number[];
   editBody?: string;
   actorUserId: string | null;
 }): Record<string, unknown> {
-  // An edit substitutes its body where it stands; a delete drops the whole omitted set; a create appends.
-  const liveAfter: string[] = [];
-  for (const row of input.liveBefore) {
-    if (input.omitIds?.includes(row.id)) continue;
-    if (input.targetId != null && row.id === input.targetId) {
-      if (input.opName === 'comment_edit') liveAfter.push(input.editBody ?? row.body);
-      continue;
-    }
-    liveAfter.push(row.body);
-  }
-  if (input.opName === 'comment_create') liveAfter.push(input.editBody ?? '');
   const base = {
     title: input.facts.title,
     description: input.facts.description,
@@ -107,12 +92,15 @@ export function commentOp(input: {
       ...base,
       comments: [...input.versions, ...input.liveBefore.map((r) => r.body)],
     },
-    // The post-write state keeps those, adds the bodies this write supersedes, and carries the live list
-    // as it will read afterwards - each unchanged body exactly once.
-    proposed_state: {
-      ...base,
-      comments: [...input.versions, ...input.superseded, ...liveAfter],
-    },
+    // WHY proposed_state carries no comments (sentinel-prod-8364, the 9913.5 HTTP 409): it used to repeat the
+    // versions, the superseded bodies and the post-write live list, so a card with about 512 KiB of history
+    // passed the owner's 1 MiB input limit. No rule needs that copy. tracker_rule_compliance reads only
+    // previous_state.comments. tracker_rule_routing reads comments in both states, but only for @lane
+    // mentions, and every proposed body is a retained body above or the top-level comment it already reads.
+    // An absent key reads as an empty list in both rules. Do not put the list back to "complete" the state,
+    // and do not dedupe or split previous_state.comments: compliance's \s+ patterns can match across the
+    // join between two retained bodies, so its order and every body stay exactly as stored.
+    proposed_state: base,
   };
   return op;
 }

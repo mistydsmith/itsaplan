@@ -674,7 +674,6 @@ export async function updateComment(
           liveBefore,
           // The body this edit supersedes, from the locked row - never the request.
           superseded: [locked.body],
-          targetId: locked.commentId,
           editBody: body,
           actorUserId,
         },
@@ -779,8 +778,6 @@ export async function deleteComment(
         liveBefore: await liveCommentRows(tx, root.issueId),
         // Every body this delete removes, from the locked rows - never from the request.
         superseded: cascade.map((row) => row.body),
-        // The whole locked cascade leaves the post-write list, not just the root.
-        omitIds: cascade.map((row) => row.commentId),
         actorUserId,
       });
       try {
