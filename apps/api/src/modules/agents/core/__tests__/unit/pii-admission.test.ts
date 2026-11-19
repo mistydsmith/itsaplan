@@ -318,7 +318,6 @@ describe('8429: the routing seam judged on the actor behind the write', () => {
       const op = await commentDeleteOp(routerTx(actorUserId === 'bot-user-1' ? [{ id: 1 }] : []), {
         ...commentInput(actorUserId),
         opName: 'comment_delete',
-        omitIds: [41],
       });
       kinds.push(op.actor_kind);
       // A delete has never carried routing facts, and it still carries none, whatever the actor is.
