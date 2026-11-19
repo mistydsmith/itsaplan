@@ -12,7 +12,7 @@ import * as rulesReal from '@repo/db/tracker-rules';
 import type { TrackerRulesAnswer } from '@repo/db/tracker-rules';
 import { emptyPermissions, fullPermissions } from '@repo/db';
 import * as accessReal from '#shared/access';
-import type { ProjectAccess } from '#shared/access';
+import type { ProjectAccess } from '#shared/workspace-roles';
 
 // The pinned rule set one request loads. The config value is fake: no path points at a real
 // owner, no sha is a real token, and the spied gate never spawns anything.

@@ -12,7 +12,8 @@ import { verifyPinnedManifest, type TrackerRulesAnswer } from '@repo/db/tracker-
 import { type TrackerActorKind } from '@repo/db/tracker-routing-facts';
 import type { DbExecutor } from '@repo/db';
 import { actorKindOf, skillFactsFor, type TrackerSkillFacts } from '#modules/issues/skill-facts';
-import { getProjectAccess, type ProjectAccess } from '#shared/access';
+import { getProjectAccess } from '#shared/access';
+import type { ProjectAccess } from '#shared/workspace-roles';
 
 export type ReadinessKind = 'task' | 'epic' | 'slot';
 export type ReadinessRole = 'worker' | 'coordinator' | 'operator';
